@@ -1,0 +1,34 @@
+{
+  "name": "@pideck/supervisor",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "pideck-supervisor": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "biome check src"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@nextflow/agent-runtime": "workspace:*",
+    "@nextflow/contracts": "workspace:*",
+    "@nextflow/database": "workspace:*",
+    "@nextflow/observability": "workspace:*",
+    "@nextflow/test-agents": "workspace:*",
+    "fastify": "^5.4.0",
+    "zod": "^3.25.76"
+  }
+}

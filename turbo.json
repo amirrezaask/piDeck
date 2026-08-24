@@ -1,0 +1,33 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalPassThroughEnv": [
+    "NEXTFLOW_DATABASE_PATH",
+    "NEXTFLOW_SUPERVISOR_TOKEN",
+    "NEXTFLOW_SUPERVISOR_HOST",
+    "NEXTFLOW_SUPERVISOR_PORT",
+    "NEXTFLOW_AGENT_CWD",
+    "NEXTFLOW_PI_SESSION_DIR",
+    "VITE_SUPERVISOR_URL"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build", "^typecheck"]
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "lint": {
+      "outputs": []
+    },
+    "dev": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    }
+  }
+}

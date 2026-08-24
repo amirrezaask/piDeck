@@ -1,0 +1,150 @@
+{
+  "title": "Choose piDeck’s visual world",
+  "question": "How should a solo developer see and control a large live agent fleet?",
+  "options": [
+    {
+      "id": "assigned",
+      "label": "Broadcast Multiview",
+      "kicker": "THE ROLL",
+      "lineage": "live broadcast control rooms and vision mixers",
+      "thesis": "The fleet is a live program: every agent has a feed, attention has a tally, and interventions happen from one control surface.",
+      "palette": ["#151719", "#E8E5DC", "#F2B84B", "#D64B3C"],
+      "materials": ["matte equipment enamel", "anti-glare monitor glass", "engraved legends"],
+      "viewport": "A compact supervisor rail frames a wall of live agent feeds; the selected run expands into a central program monitor while an intervention desk remains anchored below.",
+      "risk": "A literal wall of equal tiles would become surveillance noise, so feed scale must follow urgency and workflow hierarchy.",
+      "raised": [
+        {
+          "from": "Arcade state law",
+          "raise": "Every critical state changes shape and label as well as color."
+        },
+        {
+          "from": "Cutting-bench continuity",
+          "raise": "Paused and deferred work remains spatially reachable instead of disappearing into filters."
+        },
+        {
+          "from": "Catalog reflow",
+          "raise": "Responsive layouts preserve whole agent-feed units rather than compressing them into illegibility."
+        },
+        {
+          "from": "Terminal wayfinding",
+          "raise": "Each alert exposes the single next safe decision, and rerouting updates immediately."
+        },
+        {
+          "from": "Origami recoverability",
+          "raise": "Intervention state is explicit, replayable, and linked back to the event that caused it."
+        },
+        {
+          "from": "Cloud-quarry depth",
+          "raise": "Nested workflow depth is structural and unmistakable, never decorative indentation."
+        }
+      ]
+    },
+    {
+      "id": "model-pick",
+      "label": "Flight Progress Bay",
+      "kicker": "IMPECCABLE’S PICK",
+      "lineage": "air-traffic flight-progress strips and controller bays",
+      "thesis": "Each agent run is a physical strip moving through a shared bay; exceptions get pulled forward and every handoff leaves a mark.",
+      "palette": ["#E9E4D6", "#172332", "#E8833A", "#B8443C"],
+      "materials": ["warm fiber strips", "graphite notation", "powder-coated rails"],
+      "viewport": "A fleet-wide strip bay dominates the screen, grouped by supervisor and workflow, with an attention rack above and a selected run’s event record opening beside it.",
+      "risk": "It is a familiar operations metaphor and can collapse into rows of tiny cards if the strip grammar is not enforced."
+    },
+    {
+      "id": "challenger-terminal-wayfinding",
+      "label": "Terminal Wayfinding",
+      "verdict": "competitive",
+      "lineage": "international airport sign systems",
+      "thesis": "The interface routes the operator from fleet overview to the next consequential decision with uncompromising signage.",
+      "palette": ["#F5C400", "#111111", "#FFFFFF", "#60656B"],
+      "materials": ["framed overhead bands", "backlit pictograms", "split-flap updates"],
+      "viewport": "A monumental attention band names the fleet’s next decision while supervisor corridors and agent destinations recede beneath it with time-to-impact labels.",
+      "case": "It wins immediate action clarity, but identifies less strongly with a developer managing concurrent technical work.",
+      "risk": "A one-decision-at-a-time system can hide useful peripheral awareness during a large incident.",
+      "hero": "https://impeccable.style/worlds/cards/wayfinding-cartography-signage-terminal-yellow-wayfinding-hero.webp",
+      "board": "https://impeccable.style/worlds/cards/wayfinding-cartography-signage-terminal-yellow-wayfinding.webp"
+    },
+    {
+      "id": "challenger-arcade",
+      "label": "Arcade Fleet Grid",
+      "verdict": "declined",
+      "lineage": "pixel-art arcade cabinet screens",
+      "thesis": "Agents become strict tile-bound actors with unmistakable sprite states.",
+      "palette": ["#090A0D", "#F6D44A", "#42C7A5", "#F3F1E8"],
+      "materials": ["integer pixels", "scanline gaps", "phosphor bloom"],
+      "viewport": "A tile-grid fleet stage ranks active agents beneath a compact score rail.",
+      "case": "The state grammar is excellent, but the game frame weakens trust and reduces complex work to characters.",
+      "kept": "Critical states now obey shape, label, and palette laws.",
+      "risk": "Large-fleet supervision would read as gamified rather than operational.",
+      "hero": "https://impeccable.style/worlds/cards/medium-native-crt-arcade-pixel-glow-hero.webp"
+    },
+    {
+      "id": "challenger-cutting-bench",
+      "label": "Cutting Bench",
+      "verdict": "declined",
+      "lineage": "film workprints, perforated rails, and pinned trims",
+      "thesis": "Agent execution becomes a scrubbable workprint where stopped and deferred moments remain pinned in view.",
+      "palette": ["#0A0A0A", "#D96A2B", "#F4F0E8", "#7D7A73"],
+      "materials": ["coarse film grain", "grease marks", "folded tape flags"],
+      "viewport": "A perforated event rail crosses the screen with intervention moments flagged and paused runs hanging below.",
+      "case": "It explains one run beautifully but cannot carry a large simultaneous fleet as clearly as the multiview.",
+      "kept": "Deferred and paused work remains spatially reachable.",
+      "risk": "The linear rail overstates sequence and understates concurrency.",
+      "hero": "https://impeccable.style/worlds/cards/operate-a-cutting-bench-select-rail-hero.webp"
+    },
+    {
+      "id": "challenger-character-catalog",
+      "label": "Character Catalog",
+      "verdict": "declined",
+      "lineage": "ranked character-goods catalogs",
+      "thesis": "A finite agent roster reflows as stable whole cells with distinct identities.",
+      "palette": ["#F3D7E5", "#C9E7DB", "#F6E5A6", "#423B46"],
+      "materials": ["flat mascot fills", "white keylines", "ribbon labels"],
+      "viewport": "A ranked pastel roster fills the screen with one personality-led cell per agent.",
+      "case": "The roster remains legible, but anthropomorphism obscures work state and intervention consequence.",
+      "kept": "Responsive layouts preserve whole feed units.",
+      "risk": "It makes consequential approvals feel collectible and unserious.",
+      "hero": "https://impeccable.style/worlds/cards/pop-culture-shelf-character-goods-catalog-hero.webp"
+    },
+    {
+      "id": "challenger-origami",
+      "label": "Recoverable Fold",
+      "verdict": "declined",
+      "lineage": "orizuru folding sequences",
+      "thesis": "Every workflow exposes its current transformation and every intervention remains recoverable.",
+      "palette": ["#C8372D", "#F5F0E6", "#1B1B1B", "#C6A24A"],
+      "materials": ["vermilion washi", "fold-white creases", "sumi notation"],
+      "viewport": "One workflow’s state graph unfolds as a precise crease diagram beside its current execution form.",
+      "case": "It communicates state lineage but cannot provide fast fleet-wide comparison.",
+      "kept": "Every intervention links back to a recoverable event state.",
+      "risk": "The continuous-sheet metaphor breaks across independent supervisors and failures.",
+      "hero": "https://impeccable.style/worlds/cards/paper-folds-pleats-deployable-orizuru-crane-sequence-hero.webp"
+    },
+    {
+      "id": "challenger-cloud-quarry",
+      "label": "Cloud Quarry",
+      "verdict": "declined",
+      "lineage": "surreal industrial cloud architecture",
+      "thesis": "Nested workflows become atmospheric blocks whose density exposes operational weight.",
+      "palette": ["#F4F4EF", "#62A9D8", "#535B63", "#B7C0C7"],
+      "materials": ["cumulus mass", "sky voids", "silver cut lines"],
+      "viewport": "A sectional fleet landscape stacks workflow blocks around deep blue structural gaps.",
+      "case": "The depth is memorable, but abstract mass conceals precise status and safe controls.",
+      "kept": "Nested workflow depth becomes structural rather than decorative.",
+      "risk": "Atmosphere would compete directly with operational certainty.",
+      "hero": "https://impeccable.style/worlds/cards/dream-surreal-impossible-worlds-cloud-quarry-hero.webp"
+    }
+  ],
+  "reroll": { "registers": ["safer", "bolder"] },
+  "buildPath": { "value": "code", "toggle": false },
+  "canon": true,
+  "canonCard": {
+    "label": "The category standard",
+    "thesis": "A polished dark developer dashboard with sidebar navigation, KPI cards, an activity feed, and a chat-style run inspector.",
+    "palette": ["#0F1115", "#F2F4F7", "#6D5EF5", "#2DD4BF"],
+    "materials": ["soft cards", "hairline borders", "colored status dots"],
+    "viewport": "A left sidebar and top metrics frame a center fleet table with a right-hand event inspector.",
+    "risk": "Immediately usable but visually and structurally indistinguishable from generic AI operations tools."
+  },
+  "steer": true
+}

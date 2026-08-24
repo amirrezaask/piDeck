@@ -1,0 +1,33 @@
+{
+  "name": "pideck",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "dev:web": "pnpm --filter @pideck/web dev",
+    "dev:supervisor": "pnpm --filter @pideck/server dev",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "test:coverage": "pnpm --filter @pideck/web test:coverage",
+    "test:e2e": "playwright test",
+    "lint": "turbo run lint && biome check tests playwright.config.ts",
+    "format": "biome format --write apps packages",
+    "format:check": "biome format apps packages"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.4",
+    "@playwright/test": "^1.55.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.13.3",
+    "kysely": "^0.28.5",
+    "tsx": "^4.20.3",
+    "turbo": "^2.5.6",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
