@@ -29,6 +29,10 @@
     "@nextflow/observability": "workspace:*",
     "@nextflow/test-agents": "workspace:*",
     "fastify": "^5.4.0",
+    "ws": "^8.21.3",
     "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
   }
 }

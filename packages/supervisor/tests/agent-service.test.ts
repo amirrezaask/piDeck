@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
@@ -70,6 +70,50 @@ describe('ManagedAgentService', () => {
     }
   });
 
+  it('normalizes home-relative paths before creating a session', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({
+        systemPrompt: 'You are a project agent.',
+        cwd: '~',
+      });
+      const run = await context.service.createRun({
+        agentId: agent.id,
+        prompt: 'Inspect the project.',
+      });
+
+      expect(run.cwd).toBe(homedir());
+      expect(context.factory.requests[0]?.cwd).toBe(homedir());
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('adds the run working directory to the reusable project list', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'You are a project agent.' });
+      await context.service.createRun({
+        agentId: agent.id,
+        prompt: 'Inspect the project.',
+        cwd: context.directory,
+      });
+
+      const projects = await context.connection.db
+        .selectFrom('supervisor_projects')
+        .select(['name', 'path'])
+        .execute();
+      expect(projects).toEqual([
+        expect.objectContaining({
+          name: context.directory.split('/').at(-1),
+          path: context.directory,
+        }),
+      ]);
+    } finally {
+      await context.close();
+    }
+  });
+
   it('creates a session per run and associates persisted events with that run', async () => {
     const context = await createService();
     try {
@@ -108,6 +152,35 @@ describe('ManagedAgentService', () => {
       const events = await context.service.listRunEvents(run.id, { afterSequence: 0 });
       expect(events.length).toBeGreaterThan(0);
       expect(events.every((event) => event.runId === run.id)).toBe(true);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('keeps a completed session available for follow-up chat', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Start.' });
+      const session = context.factory.sessions[0];
+      if (!session) throw new Error('Fake session was not created');
+
+      session.settle();
+      await waitForEvent(context.service, agent.id, 'agent_settled');
+      expect((await context.service.getRun(run.id))?.status).toBe('completed');
+
+      const followUp = await context.service.followUpRun(run.id, { message: 'Continue.' });
+      expect(followUp.status).toBe('running');
+      expect(session.prompts).toEqual(['Start.', 'Continue.']);
+      session.settle();
+      await waitForEvent(context.service, agent.id, 'agent_settled');
+      expect((await context.service.getRun(run.id))?.status).toBe('completed');
+
+      const nextRun = await context.service.createRun({
+        agentId: agent.id,
+        prompt: 'Start another.',
+      });
+      expect(nextRun.status).toBe('running');
     } finally {
       await context.close();
     }

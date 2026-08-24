@@ -12,6 +12,7 @@ import type {
   AgentToolName,
   ManagedAgentModelsResponse,
 } from '@nextflow/contracts';
+import { resolveWorkingDirectory } from './working-directory.js';
 
 export interface ManagedPiSession {
   readonly sessionId: string;
@@ -139,7 +140,7 @@ export class SdkPiSessionFactory implements PiSessionFactory {
   private modelRuntime?: Promise<ModelRuntime>;
 
   constructor(options: SdkPiSessionFactoryOptions = {}) {
-    this.defaultCwd = resolve(options.defaultCwd ?? process.cwd());
+    this.defaultCwd = resolveWorkingDirectory(options.defaultCwd ?? process.cwd());
     this.sessionDirectory = options.sessionDirectory
       ? resolve(options.sessionDirectory)
       : undefined;
@@ -160,7 +161,7 @@ export class SdkPiSessionFactory implements PiSessionFactory {
   }
 
   async create(options: CreatePiSessionOptions): Promise<ManagedPiSession> {
-    const cwd = resolve(options.cwd ?? this.defaultCwd);
+    const cwd = resolveWorkingDirectory(options.cwd ?? this.defaultCwd);
     const pi = await this.getPiModule();
     const agentDir = pi.getAgentDir();
     const resourceLoader = new pi.DefaultResourceLoader({

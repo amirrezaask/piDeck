@@ -6,6 +6,8 @@ import {
   CreateManagedAgentRequestSchema,
   type CreateManagedAgentRunRequest,
   CreateManagedAgentRunRequestSchema,
+  type CreateManagedProjectRequest,
+  CreateManagedProjectRequestSchema,
   ErrorResponseSchema,
   type ManagedAgentEvent,
   ManagedAgentEventSchema,
@@ -23,6 +25,11 @@ import {
   ManagedAgentRunListResponseSchema,
   type ManagedAgentRunResponse,
   ManagedAgentRunResponseSchema,
+  type ManagedProjectListQuery,
+  type ManagedProjectListResponse,
+  ManagedProjectListResponseSchema,
+  type ManagedProjectResponse,
+  ManagedProjectResponseSchema,
   type UpdateManagedAgentRequest,
   UpdateManagedAgentRequestSchema,
 } from '@nextflow/contracts';
@@ -36,6 +43,7 @@ export interface SupervisorClientOptions {
   readonly baseUrl?: string;
   readonly serviceToken?: string;
   readonly fetcher?: typeof fetch;
+  readonly webSocketFactory?: typeof WebSocket;
 }
 
 export interface StreamAgentEventsOptions {
@@ -47,11 +55,13 @@ export class SupervisorClient {
   private readonly baseUrl: string;
   private readonly serviceToken: string | undefined;
   private readonly fetcher: typeof fetch;
+  private readonly webSocketFactory: typeof WebSocket | undefined;
 
   constructor(options: SupervisorClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? '/supervisor-api').replace(/\/$/, '');
     this.serviceToken = options.serviceToken;
     this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
+    this.webSocketFactory = options.webSocketFactory ?? globalThis.WebSocket;
   }
 
   createAgent(request: CreateManagedAgentRequest): Promise<ManagedAgentResponse> {
@@ -70,6 +80,27 @@ export class SupervisorClient {
       method: 'POST',
       body: JSON.stringify(CreateManagedAgentRunRequestSchema.parse(request)),
     });
+  }
+
+  createProject(request: CreateManagedProjectRequest): Promise<ManagedProjectResponse> {
+    return this.request('/v1/projects', ManagedProjectResponseSchema, {
+      method: 'POST',
+      body: JSON.stringify(CreateManagedProjectRequestSchema.parse(request)),
+    });
+  }
+
+  deleteProject(projectId: string): Promise<ManagedProjectResponse> {
+    return this.request(
+      `/v1/projects/${encodeURIComponent(projectId)}`,
+      ManagedProjectResponseSchema,
+      { method: 'DELETE' },
+    );
+  }
+
+  listProjects(query: Partial<ManagedProjectListQuery> = {}): Promise<ManagedProjectListResponse> {
+    const params = new URLSearchParams({ limit: String(query.limit ?? 100) });
+    if (query.cursor) params.set('cursor', query.cursor);
+    return this.request(`/v1/projects?${params.toString()}`, ManagedProjectListResponseSchema);
   }
 
   listRuns(query: Partial<ManagedAgentRunListQuery> = {}): Promise<ManagedAgentRunListResponse> {
@@ -157,20 +188,51 @@ export class SupervisorClient {
     path: string,
     options: StreamAgentEventsOptions,
   ): AsyncGenerator<ManagedAgentEvent> {
+    if (!this.webSocketFactory) throw new Error('WebSocket is not available in this environment');
+
     const params = new URLSearchParams({
       afterSequence: String(options.afterSequence ?? 0),
     });
-    const response = await this.fetcher(`${this.baseUrl}${path}?${params.toString()}`, {
-      method: 'GET',
-      ...(options.signal ? { signal: options.signal } : {}),
-      headers: this.headers('text/event-stream'),
-    });
-    if (!response.ok) throw await responseError(response);
-    if (!response.body) throw new Error('Supervisor event stream returned no response body');
+    const socketUrl = this.websocketUrl(path, params);
+    const socket = new this.webSocketFactory(socketUrl);
+    const queue = new AsyncEventQueue<ManagedAgentEvent>();
+    const abort = () => {
+      queue.end();
+      socket.close();
+    };
 
-    for await (const payload of parseServerSentEvents(response.body)) {
-      yield ManagedAgentEventSchema.parse(payload);
+    socket.onmessage = (event) => {
+      try {
+        const payload = typeof event.data === 'string' ? event.data : String(event.data);
+        queue.push(ManagedAgentEventSchema.parse(JSON.parse(payload) as unknown));
+      } catch (reason) {
+        queue.fail(reason instanceof Error ? reason : new Error('Invalid Supervisor event'));
+        socket.close();
+      }
+    };
+    socket.onerror = () => queue.fail(new Error('Supervisor event WebSocket failed'));
+    socket.onclose = () => queue.end();
+    options.signal?.addEventListener('abort', abort, { once: true });
+
+    try {
+      while (true) {
+        const result = await queue.next();
+        if (result.done) return;
+        yield result.value;
+      }
+    } finally {
+      options.signal?.removeEventListener('abort', abort);
+      socket.close();
     }
+  }
+
+  private websocketUrl(path: string, params: URLSearchParams): string {
+    const origin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
+    const url = new URL(`${this.baseUrl}${path}`, origin);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    params.forEach((value, key) => url.searchParams.set(key, value));
+    if (this.serviceToken) url.searchParams.set('token', this.serviceToken);
+    return url.toString();
   }
 
   private runCommand(
@@ -212,52 +274,37 @@ export class SupervisorClient {
   }
 }
 
-export async function* parseServerSentEvents(
-  stream: ReadableStream<Uint8Array>,
-): AsyncGenerator<unknown> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let dataLines: string[] = [];
+class AsyncEventQueue<T> {
+  private readonly values: T[] = [];
+  private readonly waiters: Array<(result: IteratorResult<T>) => void> = [];
+  private ended = false;
+  private failure: Error | undefined;
 
-  const parseBlock = (): unknown | undefined => {
-    if (dataLines.length === 0) return undefined;
-    const data = dataLines.join('\n');
-    dataLines = [];
-    return JSON.parse(data) as unknown;
-  };
+  push(value: T): void {
+    if (this.ended) return;
+    const waiter = this.waiters.shift();
+    if (waiter) waiter({ done: false, value });
+    else this.values.push(value);
+  }
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      buffer += decoder.decode(value, { stream: !done });
+  fail(error: Error): void {
+    if (this.ended) return;
+    this.failure = error;
+    this.end();
+  }
 
-      let newlineIndex = buffer.indexOf('\n');
-      while (newlineIndex >= 0) {
-        let line = buffer.slice(0, newlineIndex);
-        buffer = buffer.slice(newlineIndex + 1);
-        if (line.endsWith('\r')) line = line.slice(0, -1);
+  end(): void {
+    if (this.ended) return;
+    this.ended = true;
+    while (this.waiters.length > 0) this.waiters.shift()?.({ done: true, value: undefined });
+  }
 
-        if (line === '') {
-          const payload = parseBlock();
-          if (payload !== undefined) yield payload;
-        } else if (line.startsWith('data:')) {
-          dataLines.push(line.slice(5).replace(/^ /, ''));
-        }
-        newlineIndex = buffer.indexOf('\n');
-      }
-
-      if (done) break;
-    }
-
-    if (buffer.length > 0) {
-      const line = buffer.endsWith('\r') ? buffer.slice(0, -1) : buffer;
-      if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
-    }
-    const payload = parseBlock();
-    if (payload !== undefined) yield payload;
-  } finally {
-    reader.releaseLock();
+  next(): Promise<IteratorResult<T>> {
+    const value = this.values.shift();
+    if (value !== undefined) return Promise.resolve({ done: false, value });
+    if (this.failure) return Promise.reject(this.failure);
+    if (this.ended) return Promise.resolve({ done: true, value: undefined });
+    return new Promise((resolve) => this.waiters.push(resolve));
   }
 }
 

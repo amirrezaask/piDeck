@@ -20,6 +20,10 @@ export {
   type SdkPiSessionFactoryOptions,
 } from './pi-session.js';
 export {
+  ProjectService,
+  type ProjectServiceOptions,
+} from './project-service.js';
+export {
   type CreateExecutionResult,
   ExecutionNotCancellableError,
   ExecutionNotFoundError,

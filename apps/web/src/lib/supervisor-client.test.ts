@@ -1,7 +1,7 @@
 import type { ManagedAgentResponse } from '@nextflow/contracts';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from './api-error';
-import { modelDisplayName, parseServerSentEvents, SupervisorClient } from './supervisor-client';
+import { modelDisplayName, SupervisorClient } from './supervisor-client';
 
 const agentId = '018bcfe4-7a4b-7000-8000-000000000111';
 const timestamp = '2026-08-23T20:00:00.000Z';
@@ -22,6 +22,36 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+class FakeWebSocket {
+  static last: FakeWebSocket | undefined;
+  readonly url: string;
+  readonly readyState = 1;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+
+  constructor(url: string) {
+    this.url = url;
+    FakeWebSocket.last = this;
+    queueMicrotask(() =>
+      this.onmessage?.({
+        data: JSON.stringify({
+          agentId,
+          runId: null,
+          sequence: 1,
+          type: 'agent_start',
+          payload: {},
+          createdAt: timestamp,
+        }),
+      }),
+    );
+  }
+
+  close(): void {
+    this.onclose?.();
+  }
 }
 
 describe('SupervisorClient', () => {
@@ -67,6 +97,51 @@ describe('SupervisorClient', () => {
           tools: ['read', 'bash'],
         }),
       }),
+    );
+  });
+
+  it('creates and lists projects with validated paths', async () => {
+    const project = {
+      id: '018bcfe4-7a4b-7000-8000-000000000333',
+      name: 'workspace',
+      path: '/workspace',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastUsedAt: timestamp,
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(project, 201))
+      .mockResolvedValueOnce(jsonResponse({ projects: [project], nextCursor: null }));
+    const client = new SupervisorClient({ baseUrl: '/supervisor-api', fetcher });
+
+    await expect(client.createProject({ path: '/workspace' })).resolves.toEqual(project);
+    await expect(client.listProjects({ limit: 12 })).resolves.toEqual({
+      projects: [project],
+      nextCursor: null,
+    });
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      '/supervisor-api/v1/projects',
+      '/supervisor-api/v1/projects?limit=12',
+    ]);
+  });
+
+  it('deletes a project by id', async () => {
+    const project = {
+      id: '018bcfe4-7a4b-7000-8000-000000000333',
+      name: 'workspace',
+      path: '/workspace',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastUsedAt: timestamp,
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(project));
+    const client = new SupervisorClient({ baseUrl: '/supervisor-api', fetcher });
+
+    await expect(client.deleteProject(project.id)).resolves.toEqual(project);
+    expect(fetcher).toHaveBeenCalledWith(
+      `/supervisor-api/v1/projects/${project.id}`,
+      expect.objectContaining({ method: 'DELETE' }),
     );
   });
 
@@ -194,75 +269,21 @@ describe('SupervisorClient', () => {
     await expect(client.getAgent(agentId)).rejects.toThrow();
   });
 
-  it('streams fragmented SSE frames and ignores comments and event metadata', async () => {
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(encoder.encode(': keep-alive\r\nid: 1\r\nevent: agent_start\r\nda'));
-        controller.enqueue(
-          encoder.encode(
-            `ta: ${JSON.stringify({
-              agentId,
-              runId: null,
-              sequence: 1,
-              type: 'agent_start',
-              payload: {},
-              createdAt: timestamp,
-            })}\r\n\r\n`,
-          ),
-        );
-        controller.enqueue(
-          encoder.encode(
-            `data: ${JSON.stringify({
-              agentId,
-              runId: null,
-              sequence: 2,
-              type: 'message_update',
-              payload: { delta: 'hello' },
-              createdAt: timestamp,
-            })}\n\n`,
-          ),
-        );
-        controller.close();
-      },
+  it('streams JSON event frames over WebSocket after the requested sequence', async () => {
+    const client = new SupervisorClient({
+      baseUrl: '/supervisor-api',
+      webSocketFactory: FakeWebSocket as unknown as typeof WebSocket,
     });
-    const fetcher = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(
-        new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
-      );
-    const client = new SupervisorClient({ fetcher });
 
     const events = [];
-    for await (const event of client.streamEvents(agentId, { afterSequence: 0 })) {
+    for await (const event of client.streamEvents(agentId, { afterSequence: 7 })) {
       events.push(event);
+      FakeWebSocket.last?.onclose?.();
     }
 
-    expect(events.map((event) => [event.sequence, event.type])).toEqual([
-      [1, 'agent_start'],
-      [2, 'message_update'],
-    ]);
-    expect(fetcher).toHaveBeenCalledWith(
-      `/supervisor-api/v1/agents/${agentId}/stream?afterSequence=0`,
-      expect.objectContaining({
-        method: 'GET',
-        headers: expect.objectContaining({ Accept: 'text/event-stream' }),
-      }),
+    expect(events.map((event) => [event.sequence, event.type])).toEqual([[1, 'agent_start']]);
+    expect(FakeWebSocket.last?.url).toBe(
+      `ws://localhost:3000/supervisor-api/v1/agents/${agentId}/stream?afterSequence=7`,
     );
-  });
-});
-
-describe('parseServerSentEvents', () => {
-  it('joins multiple data lines and flushes a final frame without a blank line', async () => {
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(encoder.encode('data: {"value":\ndata: 42}'));
-        controller.close();
-      },
-    });
-    const values = [];
-    for await (const value of parseServerSentEvents(stream)) values.push(value);
-    expect(values).toEqual([{ value: 42 }]);
   });
 });

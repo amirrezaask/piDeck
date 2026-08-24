@@ -49,6 +49,7 @@
 }
 
 :root {
+  color-scheme: light;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -84,6 +85,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
@@ -127,6 +129,42 @@
   html {
     @apply font-sans;
   }
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 24%, transparent);
+    color: var(--foreground);
+  }
+}
+
+[data-slot="code-block"] .shiki-code .shiki,
+[data-slot="code-block"] .shiki-code-fallback {
+  margin: 0;
+  min-width: max-content;
+  background: transparent;
+  padding: 0.75rem 0.875rem;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  text-align: left;
+}
+
+[data-slot="code-block"] .shiki-code .shiki code {
+  display: block;
+  background: transparent;
+}
+
+[data-slot="code-block"] .shiki-code .shiki .line {
+  display: block;
+  min-height: 1.4em;
+}
+
+[data-slot="code-block"] .shiki-code .shiki span {
+  color: var(--shiki-light);
+}
+
+.dark [data-slot="code-block"] .shiki-code .shiki span {
+  color: var(--shiki-dark);
 }
 
 @media (prefers-reduced-motion: reduce) {

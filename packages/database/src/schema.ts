@@ -245,6 +245,15 @@ export interface SupervisorAgentCommandReceiptsTable {
   completed_at: Nullable<string>;
 }
 
+export interface SupervisorProjectsTable {
+  id: string;
+  name: string;
+  path: string;
+  created_at: string;
+  updated_at: string;
+  last_used_at: string;
+}
+
 export interface IdentityDatabase {
   identity_users: IdentityUsersTable;
   identity_roles: IdentityRolesTable;
@@ -272,6 +281,7 @@ export interface SupervisorDatabase {
   supervisor_agent_events: SupervisorAgentEventsTable;
   supervisor_agent_runs: SupervisorAgentRunsTable;
   supervisor_agent_command_receipts: SupervisorAgentCommandReceiptsTable;
+  supervisor_projects: SupervisorProjectsTable;
 }
 
 export interface MigrationDatabase extends WorkflowDatabase, SupervisorDatabase {}

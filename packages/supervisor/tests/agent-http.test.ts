@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ManagedAgentResponse } from '@nextflow/contracts';
@@ -12,6 +12,7 @@ async function withAgentApp<T>(
   callback: (context: {
     server: ReturnType<typeof buildSupervisorApp>['server'];
     factory: FakePiSessionFactory;
+    directory: string;
   }) => Promise<T>,
   options: { serviceToken?: string; piSessionFactory?: FakePiSessionFactory } = {},
 ): Promise<T> {
@@ -27,7 +28,7 @@ async function withAgentApp<T>(
     piSessionFactory: factory,
   });
   try {
-    return await callback({ server: app.server, factory });
+    return await callback({ server: app.server, factory, directory });
   } finally {
     await app.server.close();
     rmSync(directory, { recursive: true, force: true });
@@ -63,12 +64,70 @@ describe('Supervisor managed-agent HTTP API', () => {
     );
   });
 
+  it('persists projects and exposes them for the composer', async () => {
+    await withAgentApp(async ({ server }) => {
+      const created = await server.inject({
+        method: 'POST',
+        url: '/v1/projects',
+        payload: { path: '~' },
+      });
+      expect(created.statusCode).toBe(201);
+      expect(created.json()).toMatchObject({
+        name: homedir().split('/').at(-1),
+        path: homedir(),
+      });
+
+      const listed = await server.inject({ method: 'GET', url: '/v1/projects?limit=100' });
+      expect(listed.statusCode).toBe(200);
+      expect(listed.json()).toMatchObject({
+        projects: [expect.objectContaining({ path: homedir() })],
+        nextCursor: null,
+      });
+    });
+  });
+
+  it('deletes a saved project without affecting its directory', async () => {
+    await withAgentApp(async ({ server }) => {
+      const created = await server.inject({
+        method: 'POST',
+        url: '/v1/projects',
+        payload: { path: '~' },
+      });
+      const project = created.json<{ id: string }>();
+
+      const deleted = await server.inject({
+        method: 'DELETE',
+        url: `/v1/projects/${project.id}`,
+      });
+      expect(deleted.statusCode).toBe(200);
+      expect(deleted.json()).toMatchObject({ id: project.id, path: homedir() });
+
+      const listed = await server.inject({ method: 'GET', url: '/v1/projects?limit=100' });
+      expect(listed.json()).toMatchObject({ projects: [] });
+    });
+  });
+
+  it('rejects project paths that do not exist', async () => {
+    await withAgentApp(async ({ server }) => {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/v1/projects',
+        payload: { path: '/definitely/missing/pideck-path' },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: { code: 'validation_failed' },
+      });
+    });
+  });
+
   it('creates an inert definition and starts a run-owned session', async () => {
-    await withAgentApp(async ({ server, factory }) => {
+    await withAgentApp(async ({ server, factory, directory }) => {
       const createdResponse = await server.inject({
         method: 'POST',
         url: '/v1/agents',
-        payload: createPayload,
+        payload: { ...createPayload, cwd: directory },
       });
       const created = createdResponse.json<ManagedAgentResponse>();
       expect(createdResponse.statusCode).toBe(201);
@@ -76,7 +135,7 @@ describe('Supervisor managed-agent HTTP API', () => {
         name: 'CI review agent',
         systemPrompt: 'You are a CI agent.',
         model: { provider: 'fake', id: 'fake-model' },
-        cwd: '/tmp/project',
+        cwd: directory,
       });
       expect(created).not.toHaveProperty('status');
       expect(factory.requests).toEqual([]);
@@ -127,11 +186,11 @@ describe('Supervisor managed-agent HTTP API', () => {
   it('returns a failed run when session creation fails while retaining the definition', async () => {
     const factory = new FakePiSessionFactory({ createError: new Error('no model credentials') });
     await withAgentApp(
-      async ({ server }) => {
+      async ({ server, directory }) => {
         const create = await server.inject({
           method: 'POST',
           url: '/v1/agents',
-          payload: createPayload,
+          payload: { ...createPayload, cwd: directory },
         });
         const agent = create.json<ManagedAgentResponse>();
         const run = await server.inject({

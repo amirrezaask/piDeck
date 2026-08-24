@@ -11,6 +11,7 @@
     "dev": "turbo run dev",
     "dev:web": "pnpm --filter @pideck/web dev",
     "dev:supervisor": "pnpm --filter @pideck/server dev",
+    "db:migrate": "tsx packages/database/src/migrate.ts",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "test:coverage": "pnpm --filter @pideck/web test:coverage",

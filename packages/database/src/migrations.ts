@@ -8,6 +8,7 @@ import { supervisorAgentNamesMigration } from '../migrations/005_supervisor_agen
 import { supervisorAgentRunsMigration } from '../migrations/006_supervisor_agent_runs';
 import { supervisorAgentDefinitionRuntimeSplitMigration } from '../migrations/007_supervisor_agent_definition_runtime_split';
 import { supervisorRunConfigurationMigration } from '../migrations/008_supervisor_run_configuration';
+import { supervisorProjectsMigration } from '../migrations/009_supervisor_projects';
 import type { MigrationDatabase } from './schema';
 
 const migrations: Record<string, Migration> = {
@@ -19,6 +20,7 @@ const migrations: Record<string, Migration> = {
   '006_supervisor_agent_runs': supervisorAgentRunsMigration,
   '007_supervisor_agent_definition_runtime_split': supervisorAgentDefinitionRuntimeSplitMigration,
   '008_supervisor_run_configuration': supervisorRunConfigurationMigration,
+  '009_supervisor_projects': supervisorProjectsMigration,
 };
 
 const provider: MigrationProvider = {

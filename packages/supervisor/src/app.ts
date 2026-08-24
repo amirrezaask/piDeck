@@ -7,6 +7,7 @@ import {
   CreateExecutionRequestSchema,
   CreateManagedAgentRequestSchema,
   CreateManagedAgentRunRequestSchema,
+  CreateManagedProjectRequestSchema,
   type ErrorCode,
   ErrorResponseSchema,
   ExecutionEventsQuerySchema,
@@ -21,6 +22,8 @@ import {
   ManagedAgentRunListQuerySchema,
   ManagedAgentRunListResponseSchema,
   ManagedAgentRunResponseSchema,
+  ManagedProjectListQuerySchema,
+  ManagedProjectListResponseSchema,
   UpdateManagedAgentRequestSchema,
 } from '@nextflow/contracts';
 import {
@@ -34,6 +37,7 @@ import { createLogger } from '@nextflow/observability';
 import { createTestAgentFactory } from '@nextflow/test-agents';
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import type { Kysely } from 'kysely';
+import { WebSocket, WebSocketServer } from 'ws';
 import { z } from 'zod';
 import {
   ManagedAgentBusyError,
@@ -45,15 +49,18 @@ import {
 } from './agent-service.js';
 import type { PiSessionFactory } from './pi-session.js';
 import { SdkPiSessionFactory } from './pi-session.js';
+import { ProjectService } from './project-service.js';
 import {
   ExecutionNotCancellableError,
   ExecutionNotFoundError,
   SupervisorService,
 } from './service.js';
+import { InvalidWorkingDirectoryError, resolveWorkingDirectory } from './working-directory.js';
 
 const ExecutionParamsSchema = z.object({ executionId: z.string().min(1) });
 const AgentParamsSchema = z.object({ agentId: z.string().uuid() });
 const AgentRunParamsSchema = z.object({ runId: z.string().uuid() });
+const ProjectParamsSchema = z.object({ projectId: z.string().uuid() });
 
 export interface SupervisorAppOptions {
   databasePath: string;
@@ -71,6 +78,7 @@ export interface SupervisorApp {
   readonly database: NextflowDatabase<SupervisorDatabase>;
   readonly service: SupervisorService;
   readonly agents: ManagedAgentService;
+  readonly projects: ProjectService;
 }
 
 export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp {
@@ -87,7 +95,8 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     agentFactory: options.agentFactory ?? createTestAgentFactory(),
     logger: serviceLogger,
   });
-  const defaultCwd = resolve(options.agentDefaultCwd ?? process.cwd());
+  const defaultCwd = resolveWorkingDirectory(options.agentDefaultCwd ?? process.cwd());
+  const projects = new ProjectService({ db: database.db });
   const sessionFactory =
     options.piSessionFactory ??
     new SdkPiSessionFactory({
@@ -100,8 +109,97 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     sessionFactory,
     defaultCwd,
     logger: serviceLogger,
+    projectService: projects,
   });
   const server = Fastify({ logger: options.logger ?? false, requestIdHeader: 'x-request-id' });
+  const eventWebSocketServer = new WebSocketServer({ noServer: true });
+  const eventSockets = new Set<WebSocket>();
+
+  server.server.on('upgrade', (request, socket, head) => {
+    const requestUrl = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+    const runMatch = requestUrl.pathname.match(/^\/v1\/runs\/([^/]+)\/stream$/);
+    const agentMatch = requestUrl.pathname.match(/^\/v1\/agents\/([^/]+)\/stream$/);
+    const resource = runMatch
+      ? { type: 'run' as const, id: runMatch[1] }
+      : agentMatch
+        ? { type: 'agent' as const, id: agentMatch[1] }
+        : undefined;
+    if (!resource) return;
+
+    const authorized =
+      !options.serviceToken ||
+      request.headers.authorization === `Bearer ${options.serviceToken}` ||
+      requestUrl.searchParams.get('token') === options.serviceToken;
+    if (!authorized) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    const query = ManagedAgentEventsQuerySchema.safeParse({
+      afterSequence: requestUrl.searchParams.get('afterSequence') ?? 0,
+    });
+    if (!query.success) {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    eventWebSocketServer.handleUpgrade(request, socket, head, (eventSocket) => {
+      eventWebSocketServer.emit(
+        'connection',
+        eventSocket,
+        request,
+        resource.type,
+        resource.id,
+        query.data.afterSequence,
+      );
+    });
+  });
+
+  eventWebSocketServer.on(
+    'connection',
+    (
+      socket: WebSocket,
+      _request: unknown,
+      resourceType: 'agent' | 'run',
+      resourceId: string,
+      afterSequence: number,
+    ) => {
+      eventSockets.add(socket);
+      let unsubscribe: (() => void) | undefined;
+      let closed = false;
+      const heartbeat = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) socket.ping();
+      }, 15_000);
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(heartbeat);
+        unsubscribe?.();
+        eventSockets.delete(socket);
+      };
+      socket.once('close', cleanup);
+      socket.once('error', cleanup);
+
+      const stream =
+        resourceType === 'run'
+          ? agents.streamRun(resourceId, afterSequence, (event) => {
+              if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event));
+            })
+          : agents.streamAgent(resourceId, afterSequence, (event) => {
+              if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event));
+            });
+      void stream
+        .then((nextUnsubscribe) => {
+          if (closed) nextUnsubscribe();
+          else unsubscribe = nextUnsubscribe;
+        })
+        .catch(() => {
+          if (!closed) socket.close(1008, 'Event resource not found');
+        });
+    },
+  );
   server.setErrorHandler((error, _request, reply) => {
     if (error instanceof z.ZodError) {
       return sendError(reply, 400, 'validation_failed', 'The request is invalid', error.issues);
@@ -142,6 +240,43 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
 
     const agent = await agents.createAgent(parsed.data);
     return reply.code(201).send(agent);
+  });
+
+  server.post('/v1/projects', async (request, reply) => {
+    const parsed = CreateManagedProjectRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return sendError(
+        reply,
+        400,
+        'validation_failed',
+        'The project request is invalid',
+        parsed.error.issues,
+      );
+    }
+    return reply.code(201).send(await projects.createProject(parsed.data));
+  });
+
+  server.delete('/v1/projects/:projectId', async (request, reply) => {
+    const params = ProjectParamsSchema.parse(request.params);
+    const deleted = await projects.deleteProject(params.projectId);
+    if (!deleted) return sendError(reply, 404, 'not_found', 'Project not found');
+    return reply.send(deleted);
+  });
+
+  server.get('/v1/projects', async (request, reply) => {
+    const parsed = ManagedProjectListQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return sendError(
+        reply,
+        400,
+        'validation_failed',
+        'The project query is invalid',
+        parsed.error.issues,
+      );
+    }
+    return reply.send(
+      ManagedProjectListResponseSchema.parse(await projects.listProjects(parsed.data)),
+    );
   });
 
   server.post('/v1/runs', async (request, reply) => {
@@ -233,57 +368,6 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     }
   });
 
-  server.get('/v1/runs/:runId/stream', async (request, reply) => {
-    const params = AgentRunParamsSchema.parse(request.params);
-    const query = ManagedAgentEventsQuerySchema.safeParse(request.query);
-    if (!query.success) {
-      return sendError(
-        reply,
-        400,
-        'validation_failed',
-        'The run event query is invalid',
-        query.error.issues,
-      );
-    }
-    if (!(await agents.getRun(params.runId))) {
-      return sendError(reply, 404, 'not_found', 'Run not found');
-    }
-
-    const lastEventId = request.headers['last-event-id'];
-    const headerSequence = typeof lastEventId === 'string' ? Number(lastEventId) : Number.NaN;
-    const afterSequence =
-      Number.isInteger(headerSequence) && headerSequence >= 0
-        ? Math.max(query.data.afterSequence, headerSequence)
-        : query.data.afterSequence;
-
-    reply.hijack();
-    reply.raw.writeHead(200, {
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'X-Accel-Buffering': 'no',
-    });
-    const send = (event: Parameters<ManagedAgentService['events']['publish']>[0]) => {
-      reply.raw.write(
-        `id: ${event.sequence}\\nevent: ${event.type}\\ndata: ${JSON.stringify(event)}\\n\\n`,
-      );
-    };
-    let unsubscribe: (() => void) | undefined;
-    try {
-      unsubscribe = await agents.streamRun(params.runId, afterSequence, send);
-    } catch {
-      reply.raw.end();
-      return reply;
-    }
-    const heartbeat = setInterval(() => {
-      reply.raw.write(': keep-alive\\n\\n');
-    }, 15_000);
-    request.raw.once('close', () => {
-      clearInterval(heartbeat);
-      unsubscribe?.();
-    });
-  });
-
   server.get('/v1/models', async (_request, reply) => {
     return reply.send(ManagedAgentModelsResponseSchema.parse(await agents.listModels()));
   });
@@ -350,58 +434,6 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
         events: await agents.listEvents(params.agentId, query.data),
       }),
     );
-  });
-
-  server.get('/v1/agents/:agentId/stream', async (request, reply) => {
-    const params = AgentParamsSchema.parse(request.params);
-    const query = ManagedAgentEventsQuerySchema.safeParse(request.query);
-    if (!query.success) {
-      return sendError(
-        reply,
-        400,
-        'validation_failed',
-        'The agent event query is invalid',
-        query.error.issues,
-      );
-    }
-    if (!(await agents.getAgent(params.agentId))) {
-      return sendError(reply, 404, 'not_found', 'Agent not found');
-    }
-
-    const lastEventId = request.headers['last-event-id'];
-    const headerSequence = typeof lastEventId === 'string' ? Number(lastEventId) : Number.NaN;
-    const afterSequence =
-      Number.isInteger(headerSequence) && headerSequence >= 0
-        ? Math.max(query.data.afterSequence, headerSequence)
-        : query.data.afterSequence;
-
-    reply.hijack();
-    reply.raw.writeHead(200, {
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'X-Accel-Buffering': 'no',
-    });
-    const send = (event: Parameters<ManagedAgentService['events']['publish']>[0]) => {
-      reply.raw.write(
-        `id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
-      );
-    };
-    let unsubscribe: (() => void) | undefined;
-    try {
-      unsubscribe = await agents.streamAgent(params.agentId, afterSequence, send);
-    } catch {
-      reply.raw.end();
-      return reply;
-    }
-    const heartbeat = setInterval(() => {
-      reply.raw.write(': keep-alive\n\n');
-    }, 15_000);
-    const cleanup = () => {
-      clearInterval(heartbeat);
-      unsubscribe?.();
-    };
-    request.raw.once('close', cleanup);
   });
 
   server.post('/v1/executions', async (request, reply) => {
@@ -542,12 +574,15 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     });
   }
   server.addHook('onClose', async () => {
+    for (const socket of eventSockets) socket.terminate();
+    eventSockets.clear();
+    eventWebSocketServer.close();
     await agents.close();
     await service.close();
     await database.close();
   });
 
-  return { server, database, service, agents };
+  return { server, database, service, agents, projects };
 }
 
 function sendError(
@@ -568,6 +603,9 @@ function sendError(
 }
 
 function handleError(reply: FastifyReply, error: unknown): FastifyReply {
+  if (error instanceof InvalidWorkingDirectoryError) {
+    return sendError(reply, 400, 'validation_failed', error.message, { path: error.path });
+  }
   if (error instanceof ExecutionNotFoundError) {
     return sendError(reply, 404, 'not_found', error.message);
   }

@@ -21,7 +21,7 @@ describe('database foundation', () => {
       const tables = connection.sqlite
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'kysely_%'")
         .all() as Array<{ name: string }>;
-      expect(tables).toHaveLength(20);
+      expect(tables).toHaveLength(21);
     } finally {
       await connection.close();
     }

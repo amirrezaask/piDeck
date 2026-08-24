@@ -1,5 +1,3 @@
-import { resolve } from 'node:path';
-
 import {
   type AgentMessageRequest,
   AgentMessageRequestSchema,
@@ -38,7 +36,9 @@ import {
 import { type Kysely, type Selectable, sql } from 'kysely';
 import { ManagedAgentEventHub } from './agent-event-hub.js';
 import type { CreatePiSessionOptions, ManagedPiSession, PiSessionFactory } from './pi-session.js';
+import { ProjectService } from './project-service.js';
 import type { SupervisorLogger } from './service.js';
+import { resolveWorkingDirectory } from './working-directory.js';
 
 const defaultLogger: SupervisorLogger = {
   info: (message, context) => console.info(message, context ?? ''),
@@ -54,6 +54,7 @@ interface ActiveRun {
   readonly agentId: string;
   readonly session: ManagedPiSession;
   readonly operations: Set<Promise<void>>;
+  settled: boolean;
   unsubscribe: () => void;
 }
 
@@ -115,6 +116,7 @@ export interface ManagedAgentServiceOptions {
   readonly logger?: SupervisorLogger;
   readonly now?: () => string;
   readonly idFactory?: () => string;
+  readonly projectService?: ProjectService;
 }
 
 /**
@@ -133,6 +135,7 @@ export class ManagedAgentService {
   private readonly logger: SupervisorLogger;
   private readonly now: () => string;
   private readonly idFactory: () => string;
+  private readonly projectService: ProjectService;
   private readonly activeRuns = new Map<string, ActiveRun>();
   private readonly eventTails = new Map<string, Promise<void>>();
   private readonly commandTails = new Map<string, Promise<void>>();
@@ -143,10 +146,12 @@ export class ManagedAgentService {
   constructor(options: ManagedAgentServiceOptions) {
     this.db = options.db;
     this.sessionFactory = options.sessionFactory;
-    this.defaultCwd = resolve(options.defaultCwd ?? process.cwd());
+    this.defaultCwd = resolveWorkingDirectory(options.defaultCwd ?? process.cwd());
     this.logger = options.logger ?? defaultLogger;
     this.now = options.now ?? nowIso;
     this.idFactory = options.idFactory ?? createId;
+    this.projectService =
+      options.projectService ?? new ProjectService({ db: options.db, now: this.now });
   }
 
   async start(): Promise<void> {
@@ -193,7 +198,7 @@ export class ManagedAgentService {
     const request = CreateManagedAgentRequestSchema.parse(input);
     const id = this.idFactory();
     const createdAt = this.now();
-    const cwd = resolve(request.cwd ?? this.defaultCwd);
+    const cwd = resolveWorkingDirectory(request.cwd ?? this.defaultCwd);
     const name = request.name ?? 'Pi agent';
     const toolsJson = request.tools ? encodeJson(request.tools) : null;
     if (await this.usesLegacyAgentRuntimeColumns()) {
@@ -241,6 +246,7 @@ export class ManagedAgentService {
     }
 
     const sessionOptions = createSessionOptions(agent, request);
+    await this.projectService.touchPath(sessionOptions.cwd ?? this.defaultCwd);
     const runId = this.idFactory();
     const createdAt = this.now();
     await this.db
@@ -401,9 +407,18 @@ export class ManagedAgentService {
 
   async deleteAgent(agentId: string): Promise<ManagedAgentResponse> {
     return this.serializeCommand(agentId, async () => {
-      if (this.findActiveRun(agentId)) {
+      const activeRuns = [...this.activeRuns.values()].filter(
+        (active) => active.agentId === agentId,
+      );
+      if (activeRuns.some((active) => active.session.isStreaming)) {
         throw new ManagedAgentBusyError(agentId, 'The agent has an active run');
       }
+      await Promise.all(
+        activeRuns.map(async (active) => {
+          await Promise.allSettled([...active.operations]);
+          await this.disposeActiveRun(active);
+        }),
+      );
       const row = await this.getAgentRow(agentId);
       if (!row) throw new ManagedAgentNotFoundError(agentId);
       await this.db.deleteFrom('supervisor_agents').where('id', '=', agentId).execute();
@@ -431,16 +446,21 @@ export class ManagedAgentService {
   async followUpRun(runId: string, input: AgentMessageRequest): Promise<ManagedAgentRunResponse> {
     const request = AgentMessageRequestSchema.parse(input);
     return this.serializeCommand(runId, async () => {
-      const active = await this.requireActiveRun(runId);
-      if (!active.session.isStreaming) {
-        throw new ManagedAgentBusyError(active.agentId, `Run ${runId} is not running`);
-      }
+      const active = await this.requireActiveRun(runId, { allowCompleted: true });
       try {
-        await active.session.followUp(request.message);
+        if (active.session.isStreaming) {
+          await active.session.followUp(request.message);
+        } else {
+          await this.markRunRunning(runId);
+          active.settled = false;
+          this.launchOperation(active, active.session.prompt(request.message));
+        }
       } catch (error) {
         throw commandError(active.agentId, error);
       }
-      await this.enqueueCustomEvent(active.agentId, runId, 'supervisor.follow_up_accepted', {});
+      await this.enqueueCustomEvent(active.agentId, runId, 'supervisor.follow_up_accepted', {
+        message: request.message,
+      });
       return this.requireRun(runId);
     });
   }
@@ -567,6 +587,7 @@ export class ManagedAgentService {
       agentId: agent.id,
       session,
       operations: new Set(),
+      settled: false,
       unsubscribe: () => undefined,
     };
     active.unsubscribe = session.subscribe((event) => {
@@ -616,11 +637,13 @@ export class ManagedAgentService {
   private launchOperation(
     active: ActiveRun,
     operation: Promise<void>,
-    runAcceptance: Promise<boolean>,
+    runAcceptance?: Promise<boolean>,
   ): void {
     const tracked = operation
       .then(async () => {
-        if (await runAcceptance) await this.completeRun(active.runId);
+        if (runAcceptance && !(await runAcceptance)) return;
+        await this.completeRun(active.runId);
+        active.settled = true;
       })
       .catch(async (error: unknown) => {
         await this.failRun(active.runId, 'agent_operation_failed', 'The Pi agent operation failed');
@@ -633,11 +656,11 @@ export class ManagedAgentService {
           code: 'agent_operation_failed',
           message: 'The Pi agent operation failed',
         });
+        active.settled = true;
+        await this.disposeActiveRun(active);
       })
       .finally(async () => {
-        active.unsubscribe();
-        this.activeRuns.delete(active.runId);
-        await active.session.dispose();
+        if (runAcceptance && !(await runAcceptance)) await this.disposeActiveRun(active);
       });
     active.operations.add(tracked);
     void tracked
@@ -736,11 +759,14 @@ export class ManagedAgentService {
     this.events.publish(persisted);
   }
 
-  private async requireActiveRun(runId: string): Promise<ActiveRun> {
+  private async requireActiveRun(
+    runId: string,
+    options: { allowCompleted?: boolean } = {},
+  ): Promise<ActiveRun> {
     const row = await this.getRunRow(runId);
     if (!row) throw new ManagedAgentRunNotFoundError(runId);
     const status = ManagedAgentRunStatusSchema.parse(row.status);
-    if (isTerminalRunStatus(status)) {
+    if (isTerminalRunStatus(status) && !(options.allowCompleted && status === 'completed')) {
       throw new ManagedAgentBusyError(row.agent_id, `Run ${runId} is no longer active`);
     }
     const active = this.activeRuns.get(runId);
@@ -749,8 +775,32 @@ export class ManagedAgentService {
     return active;
   }
 
+  private async markRunRunning(runId: string): Promise<void> {
+    await this.db
+      .updateTable('supervisor_agent_runs')
+      .set({
+        status: 'running',
+        started_at: this.now(),
+        completed_at: null,
+        error_code: null,
+        error_message: null,
+      })
+      .where('id', '=', runId)
+      .where('status', '=', 'completed')
+      .execute();
+  }
+
+  private async disposeActiveRun(active: ActiveRun): Promise<void> {
+    if (this.activeRuns.get(active.runId) !== active) return;
+    active.unsubscribe();
+    this.activeRuns.delete(active.runId);
+    await active.session.dispose();
+  }
+
   private findActiveRun(agentId: string): ActiveRun | undefined {
-    return [...this.activeRuns.values()].find((active) => active.agentId === agentId);
+    return [...this.activeRuns.values()].find(
+      (active) => active.agentId === agentId && !active.settled,
+    );
   }
 
   private async completeRun(runId: string): Promise<void> {
@@ -892,7 +942,7 @@ function createSessionOptions(
     (row.thinking_level ? (row.thinking_level as AgentThinkingLevel) : null);
   return {
     systemPrompt: row.system_prompt,
-    cwd: resolve(request.cwd ?? row.cwd),
+    cwd: resolveWorkingDirectory(request.cwd ?? row.cwd),
     ...(tools === null ? {} : { tools }),
     ...(model === null ? {} : { model }),
     ...(thinkingLevel === null ? {} : { thinkingLevel }),

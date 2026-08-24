@@ -1,5 +1,17 @@
 export * from './common';
 export * from './json';
+export type {
+  CreateManagedProjectRequest,
+  ManagedProjectListQuery,
+  ManagedProjectListResponse,
+  ManagedProjectResponse,
+} from './project';
+export {
+  CreateManagedProjectRequestSchema,
+  ManagedProjectListQuerySchema,
+  ManagedProjectListResponseSchema,
+  ManagedProjectResponseSchema,
+} from './project';
 export * from './supervisor';
 export type {
   AgentMessageRequest,

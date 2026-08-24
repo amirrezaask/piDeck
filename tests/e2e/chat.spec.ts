@@ -14,6 +14,14 @@ const agent = {
   createdAt: timestamp,
   updatedAt: timestamp,
 };
+const project = {
+  id: '018bcfe4-7a4b-7000-8000-000000000333',
+  name: 'workspace',
+  path: '/workspace',
+  createdAt: timestamp,
+  updatedAt: timestamp,
+  lastUsedAt: timestamp,
+};
 const run = {
   id: '018bcfe4-7a4b-7000-8000-000000000222',
   agentId: agent.id,
@@ -27,6 +35,22 @@ const run = {
   startedAt: timestamp,
   completedAt: timestamp,
 };
+
+test.beforeEach(async ({ page }) => {
+  await page.route('**/supervisor/v1/projects?**', (route) =>
+    route.fulfill({ json: { projects: [project], nextCursor: null } }),
+  );
+  await page.route('**/supervisor/v1/projects', (route) =>
+    route.fulfill({ status: 201, json: project }),
+  );
+  await page.route('**/supervisor/v1/projects/*', async (route) => {
+    if (route.request().method() === 'DELETE') {
+      await route.fulfill({ status: 200, json: project });
+      return;
+    }
+    await route.continue();
+  });
+});
 
 function watchBrowserErrors(page: Page): string[] {
   const errors: string[] = [];
@@ -70,30 +94,81 @@ test('renders persisted and streamed PI events with chat primitives', async ({
             payload: {},
             createdAt: timestamp,
           },
+          {
+            agentId: agent.id,
+            runId: run.id,
+            sequence: 2,
+            type: 'message_start',
+            payload: {},
+            createdAt: timestamp,
+          },
+          {
+            agentId: agent.id,
+            runId: run.id,
+            sequence: 3,
+            type: 'message_end',
+            payload: {},
+            createdAt: timestamp,
+          },
+          {
+            agentId: agent.id,
+            runId: run.id,
+            sequence: 4,
+            type: 'turn_start',
+            payload: {},
+            createdAt: timestamp,
+          },
+          {
+            agentId: agent.id,
+            runId: run.id,
+            sequence: 5,
+            type: 'tool_execution_start',
+            payload: { toolName: 'bash', args: { command: 'pwd' } },
+            createdAt: timestamp,
+          },
         ],
       },
     }),
   );
-  await page.route(`**/supervisor/v1/runs/${run.id}/stream?**`, (route) =>
-    route.fulfill({
-      contentType: 'text/event-stream',
-      body: `data: ${JSON.stringify({
+  await page.routeWebSocket(`**/supervisor/v1/runs/${run.id}/stream?**`, (socket) => {
+    socket.send(
+      JSON.stringify({
         agentId: agent.id,
         runId: run.id,
-        sequence: 2,
+        sequence: 6,
+        type: 'tool_execution_end',
+        payload: { toolName: 'bash', isError: false },
+        createdAt: timestamp,
+      }),
+    );
+    socket.send(
+      JSON.stringify({
+        agentId: agent.id,
+        runId: run.id,
+        sequence: 7,
         type: 'message_update',
         payload: { assistantMessageEvent: { type: 'text_delta', delta: 'Everything checks out.' } },
         createdAt: timestamp,
-      })}\n\n`,
-    }),
-  );
+      }),
+    );
+  });
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/');
   await expect(
     page.getByRole('heading', { name: 'Review the changes.', exact: true }),
   ).toBeVisible();
-  await expect(page.getByText('PI started the run')).toBeVisible();
+  const activity = page.getByRole('button', { name: /6 events/ });
+  await expect(activity).toBeVisible();
+  await activity.click();
+  await expect(page.getByText('Thinking...', { exact: true })).toHaveCount(1);
+  const toolCall = page.getByRole('button', { name: 'Running bash' });
+  await expect(toolCall).toBeVisible();
+  await toolCall.click();
+  await expect(page.locator('pre')).toContainText('"command": "pwd"');
+  await expect(
+    page.locator('[data-slot="marker-content"]').filter({ hasText: 'bash finished' }),
+  ).toBeVisible();
   await expect(page.getByText('Everything checks out.')).toBeVisible();
   await expect(page.getByLabel('Workspace agent conversation')).toBeVisible();
   await expect(page.locator('html')).not.toHaveAttribute('data-scroll-locked');
@@ -109,6 +184,187 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
   await page.screenshot({
     path: `.impeccable/review/conversation-${viewport}.png`,
+    fullPage: true,
+  });
+});
+
+test('accepts dropped images and documents in the chat composer', async ({ page }, testInfo) => {
+  const errors = watchBrowserErrors(page);
+  await page.route('**/supervisor/v1/agents?**', (route) =>
+    route.fulfill({ json: { agents: [agent], nextCursor: null } }),
+  );
+  await page.route('**/supervisor/v1/runs?**', (route) =>
+    route.fulfill({ json: { runs: [run], nextCursor: null } }),
+  );
+  await page.route('**/supervisor/v1/models', (route) =>
+    route.fulfill({
+      json: {
+        models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
+        defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
+      },
+    }),
+  );
+  await page.route(`**/supervisor/v1/runs/${run.id}/events?**`, (route) =>
+    route.fulfill({ json: { events: [] } }),
+  );
+  await page.routeWebSocket(`**/supervisor/v1/runs/${run.id}/stream?**`, () => undefined);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/');
+  await expect(page.getByRole('textbox', { name: 'Message agent' })).toBeVisible();
+
+  await page.evaluate(() => {
+    const chatArea = document.querySelector<HTMLElement>('[aria-label="Chat area"]');
+    if (!chatArea) throw new Error('Chat area not found');
+    const transfer = new DataTransfer();
+    const imageBytes = Uint8Array.from(
+      atob(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      ),
+      (character) => character.charCodeAt(0),
+    );
+    transfer.items.add(new File([imageBytes], 'screen.png', { type: 'image/png' }));
+    transfer.items.add(new File(['notes'], 'notes.txt', { type: 'text/plain' }));
+    chatArea.dispatchEvent(
+      new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }),
+    );
+  });
+
+  await expect(page.getByRole('img', { name: 'screen.png' })).toBeVisible();
+  await expect(page.getByText('notes.txt')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Remove screen.png' })).toBeVisible();
+  expect(errors).toEqual([]);
+
+  mkdirSync('.impeccable/review', { recursive: true });
+  const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
+  await page.screenshot({
+    path: `.impeccable/review/conversation-attachments-${viewport}.png`,
+    fullPage: true,
+  });
+});
+
+test('navigates skills and installed extensions in settings', async ({ page }, testInfo) => {
+  const errors = watchBrowserErrors(page);
+  await page.route('**/supervisor/v1/agents?**', (route) =>
+    route.fulfill({ json: { agents: [], nextCursor: null } }),
+  );
+  await page.route('**/supervisor/v1/runs?**', (route) =>
+    route.fulfill({ json: { runs: [], nextCursor: null } }),
+  );
+  await page.route('**/supervisor/v1/models', (route) =>
+    route.fulfill({
+      json: {
+        models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
+        defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
+      },
+    }),
+  );
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open agent settings' }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  await expect(settings).toBeVisible();
+
+  await settings.getByRole('button', { name: 'Appearance' }).click();
+  await expect(settings.getByRole('heading', { name: 'Appearance' })).toBeVisible();
+  await settings.getByRole('radio', { name: /Dark/ }).click();
+  await expect(page.locator('html')).toHaveClass(/dark/);
+  expect(await page.evaluate(() => localStorage.getItem('pideck-theme'))).toBe('dark');
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const element = [
+          ...document.querySelectorAll<HTMLElement>('[data-variant="secondary"]'),
+        ].at(-1);
+        return element ? getComputedStyle(element).backgroundColor : '';
+      }),
+    )
+    .toMatch(/okl(ch|ab)|rgb|hsl/);
+  await page.mouse.move(5, 5);
+  mkdirSync('.impeccable/review', { recursive: true });
+  await page.screenshot({
+    path: '.impeccable/review/settings-appearance-dark.png',
+    fullPage: true,
+  });
+  await settings.getByRole('radio', { name: /Light/ }).click();
+  await expect(page.locator('html')).not.toHaveClass(/dark/);
+
+  await settings.getByRole('button', { name: /^Skills/ }).click();
+  await expect(settings.getByRole('heading', { name: 'Skills' })).toBeVisible();
+  await expect(settings.getByRole('list', { name: 'Available skills' })).toBeVisible();
+  await settings.getByRole('button', { name: /Code review/ }).click();
+  const skillViewer = page.getByRole('dialog', { name: 'Code review' });
+  await expect(skillViewer).toBeVisible();
+  await expect(skillViewer.getByRole('button', { name: 'SKILL.md' })).toBeVisible();
+  await expect(skillViewer.getByText('Two-axis review of the diff')).toBeVisible();
+  await skillViewer.getByRole('button', { name: 'agents/openai.yaml' }).click();
+  await expect(skillViewer.getByText(/display_name: "Code Review"/)).toBeVisible();
+  mkdirSync('.impeccable/review', { recursive: true });
+  const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
+  await page.screenshot({
+    path: `.impeccable/review/settings-skills-${viewport}.png`,
+    fullPage: true,
+  });
+  await skillViewer.getByRole('button', { name: 'Close' }).click();
+
+  await settings.getByRole('button', { name: /^Extensions/ }).click();
+  await expect(settings.getByRole('heading', { name: 'Extensions' })).toBeVisible();
+  await expect(settings.getByRole('list', { name: 'Installed extensions' })).toBeVisible();
+  expect(errors).toEqual([]);
+  mkdirSync('.impeccable/review', { recursive: true });
+  await page.screenshot({
+    path: `.impeccable/review/settings-extensions-${viewport}.png`,
+    fullPage: true,
+  });
+  await settings.getByRole('button', { name: 'Update' }).click();
+  await expect(settings.getByText('All current')).toBeVisible();
+});
+
+test('chooses a saved project or prepares a new workspace', async ({ page }, testInfo) => {
+  const errors = watchBrowserErrors(page);
+  await page.route('**/supervisor/v1/agents?**', (route) =>
+    route.fulfill({ json: { agents: [agent], nextCursor: null } }),
+  );
+  await page.route('**/supervisor/v1/runs?**', (route) =>
+    route.fulfill({ json: { runs: [], nextCursor: null } }),
+  );
+  await page.route('**/supervisor/v1/models', (route) =>
+    route.fulfill({
+      json: {
+        models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
+        defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
+      },
+    }),
+  );
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Choose project' }).click();
+  const picker = page.getByRole('dialog', { name: 'Choose project' });
+  await expect(picker.getByRole('option', { name: /workspace/ })).toBeVisible();
+  await expect(picker.getByRole('button', { name: 'Delete project workspace' })).toBeVisible();
+  await expect(picker.getByPlaceholder('Search projects')).toBeVisible();
+  await expect(picker).toHaveCSS('opacity', '1');
+  mkdirSync('.impeccable/review', { recursive: true });
+  const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
+  await page.screenshot({
+    path: `.impeccable/review/project-picker-list-${viewport}.png`,
+    fullPage: true,
+  });
+  await picker.getByRole('button', { name: 'Delete project workspace' }).click();
+  const confirmation = page.getByRole('dialog', { name: 'Delete saved project?' });
+  await expect(confirmation).toContainText('Files on disk will not be changed.');
+  await confirmation.getByRole('button', { name: 'Delete project' }).click();
+  await expect(picker.getByRole('button', { name: 'Delete project workspace' })).toBeHidden();
+  await picker.getByRole('button', { name: 'New project' }).click();
+  await picker.getByLabel('Working directory').fill('/tmp/new-project');
+  await picker.getByRole('button', { name: 'Use project' }).click();
+  await expect(page.getByRole('button', { name: 'Choose project' })).toContainText('new-project');
+  expect(errors).toEqual([]);
+
+  await page.screenshot({
+    path: `.impeccable/review/project-picker-${viewport}.png`,
     fullPage: true,
   });
 });
@@ -142,9 +398,7 @@ test('creates an agent and starts a managed run', async ({ page }, testInfo) => 
   await page.route(`**/supervisor/v1/runs/${run.id}/events?**`, (route) =>
     route.fulfill({ json: { events: [] } }),
   );
-  await page.route(`**/supervisor/v1/runs/${run.id}/stream?**`, (route) =>
-    route.fulfill({ contentType: 'text/event-stream', body: '' }),
-  );
+  await page.routeWebSocket(`**/supervisor/v1/runs/${run.id}/stream?**`, () => undefined);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/');

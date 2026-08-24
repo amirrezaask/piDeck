@@ -15,7 +15,7 @@ const { server } = buildSupervisorApp({
 await server.listen({ host: '127.0.0.1', port: 4101 });
 ```
 
-Call `server.close()` during shutdown. The package owns its database and PI session lifecycle.
+Call `server.close()` during shutdown. The package owns its database and PI session lifecycle. Working-directory inputs accept absolute paths and `~/...` paths; they are normalized and validated before a Pi session starts.
 
 ## Standalone process
 

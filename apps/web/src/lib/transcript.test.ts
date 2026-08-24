@@ -1,7 +1,7 @@
 import type { ManagedAgentEvent } from '@nextflow/contracts';
 import { describe, expect, it } from 'vitest';
 
-import { mapPiEvents } from './transcript';
+import { collapseThinkingMarkers, mapPiEvents } from './transcript';
 
 const base = {
   agentId: '018bcfe4-7a4b-7000-8000-000000000111',
@@ -36,19 +36,73 @@ describe('mapPiEvents', () => {
     ]);
   });
 
-  it('maps lifecycle and tool activity to markers', () => {
+  it('groups consecutive lifecycle and tool activity into a collapsible item', () => {
     expect(
       mapPiEvents([
         event(1, 'agent_start'),
-        event(2, 'tool_execution_start', { toolName: 'bash' }),
+        event(2, 'tool_execution_start', {
+          toolName: 'bash',
+          args: { command: 'pwd' },
+        }),
         event(3, 'tool_execution_end', { toolName: 'bash', isError: false }),
         event(4, 'agent_end'),
       ]),
     ).toMatchObject([
-      { kind: 'marker', label: 'PI started the run', tone: 'active' },
-      { kind: 'marker', label: 'Running bash', tone: 'active' },
-      { kind: 'marker', label: 'bash finished', tone: 'success' },
-      { kind: 'marker', label: 'Run finished', tone: 'success' },
+      {
+        kind: 'event-group',
+        startSequence: 1,
+        endSequence: 4,
+        events: [
+          { kind: 'marker', label: 'Thinking...', tone: 'active' },
+          {
+            kind: 'marker',
+            label: 'Running bash',
+            tone: 'active',
+            toolCall: true,
+            toolArguments: { command: 'pwd' },
+          },
+          { kind: 'marker', label: 'bash finished', tone: 'success' },
+          { kind: 'marker', label: 'Thinking...', tone: 'active' },
+        ],
+      },
+    ]);
+  });
+
+  it('maps lifecycle noise to shimmer thinking markers', () => {
+    expect(
+      mapPiEvents([
+        event(1, 'message_start'),
+        event(2, 'message_end'),
+        event(3, 'turn_start'),
+        event(4, 'turn_end'),
+      ]),
+    ).toMatchObject([
+      {
+        kind: 'event-group',
+        events: [
+          { kind: 'marker', label: 'Thinking...', variant: 'default', shimmer: true },
+          { kind: 'marker', label: 'Thinking...', variant: 'default', shimmer: true },
+          { kind: 'marker', label: 'Thinking...', variant: 'default', shimmer: true },
+          { kind: 'marker', label: 'Thinking...', variant: 'default', shimmer: true },
+        ],
+      },
+    ]);
+  });
+
+  it('collapses repeated thinking markers while keeping the raw event count', () => {
+    const [item] = mapPiEvents([
+      event(1, 'agent_start'),
+      event(2, 'message_start'),
+      event(3, 'message_end'),
+      event(4, 'agent_end'),
+    ]);
+
+    expect(item.kind).toBe('event-group');
+    if (item.kind !== 'event-group') throw new Error('Expected an event group');
+
+    expect(item.events).toHaveLength(4);
+    expect(collapseThinkingMarkers(item.events)).toMatchObject([
+      { kind: 'marker', label: 'Thinking...', shimmer: true },
     ]);
   });
 
@@ -59,9 +113,20 @@ describe('mapPiEvents', () => {
         event(2, 'context_compacted'),
       ]),
     ).toMatchObject([
-      { kind: 'error', label: 'Model credentials are missing' },
-      { kind: 'marker', label: 'Context compacted' },
+      {
+        kind: 'event-group',
+        events: [
+          { kind: 'error', label: 'Model credentials are missing' },
+          { kind: 'marker', label: 'Context compacted' },
+        ],
+      },
     ]);
+  });
+
+  it('maps follow-up acceptance into a user transcript message', () => {
+    expect(
+      mapPiEvents([event(1, 'supervisor.follow_up_accepted', { message: 'Keep going.' })]),
+    ).toMatchObject([{ kind: 'user', content: 'Keep going.' }]);
   });
 
   it('does not render non-text message update noise', () => {

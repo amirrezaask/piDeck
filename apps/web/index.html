@@ -6,6 +6,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#ffffff" />
     <meta name="description" content="A local workspace for supervising PI coding agents." />
+    <script>
+      try {
+        if (localStorage.getItem('pideck-theme') === 'dark') {
+          document.documentElement.classList.add('dark');
+          document.documentElement.style.colorScheme = 'dark';
+          document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#171717');
+        }
+      } catch {
+        // Ignore unavailable storage in privacy-restricted browsers.
+      }
+    </script>
     <title>piDeck</title>
   </head>
   <body>

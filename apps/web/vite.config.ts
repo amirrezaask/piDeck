@@ -26,6 +26,7 @@ export default defineConfig(({ mode }) => {
         '/supervisor': {
           target: supervisorUrl,
           changeOrigin: true,
+          ws: true,
           headers: { Authorization: `Bearer ${supervisorToken}` },
           rewrite: (requestPath) => requestPath.replace(/^\/supervisor/, ''),
         },
