@@ -37,22 +37,20 @@ const run = {
 };
 
 test.beforeEach(async ({ page }) => {
-  await page.route('**/supervisor/v1/ws-tickets**', (route) =>
+  await page.route('**/v1/ws-tickets**', (route) =>
     route.fulfill({
       json: { ticket: 'test-ticket', expiresAt: new Date(Date.now() + 30_000).toISOString() },
     }),
   );
-  await page.route(`**/supervisor/v1/runs/${run.id}`, (route) => route.fulfill({ json: run }));
-  await page.route(`**/supervisor/v1/runs/${run.id}/attachments`, (route) =>
+  await page.route(`**/v1/runs/${run.id}`, (route) => route.fulfill({ json: run }));
+  await page.route(`**/v1/runs/${run.id}/attachments`, (route) =>
     route.fulfill({ json: { attachments: [] } }),
   );
-  await page.route('**/supervisor/v1/projects?**', (route) =>
+  await page.route('**/v1/projects?**', (route) =>
     route.fulfill({ json: { projects: [project], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/projects', (route) =>
-    route.fulfill({ status: 201, json: project }),
-  );
-  await page.route('**/supervisor/v1/projects/*', async (route) => {
+  await page.route('**/v1/projects', (route) => route.fulfill({ status: 201, json: project }));
+  await page.route('**/v1/projects/*', async (route) => {
     if (route.request().method() === 'DELETE') {
       await route.fulfill({ status: 200, json: project });
       return;
@@ -77,13 +75,13 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   page,
 }, testInfo) => {
   const errors = watchBrowserErrors(page);
-  await page.route('**/supervisor/v1/agents?**', (route) =>
+  await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [agent], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/runs?**', (route) =>
+  await page.route('**/v1/runs?**', (route) =>
     route.fulfill({ json: { runs: [run], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/models', (route) =>
+  await page.route('**/v1/models', (route) =>
     route.fulfill({
       json: {
         models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
@@ -91,7 +89,7 @@ test('renders persisted and streamed PI events with chat primitives', async ({
       },
     }),
   );
-  await page.route(`**/supervisor/v1/runs/${run.id}/attachments`, (route) =>
+  await page.route(`**/v1/runs/${run.id}/attachments`, (route) =>
     route.fulfill({
       json: {
         attachments: [
@@ -104,7 +102,7 @@ test('renders persisted and streamed PI events with chat primitives', async ({
       },
     }),
   );
-  await page.route(`**/supervisor/v1/runs/${run.id}/events?**`, (route) =>
+  await page.route(`**/v1/runs/${run.id}/events?**`, (route) =>
     route.fulfill({
       json: {
         events: [
@@ -152,7 +150,7 @@ test('renders persisted and streamed PI events with chat primitives', async ({
       },
     }),
   );
-  await page.routeWebSocket(`**/supervisor/v1/runs/${run.id}/stream?**`, (socket) => {
+  await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, (socket) => {
     socket.send(
       JSON.stringify({
         agentId: agent.id,
@@ -240,13 +238,13 @@ test('renders persisted and streamed PI events with chat primitives', async ({
 
 test('accepts dropped images and documents in the chat composer', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
-  await page.route('**/supervisor/v1/agents?**', (route) =>
+  await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [agent], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/runs?**', (route) =>
+  await page.route('**/v1/runs?**', (route) =>
     route.fulfill({ json: { runs: [run], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/models', (route) =>
+  await page.route('**/v1/models', (route) =>
     route.fulfill({
       json: {
         models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
@@ -254,10 +252,10 @@ test('accepts dropped images and documents in the chat composer', async ({ page 
       },
     }),
   );
-  await page.route(`**/supervisor/v1/runs/${run.id}/events?**`, (route) =>
+  await page.route(`**/v1/runs/${run.id}/events?**`, (route) =>
     route.fulfill({ json: { events: [] } }),
   );
-  await page.routeWebSocket(`**/supervisor/v1/runs/${run.id}/stream?**`, () => undefined);
+  await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, () => undefined);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/');
@@ -295,17 +293,27 @@ test('accepts dropped images and documents in the chat composer', async ({ page 
 
 test('navigates skills and reports extension availability honestly', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
-  await page.route('**/supervisor/v1/agents?**', (route) =>
+  await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/runs?**', (route) =>
+  await page.route('**/v1/runs?**', (route) =>
     route.fulfill({ json: { runs: [], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/models', (route) =>
+  await page.route('**/v1/models', (route) =>
     route.fulfill({
       json: {
         models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
         defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
+      },
+    }),
+  );
+  await page.route('**/v1/extensions', (route) =>
+    route.fulfill({
+      json: {
+        extensions: [],
+        cwd: '/workspace',
+        checkedAt: '2026-08-23T20:00:00.000Z',
+        updateCheckError: null,
       },
     }),
   );
@@ -364,8 +372,7 @@ test('navigates skills and reports extension availability honestly', async ({ pa
 
   await settings.getByRole('button', { name: /^Extensions/ }).click();
   await expect(settings.getByRole('heading', { name: 'Extensions' })).toBeVisible();
-  await expect(settings.getByText('Extension discovery is not available yet')).toBeVisible();
-  await expect(settings.getByText('API unavailable')).toBeVisible();
+  await expect(settings.getByText('No extensions found')).toBeVisible();
   await expect(settings.getByRole('button', { name: 'Update' })).toHaveCount(0);
   expect(errors).toEqual([]);
   mkdirSync('.impeccable/review', { recursive: true });
@@ -377,13 +384,13 @@ test('navigates skills and reports extension availability honestly', async ({ pa
 
 test('chooses a saved project or prepares a new workspace', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
-  await page.route('**/supervisor/v1/agents?**', (route) =>
+  await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [agent], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/runs?**', (route) =>
+  await page.route('**/v1/runs?**', (route) =>
     route.fulfill({ json: { runs: [], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/models', (route) =>
+  await page.route('**/v1/models', (route) =>
     route.fulfill({
       json: {
         models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
@@ -428,21 +435,18 @@ test('chooses a saved project or prepares a new workspace', async ({ page }, tes
   });
 });
 
-test('creates an agent and starts a managed run', async ({ page }, testInfo) => {
+test('adds a server and selects it in the composer', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
-  let createdAgentBody: unknown;
-  let createdRunBody: unknown;
-  await page.route('**/supervisor/v1/agents?**', (route) =>
-    route.fulfill({ json: { agents: [], nextCursor: null } }),
+  await page.route('**/v1/agents?**', (route) =>
+    route.fulfill({ json: { agents: [agent], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/agents', async (route) => {
-    createdAgentBody = route.request().postDataJSON();
-    await route.fulfill({ status: 201, json: agent });
-  });
-  await page.route('**/supervisor/v1/runs?**', (route) =>
+  await page.route('**/v1/runs?**', (route) =>
     route.fulfill({ json: { runs: [], nextCursor: null } }),
   );
-  await page.route('**/supervisor/v1/models', (route) =>
+  await page.route('**/v1/projects?**', (route) =>
+    route.fulfill({ json: { projects: [project], nextCursor: null } }),
+  );
+  await page.route('**/v1/models', (route) =>
     route.fulfill({
       json: {
         models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
@@ -450,14 +454,138 @@ test('creates an agent and starts a managed run', async ({ page }, testInfo) => 
       },
     }),
   );
-  await page.route('**/supervisor/v1/runs', async (route) => {
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/new');
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  await settings.getByRole('button', { name: /^Servers/ }).click();
+  await settings.getByRole('button', { name: 'Add server' }).click();
+  const editor = page.getByRole('dialog', { name: 'Add server' });
+  await editor.getByLabel('Name').fill('Build host');
+  await editor.getByLabel('Server address').fill('https://agents.example.com');
+  await editor.getByLabel('Access token').fill('test-token');
+  await editor.getByRole('button', { name: 'Add server' }).click();
+
+  await expect(settings.getByRole('list', { name: 'Configured servers' })).toContainText(
+    'Build host',
+  );
+  mkdirSync('.impeccable/review', { recursive: true });
+  const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
+  await page.screenshot({
+    path: `.impeccable/review/settings-servers-${viewport}.png`,
+    fullPage: true,
+  });
+
+  await settings.getByRole('button', { name: 'Close' }).click();
+  const serverSelect = page.getByRole('combobox', { name: 'Server' });
+  await serverSelect.click();
+  await page.getByRole('option', { name: 'Build host' }).click();
+  await expect(serverSelect).toContainText('Build host');
+  expect(errors).toEqual([]);
+});
+
+test('completes Pi commands and @ file references in the new-session composer', async ({
+  page,
+}, testInfo) => {
+  const errors = watchBrowserErrors(page);
+  await page.route('**/v1/agents?**', (route) =>
+    route.fulfill({ json: { agents: [agent], nextCursor: null } }),
+  );
+  await page.route('**/v1/runs?**', (route) =>
+    route.fulfill({ json: { runs: [], nextCursor: null } }),
+  );
+  await page.route('**/v1/models', (route) =>
+    route.fulfill({
+      json: {
+        models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
+        defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
+      },
+    }),
+  );
+  await page.route('**/v1/composer/suggestions?**', async (route) => {
+    const query = new URL(route.request().url()).searchParams;
+    if (query.get('kind') === 'command') {
+      await route.fulfill({
+        json: {
+          cwd: '/workspace',
+          suggestions: [
+            {
+              value: 'model',
+              label: '/model',
+              description: '<provider/model> — Select model',
+              kind: 'command',
+            },
+          ],
+        },
+      });
+      return;
+    }
+    await route.fulfill({
+      json: {
+        cwd: '/workspace',
+        suggestions: [
+          {
+            value: '@src/App.tsx',
+            label: 'App.tsx',
+            description: '/workspace/src/App.tsx',
+            kind: 'file',
+          },
+        ],
+      },
+    });
+  });
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/');
+  const composer = page.getByRole('textbox', { name: 'Session task' });
+  await composer.fill('/mod');
+  await expect(page.getByRole('option', { name: /\/model/ })).toBeVisible();
+  mkdirSync('.impeccable/review', { recursive: true });
+  await page.screenshot({
+    path: `.impeccable/review/composer-autocomplete-${testInfo.project.name}.png`,
+    fullPage: true,
+  });
+  await page.keyboard.press('Enter');
+  await expect(composer).toHaveValue('/model ');
+
+  await composer.fill('@App');
+  await expect(page.getByRole('option', { name: /App\.tsx/ })).toBeVisible();
+  await page.keyboard.press('Enter');
+  await expect(composer).toHaveValue('@src/App.tsx ');
+  expect(errors).toEqual([]);
+});
+
+test('creates an agent and starts a managed run', async ({ page }, testInfo) => {
+  const errors = watchBrowserErrors(page);
+  let createdAgentBody: unknown;
+  let createdRunBody: unknown;
+  await page.route('**/v1/agents?**', (route) =>
+    route.fulfill({ json: { agents: [], nextCursor: null } }),
+  );
+  await page.route('**/v1/agents', async (route) => {
+    createdAgentBody = route.request().postDataJSON();
+    await route.fulfill({ status: 201, json: agent });
+  });
+  await page.route('**/v1/runs?**', (route) =>
+    route.fulfill({ json: { runs: [], nextCursor: null } }),
+  );
+  await page.route('**/v1/models', (route) =>
+    route.fulfill({
+      json: {
+        models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
+        defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
+      },
+    }),
+  );
+  await page.route('**/v1/runs', async (route) => {
     createdRunBody = route.request().postDataJSON();
     await route.fulfill({ status: 202, json: { ...run, status: 'running', completedAt: null } });
   });
-  await page.route(`**/supervisor/v1/runs/${run.id}/events?**`, (route) =>
+  await page.route(`**/v1/runs/${run.id}/events?**`, (route) =>
     route.fulfill({ json: { events: [] } }),
   );
-  await page.routeWebSocket(`**/supervisor/v1/runs/${run.id}/stream?**`, () => undefined);
+  await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, () => undefined);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/');

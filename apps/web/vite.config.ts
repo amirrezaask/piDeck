@@ -10,6 +10,7 @@ export default defineConfig(({ mode }) => {
   const supervisorToken = env.NEXTFLOW_SUPERVISOR_TOKEN || 'pideck-local-dev-token';
 
   return {
+    base: './',
     envDir: path.resolve(import.meta.dirname, '../..'),
     plugins: [react(), tailwindcss()],
     resolve: {
@@ -23,6 +24,12 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       proxy: {
+        '/v1': {
+          target: supervisorUrl,
+          changeOrigin: true,
+          ws: true,
+          headers: { Authorization: `Bearer ${supervisorToken}` },
+        },
         '/supervisor': {
           target: supervisorUrl,
           changeOrigin: true,

@@ -1,0 +1,271 @@
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+
+import {
+  app,
+  BrowserWindow,
+  type IpcMainInvokeEvent,
+  ipcMain,
+  net,
+  safeStorage,
+  session,
+} from 'electron';
+
+interface StoredServer {
+  readonly id: string;
+  readonly name: string;
+  readonly address: string;
+  readonly encryptedToken?: string;
+}
+
+interface ServerInput {
+  readonly id?: string;
+  readonly name: string;
+  readonly address: string;
+  readonly token?: string;
+}
+
+interface ServerRequest {
+  readonly serverId: string;
+  readonly path: string;
+  readonly method: string;
+  readonly headers?: Record<string, string>;
+  readonly body?: string;
+}
+
+const allowedMethods = new Set(['GET', 'POST', 'PATCH', 'DELETE']);
+let mainWindow: BrowserWindow | undefined;
+let servers: StoredServer[] = [];
+
+function configPath(): string {
+  return join(app.getPath('userData'), 'servers.json');
+}
+
+function normalizeAddress(address: string): string {
+  const url = new URL(address.trim());
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('Server address must use http:// or https://');
+  }
+  if (url.username || url.password || url.search || url.hash || url.pathname !== '/') {
+    throw new Error('Enter the server origin only, without credentials, query, or path');
+  }
+  return url.origin;
+}
+
+function publicServer(server: StoredServer) {
+  return {
+    id: server.id,
+    name: server.name,
+    address: server.address,
+    hasToken: Boolean(server.encryptedToken),
+  };
+}
+
+async function loadServers(): Promise<void> {
+  try {
+    const value: unknown = JSON.parse(await readFile(configPath(), 'utf8'));
+    servers = Array.isArray(value) ? value.filter(isStoredServer) : [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+      console.error('Failed to read servers', error);
+    servers = [];
+  }
+}
+
+async function persistServers(): Promise<void> {
+  const path = configPath();
+  const temporaryPath = `${path}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(temporaryPath, `${JSON.stringify(servers, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporaryPath, path);
+}
+
+function encryptToken(token: string): string | undefined {
+  if (!token) return undefined;
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Secure credential storage is unavailable on this system');
+  }
+  if (process.platform === 'linux' && safeStorage.getSelectedStorageBackend() === 'basic_text') {
+    throw new Error('Configure a Linux secret store before saving a server access token');
+  }
+  return safeStorage.encryptString(token).toString('base64');
+}
+
+function decryptToken(server: StoredServer): string | undefined {
+  if (!server.encryptedToken) return undefined;
+  return safeStorage.decryptString(Buffer.from(server.encryptedToken, 'base64'));
+}
+
+function authorize(event: IpcMainInvokeEvent): void {
+  if (
+    !mainWindow ||
+    event.sender !== mainWindow.webContents ||
+    event.senderFrame !== mainWindow.webContents.mainFrame
+  ) {
+    throw new Error('Unauthorized renderer');
+  }
+}
+
+function registerIpc(): void {
+  ipcMain.handle('servers:list', (event) => {
+    authorize(event);
+    return servers.map(publicServer);
+  });
+
+  ipcMain.handle('servers:save', async (event, value: unknown) => {
+    authorize(event);
+    const input = parseServerInput(value);
+    const id = input.id ?? crypto.randomUUID();
+    const existing = servers.find((server) => server.id === id);
+    const next: StoredServer = {
+      id,
+      name: input.name.trim(),
+      address: normalizeAddress(input.address),
+      encryptedToken:
+        input.token === undefined ? existing?.encryptedToken : encryptToken(input.token.trim()),
+    };
+    servers = [next, ...servers.filter((server) => server.id !== id)];
+    await persistServers();
+    return publicServer(next);
+  });
+
+  ipcMain.handle('servers:remove', async (event, serverId: unknown) => {
+    authorize(event);
+    if (typeof serverId !== 'string') throw new Error('Invalid server id');
+    servers = servers.filter((server) => server.id !== serverId);
+    await persistServers();
+  });
+
+  ipcMain.handle('servers:request', async (event, value: unknown) => {
+    authorize(event);
+    const request = parseServerRequest(value);
+    const server = servers.find((candidate) => candidate.id === request.serverId);
+    if (!server) throw new Error('Server is not configured');
+    const method = request.method.toUpperCase();
+    if (!allowedMethods.has(method)) throw new Error('Unsupported server request method');
+    const target = new URL(request.path, server.address);
+    if (
+      target.origin !== server.address ||
+      !/^\/v1\/[A-Za-z0-9_~!$&'()*+,;=:@%./-]*$/.test(target.pathname)
+    ) {
+      throw new Error('Unsupported server request path');
+    }
+    if ((request.body?.length ?? 0) > 32 * 1024 * 1024)
+      throw new Error('Server request is too large');
+
+    const headers = new Headers();
+    for (const name of ['accept', 'content-type', 'idempotency-key']) {
+      const value = request.headers?.[name];
+      if (value) headers.set(name, value);
+    }
+    const token = decryptToken(server);
+    if (token) headers.set('authorization', `Bearer ${token}`);
+    const response = await net.fetch(target.toString(), {
+      method,
+      headers,
+      ...(request.body === undefined ? {} : { body: request.body }),
+    });
+    return {
+      status: response.status,
+      headers: Object.fromEntries(response.headers.entries()),
+      body: await response.text(),
+    };
+  });
+}
+
+function createWindow(): void {
+  const window = new BrowserWindow({
+    width: 1440,
+    height: 920,
+    minWidth: 900,
+    minHeight: 620,
+    show: false,
+    backgroundColor: '#171717',
+    webPreferences: {
+      preload: join(import.meta.dirname, 'preload.cjs'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      experimentalFeatures: false,
+      webviewTag: false,
+    },
+  });
+  mainWindow = window;
+  window.once('ready-to-show', () => window.show());
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.on('will-navigate', (event) => event.preventDefault());
+  window.on('closed', () => {
+    if (mainWindow === window) mainWindow = undefined;
+  });
+  void window.loadFile(resolve(import.meta.dirname, 'renderer/index.html'));
+}
+
+function isStoredServer(value: unknown): value is StoredServer {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<StoredServer>;
+  return (
+    typeof candidate.id === 'string' &&
+    typeof candidate.name === 'string' &&
+    typeof candidate.address === 'string' &&
+    (candidate.encryptedToken === undefined || typeof candidate.encryptedToken === 'string')
+  );
+}
+
+function parseServerInput(value: unknown): ServerInput {
+  if (!value || typeof value !== 'object') throw new Error('Invalid server');
+  const input = value as Partial<ServerInput>;
+  if (
+    (input.id !== undefined && typeof input.id !== 'string') ||
+    typeof input.name !== 'string' ||
+    !input.name.trim() ||
+    typeof input.address !== 'string' ||
+    (input.token !== undefined && typeof input.token !== 'string')
+  ) {
+    throw new Error('Invalid server');
+  }
+  return input as ServerInput;
+}
+
+function parseServerRequest(value: unknown): ServerRequest {
+  if (!value || typeof value !== 'object') throw new Error('Invalid server request');
+  const request = value as Partial<ServerRequest>;
+  if (
+    typeof request.serverId !== 'string' ||
+    typeof request.path !== 'string' ||
+    typeof request.method !== 'string' ||
+    (request.headers !== undefined &&
+      (typeof request.headers !== 'object' ||
+        Object.values(request.headers).some((item) => typeof item !== 'string'))) ||
+    (request.body !== undefined && typeof request.body !== 'string')
+  ) {
+    throw new Error('Invalid server request');
+  }
+  return request as ServerRequest;
+}
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  });
+  app.whenReady().then(async () => {
+    session.defaultSession.setPermissionCheckHandler(() => false);
+    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
+      callback(false),
+    );
+    await loadServers();
+    registerIpc();
+    createWindow();
+  });
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') app.quit();
+  });
+}

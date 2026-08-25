@@ -4,7 +4,7 @@
 
 ## Platform
 
-web
+Electron desktop application with a React renderer and a standalone Node server binary
 
 ## Users
 
@@ -24,11 +24,11 @@ The product connects to local or remote PI supervisors. A developer may have man
 
 ## Capabilities and Constraints
 
-- Connect to and anticipate multiple remote supervisors as well as local operation.
+- Connect to multiple local or remote supervisors. Users manage server origins and access tokens in Settings, sessions from all connected servers share one sidebar, and each new session targets an explicit server.
 - Stream live agent and run events.
 - Present large fleets and nested agentic workflows without assuming a single-chat layout.
 - Current first-class interventions are cancellation, immediate steering while a run streams, and queued follow-up for a completed run. Approval and pause/resume are not implemented controls and must be represented as unavailable rather than simulated.
-- The current stack is React, TypeScript, Vite, Tailwind CSS, and shadcn/ui.
+- The client stack is Electron, React, TypeScript, Vite, Tailwind CSS, and shadcn/ui. The Electron main process owns encrypted server credentials and authenticated HTTP transport; the sandboxed renderer receives only narrow preload capabilities.
 - Current supervisor APIs expose managed agents and runs, bounded event history, authenticated resumable event streams, cancellation, steering, and follow-up. Image attachments are sent through Pi’s image input; unsupported arbitrary files are rejected before submission.
 - Authentication, collaboration, mobile operation, and deployment topology remain open decisions.
 

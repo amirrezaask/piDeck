@@ -16,6 +16,7 @@ export {
   type SupervisorApp,
   type SupervisorAppOptions,
 } from './app.js';
+export { ComposerCatalog, type ComposerCatalogOptions } from './composer.js';
 export {
   type PiExtensionCatalog,
   PiExtensionNotConfiguredError,

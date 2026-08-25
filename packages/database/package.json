@@ -18,7 +18,6 @@
     "lint": "biome check src"
   },
   "dependencies": {
-    "better-sqlite3": "12.4.1",
     "kysely": "^0.28.5"
   }
 }

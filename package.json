@@ -8,8 +8,11 @@
   },
   "scripts": {
     "build": "turbo run build",
+    "build:binary": "pnpm build && node scripts/build-binary.mjs",
     "dev": "turbo run dev",
     "dev:web": "pnpm --filter @pideck/web dev",
+    "dev:client": "pnpm --filter @pideck/client dev",
+    "dev:server": "pnpm --filter @pideck/server dev",
     "dev:supervisor": "pnpm --filter @pideck/server dev",
     "db:migrate": "tsx packages/database/src/migrate.ts",
     "typecheck": "turbo run typecheck",
@@ -25,7 +28,6 @@
   "devDependencies": {
     "@biomejs/biome": "^2.2.4",
     "@playwright/test": "^1.55.0",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.13.3",
     "dependency-cruiser": "^18.2.0",
     "kysely": "^0.28.5",

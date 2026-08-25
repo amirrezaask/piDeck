@@ -245,6 +245,29 @@ describe('SupervisorClient', () => {
     );
   });
 
+  it('lists composer suggestions for a working directory', async () => {
+    const response = {
+      cwd: '/workspace',
+      suggestions: [
+        {
+          value: '@src/App.tsx',
+          label: 'App.tsx',
+          description: '/workspace/src/App.tsx',
+          kind: 'file' as const,
+        },
+      ],
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(response));
+    const client = new SupervisorClient({ baseUrl: '/supervisor-api', fetcher });
+
+    await expect(
+      client.listComposerSuggestions({ cwd: '/workspace', kind: 'file', prefix: '@src/App' }),
+    ).resolves.toEqual(response);
+    expect(fetcher.mock.calls[0]?.[0]).toBe(
+      '/supervisor-api/v1/composer/suggestions?cwd=%2Fworkspace&kind=file&prefix=%40src%2FApp',
+    );
+  });
+
   it('lists extensions and updates one configured package', async () => {
     const response = {
       extensions: [

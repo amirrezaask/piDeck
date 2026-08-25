@@ -5,6 +5,8 @@ import type { AgentFactory } from '@nextflow/agent-runtime';
 import {
   AgentMessageRequestSchema,
   CancelExecutionResponseSchema,
+  ComposerSuggestionsRequestSchema,
+  ComposerSuggestionsResponseSchema,
   CreateExecutionRequestSchema,
   CreateManagedAgentRequestSchema,
   CreateManagedAgentRunRequestSchema,
@@ -55,6 +57,7 @@ import {
   ManagedAgentRunNotFoundError,
   ManagedAgentService,
 } from './agent-service.js';
+import { ComposerCatalog } from './composer.js';
 import {
   type PiExtensionCatalog,
   PiExtensionNotConfiguredError,
@@ -68,7 +71,11 @@ import {
   ExecutionNotFoundError,
   SupervisorService,
 } from './service.js';
-import { InvalidWorkingDirectoryError, resolveWorkingDirectory } from './working-directory.js';
+import {
+  assertWorkingDirectory,
+  InvalidWorkingDirectoryError,
+  resolveWorkingDirectory,
+} from './working-directory.js';
 
 const ExecutionParamsSchema = z.object({ executionId: z.string().min(1) });
 const AgentParamsSchema = z.object({ agentId: z.string().uuid() });
@@ -143,6 +150,7 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     });
   const extensionService =
     options.piExtensionService ?? new PiExtensionService({ cwd: defaultCwd });
+  const composer = new ComposerCatalog({ defaultCwd });
   const agents = new ManagedAgentService({
     db: database.db,
     sessionFactory,
@@ -362,8 +370,11 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     return handleError(reply, error);
   });
   server.addHook('onRequest', async (request, reply) => {
-    if (request.url.split('?', 1)[0] === '/v1/health') return;
+    const requestPath = request.url.split('?', 1)[0] ?? '/';
+    if (!requestPath.startsWith('/v1/')) return;
+    if (requestPath === '/v1/health') return;
     const authorization = request.headers.authorization;
+    if (options.allowUnauthenticatedLoopback === true && isLoopbackAddress(request.ip)) return;
     if (options.serviceToken) {
       if (authorization !== `Bearer ${options.serviceToken}`) {
         return sendError(reply, 401, 'not_authenticated', 'Service authentication is required');
@@ -607,6 +618,25 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
 
   server.get('/v1/models', async (_request, reply) => {
     return reply.send(ManagedAgentModelsResponseSchema.parse(await agents.listModels()));
+  });
+
+  server.get('/v1/composer/suggestions', async (request, reply) => {
+    const parsed = ComposerSuggestionsRequestSchema.safeParse(request.query);
+    if (!parsed.success) {
+      return sendError(
+        reply,
+        400,
+        'validation_failed',
+        'The composer suggestion query is invalid',
+        parsed.error.issues,
+      );
+    }
+    try {
+      await assertWorkingDirectory(resolveWorkingDirectory(parsed.data.cwd, defaultCwd));
+      return reply.send(ComposerSuggestionsResponseSchema.parse(await composer.list(parsed.data)));
+    } catch (error) {
+      return handleError(reply, error);
+    }
   });
 
   server.get('/v1/extensions', async (_request, reply) => {

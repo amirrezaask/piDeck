@@ -4,6 +4,9 @@
   "private": true,
   "main": "dist/main.js",
   "types": "dist/main.d.ts",
+  "bin": {
+    "pideck-server": "dist/main.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "dev": "NEXTFLOW_SUPERVISOR_TOKEN=${NEXTFLOW_SUPERVISOR_TOKEN:-pideck-local-dev-token} tsx watch src/main.ts",

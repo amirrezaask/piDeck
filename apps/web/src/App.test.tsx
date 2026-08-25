@@ -10,6 +10,12 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App, { type SupervisorClientApi } from './App';
+import type {
+  ServerConnectionManager,
+  ServerDefinition,
+  ServerInput,
+} from './lib/server-connections';
+import type { SupervisorClient } from './lib/supervisor-client';
 
 const timestamp = '2026-08-23T20:00:00.000Z';
 const agent: ManagedAgentResponse = {
@@ -65,6 +71,7 @@ function createClient(overrides: Partial<SupervisorClientApi> = {}): SupervisorC
       models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
       defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
     }),
+    listComposerSuggestions: vi.fn().mockResolvedValue({ suggestions: [] }),
     listExtensions: vi.fn().mockResolvedValue({
       extensions: [
         {
@@ -263,6 +270,54 @@ describe('App', () => {
     await user.type(settingsPath, '/work');
     await user.click(screen.getByRole('option', { name: /workspace\/workspace/ }));
     expect(settingsPath).toHaveValue('/workspace');
+  });
+
+  it('completes Pi slash commands in the new-session composer', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+    });
+    render(<App client={client} />);
+
+    const composer = await screen.findByRole('textbox', { name: 'Session task' });
+    await user.type(composer, '/mod');
+
+    const command = await screen.findByRole('option', { name: /\/model/ });
+    expect(command).toHaveTextContent('Select model');
+    await user.click(command);
+
+    expect(composer).toHaveValue('/model ');
+  });
+
+  it('completes @ file references from the active supervisor', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listComposerSuggestions: vi.fn().mockResolvedValue({
+        suggestions: [
+          {
+            value: '@src/App.tsx',
+            label: 'App.tsx',
+            description: '/workspace/src/App.tsx',
+            kind: 'file',
+          },
+        ],
+      }),
+    });
+    render(<App client={client} />);
+
+    const composer = await screen.findByRole('textbox', { name: 'Session task' });
+    await user.type(composer, '@App');
+
+    const file = await screen.findByRole('option', { name: /App\.tsx/ });
+    await user.click(file);
+
+    expect(composer).toHaveValue('@src/App.tsx ');
+    expect(client.listComposerSuggestions).toHaveBeenCalledWith({
+      cwd: '/workspace',
+      kind: 'file',
+      prefix: '@App',
+    });
   });
 
   it('switches to dark mode and persists the preference', async () => {
@@ -738,6 +793,67 @@ describe('App', () => {
     await user.click(await screen.findByRole('button', { name: 'Cancel run' }));
     await waitFor(() => expect(client.cancelRun).toHaveBeenCalledWith(run.id));
     expect(await screen.findByText('Cancelled')).toBeVisible();
+  });
+
+  it('aggregates sessions from multiple servers and lets the composer choose one', async () => {
+    const user = userEvent.setup();
+    const remoteAgent = {
+      ...agent,
+      id: '018bcfe4-7a4b-7000-8000-000000000444',
+      name: 'Remote agent',
+      cwd: '/remote-workspace',
+    };
+    const remoteRun = {
+      ...run,
+      id: '018bcfe4-7a4b-7000-8000-000000000555',
+      agentId: remoteAgent.id,
+      prompt: 'Inspect the remote workspace.',
+      cwd: '/remote-workspace',
+    };
+    const localClient = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+    });
+    const remoteClient = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [remoteAgent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [remoteRun], nextCursor: null }),
+      listProjects: vi.fn().mockResolvedValue({ projects: [], nextCursor: null }),
+    });
+    const configuredServers: ServerDefinition[] = [
+      { id: 'local', name: 'Laptop', address: 'http://127.0.0.1:4101', hasToken: true },
+      { id: 'remote', name: 'Build host', address: 'https://agents.example.com', hasToken: true },
+    ];
+    const clients = new Map<string, SupervisorClientApi>([
+      ['local', localClient],
+      ['remote', remoteClient],
+    ]);
+    const manager: ServerConnectionManager = {
+      list: vi.fn().mockResolvedValue(configuredServers),
+      save: vi.fn(async (input: ServerInput) => ({
+        id: input.id ?? 'new-server',
+        name: input.name,
+        address: input.address,
+        hasToken: Boolean(input.token),
+      })),
+      remove: vi.fn().mockResolvedValue(undefined),
+      client: vi.fn(
+        (server: ServerDefinition) => clients.get(server.id) as unknown as SupervisorClient,
+      ),
+    };
+
+    render(<App connectionManager={manager} />);
+
+    expect(await screen.findByRole('button', { name: /Review the changes\./ })).toBeVisible();
+    expect(screen.getByRole('button', { name: /Inspect the remote workspace\./ })).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'New session' }));
+    const serverSelect = screen.getByRole('combobox', { name: 'Server' });
+    fireEvent.keyDown(serverSelect, { key: 'Enter' });
+    await user.click(await screen.findByRole('option', { name: 'Build host' }));
+    expect(serverSelect).toHaveTextContent('Build host');
+    expect(screen.getByRole('combobox', { name: 'Agent profile' })).toHaveTextContent(
+      'Remote agent',
+    );
   });
 
   it('shows actionable supervisor failures', async () => {

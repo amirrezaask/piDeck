@@ -7,7 +7,8 @@
       "tests/**",
       "playwright.config.ts",
       "!**/coverage/**",
-      "!**/dist/**"
+      "!**/dist/**",
+      "!**/out/**"
     ]
   },
   "formatter": {

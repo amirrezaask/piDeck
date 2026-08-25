@@ -2,6 +2,10 @@ import {
   type AgentMessageRequest,
   AgentMessageRequestSchema,
   type AgentModel,
+  type ComposerSuggestionsRequest,
+  ComposerSuggestionsRequestSchema,
+  type ComposerSuggestionsResponse,
+  ComposerSuggestionsResponseSchema,
   type CreateManagedAgentRequest,
   CreateManagedAgentRequestSchema,
   type CreateManagedAgentRunRequest,
@@ -105,6 +109,21 @@ export class SupervisorClient {
 
   listModels(): Promise<ManagedAgentModelsResponse> {
     return this.request('/v1/models', ManagedAgentModelsResponseSchema);
+  }
+
+  listComposerSuggestions(
+    request: ComposerSuggestionsRequest,
+  ): Promise<ComposerSuggestionsResponse> {
+    const parsed = ComposerSuggestionsRequestSchema.parse(request);
+    const params = new URLSearchParams({
+      cwd: parsed.cwd,
+      kind: parsed.kind,
+      prefix: parsed.prefix,
+    });
+    return this.request(
+      `/v1/composer/suggestions?${params.toString()}`,
+      ComposerSuggestionsResponseSchema,
+    );
   }
 
   listExtensions(): Promise<ManagedAgentExtensionsResponse> {
@@ -528,4 +547,4 @@ export function modelDisplayName(
   );
 }
 
-export const supervisorClient = new SupervisorClient({ baseUrl: '/supervisor' });
+export const supervisorClient = new SupervisorClient({ baseUrl: '' });

@@ -29,6 +29,32 @@ export const AgentModelSchema = z.object({
 });
 export type AgentModel = z.infer<typeof AgentModelSchema>;
 
+export const ComposerSuggestionKindSchema = z.enum(['file', 'directory', 'command']);
+export type ComposerSuggestionKind = z.infer<typeof ComposerSuggestionKindSchema>;
+
+export const ComposerSuggestionsRequestSchema = z
+  .object({
+    cwd: z.string().trim().min(1).max(4_096),
+    kind: z.enum(['file', 'command']),
+    prefix: z.string().max(4_096),
+  })
+  .strict();
+export type ComposerSuggestionsRequest = z.infer<typeof ComposerSuggestionsRequestSchema>;
+
+export const ComposerSuggestionSchema = z.object({
+  value: z.string().min(1).max(4_096),
+  label: z.string().min(1).max(512),
+  description: z.string().max(4_096).optional(),
+  kind: ComposerSuggestionKindSchema,
+});
+export type ComposerSuggestion = z.infer<typeof ComposerSuggestionSchema>;
+
+export const ComposerSuggestionsResponseSchema = z.object({
+  cwd: z.string().min(1).max(4_096),
+  suggestions: z.array(ComposerSuggestionSchema).max(100),
+});
+export type ComposerSuggestionsResponse = z.infer<typeof ComposerSuggestionsResponseSchema>;
+
 export const AgentModelOptionSchema = AgentModelSchema.extend({
   name: z.string().trim().min(1).max(512),
 });

@@ -36,6 +36,7 @@ import {
   PlusIcon,
   PuzzleIcon,
   SearchIcon,
+  ServerIcon,
   SettingsIcon,
   SparklesIcon,
   SunIcon,
@@ -55,6 +56,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import { ComposerInput } from '@/components/composer-input';
 import { MarkdownContent } from '@/components/markdown-content';
 import {
   Accordion,
@@ -128,6 +130,12 @@ import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { ApiError } from '@/lib/api-error';
+import {
+  type ServerConnectionManager,
+  type ServerDefinition,
+  type ServerInput,
+  serverConnectionManager,
+} from '@/lib/server-connections';
 import { AVAILABLE_SKILLS } from '@/lib/skills';
 import {
   modelDisplayName,
@@ -150,21 +158,51 @@ const THINKING_LEVELS: readonly AgentThinkingLevel[] = [
   'max',
 ];
 
-type SettingsSection = 'agents' | 'projects' | 'skills' | 'extensions' | 'appearance';
+type SettingsSection = 'servers' | 'agents' | 'projects' | 'skills' | 'extensions' | 'appearance';
 
 const THEME_STORAGE_KEY = 'pideck-theme';
 const SIDEBAR_STORAGE_KEY = 'pideck-sidebar-collapsed';
 const ARCHIVED_RUNS_STORAGE_KEY = 'pideck-archived-runs';
 
-type AppRoute = { kind: 'default' } | { kind: 'new' } | { kind: 'session'; runId: string };
+type AppRoute =
+  | { kind: 'default' }
+  | { kind: 'new' }
+  | { kind: 'session'; serverId?: string; runId: string };
+
+interface ServerSnapshot {
+  readonly server: ServerDefinition;
+  readonly client: SupervisorClientApi;
+  readonly agents: ManagedAgentResponse[];
+  readonly models: ManagedAgentModelsResponse | undefined;
+  readonly runs: ManagedAgentRunResponse[];
+  readonly projects: ManagedProjectResponse[];
+}
+
+interface ServerSession {
+  readonly serverId: string;
+  readonly run: ManagedAgentRunResponse;
+}
 
 function readAppRoute(): AppRoute {
   if (typeof window === 'undefined') return { kind: 'default' };
 
-  const match = window.location.pathname.match(/^\/sessions\/([^/]+)\/?$/);
-  if (match?.[1]) {
+  const serverMatch = window.location.pathname.match(/^\/servers\/([^/]+)\/sessions\/([^/]+)\/?$/);
+  if (serverMatch?.[1] && serverMatch[2]) {
     try {
-      return { kind: 'session', runId: decodeURIComponent(match[1]) };
+      return {
+        kind: 'session',
+        serverId: decodeURIComponent(serverMatch[1]),
+        runId: decodeURIComponent(serverMatch[2]),
+      };
+    } catch {
+      return { kind: 'default' };
+    }
+  }
+
+  const legacyMatch = window.location.pathname.match(/^\/sessions\/([^/]+)\/?$/);
+  if (legacyMatch?.[1]) {
+    try {
+      return { kind: 'session', runId: decodeURIComponent(legacyMatch[1]) };
     } catch {
       return { kind: 'default' };
     }
@@ -178,7 +216,9 @@ function writeAppRoute(route: AppRoute, replace = false) {
 
   const path =
     route.kind === 'session'
-      ? `/sessions/${encodeURIComponent(route.runId)}`
+      ? route.serverId
+        ? `/servers/${encodeURIComponent(route.serverId)}/sessions/${encodeURIComponent(route.runId)}`
+        : `/sessions/${encodeURIComponent(route.runId)}`
       : route.kind === 'new'
         ? '/new'
         : '/';
@@ -380,6 +420,7 @@ export type SupervisorClientApi = Pick<
   SupervisorClient,
   | 'listAgents'
   | 'listModels'
+  | 'listComposerSuggestions'
   | 'listExtensions'
   | 'updateExtensions'
   | 'listRuns'
@@ -402,11 +443,28 @@ export type SupervisorClientApi = Pick<
 
 interface AppProps {
   client?: SupervisorClientApi;
+  connectionManager?: ServerConnectionManager;
 }
 
-export default function App({ client = supervisorClient }: AppProps) {
+export default function App({
+  client: injectedClient,
+  connectionManager = serverConnectionManager,
+}: AppProps) {
+  const fallbackServer = useMemo<ServerDefinition>(
+    () => ({ id: 'local', name: 'Local', address: '/', hasToken: false }),
+    [],
+  );
+  const [client, setClient] = useState<SupervisorClientApi>(injectedClient ?? supervisorClient);
   const [initialRoute] = useState(readAppRoute);
   const initialRouteRef = useRef(initialRoute);
+  const [servers, setServers] = useState<ServerDefinition[]>(() =>
+    injectedClient ? [fallbackServer] : [],
+  );
+  const [snapshots, setSnapshots] = useState<Record<string, ServerSnapshot>>({});
+  const snapshotsRef = useRef<Record<string, ServerSnapshot>>({});
+  const [activeServerId, setActiveServerId] = useState<string | undefined>(() =>
+    initialRoute.kind === 'session' ? initialRoute.serverId : undefined,
+  );
   const [agents, setAgents] = useState<ManagedAgentResponse[]>([]);
   const [models, setModels] = useState<ManagedAgentModelsResponse>();
   const [runs, setRuns] = useState<ManagedAgentRunResponse[]>([]);
@@ -419,6 +477,9 @@ export default function App({ client = supervisorClient }: AppProps) {
   const [events, setEvents] = useState<ManagedAgentEvent[]>([]);
   const [runAttachments, setRunAttachments] = useState<Record<string, AgentImageAttachment[]>>({});
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>(
+    injectedClient ? 'agents' : 'servers',
+  );
   const [darkMode, setDarkMode] = useState(() => readDarkModePreference());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readSidebarCollapsedPreference());
   const [loading, setLoading] = useState(true);
@@ -426,12 +487,27 @@ export default function App({ client = supervisorClient }: AppProps) {
   const [error, setError] = useState<string>();
   const [connectionState, setConnectionState] = useState<StreamConnectionState>('stale');
 
-  const visibleRuns = useMemo(
-    () => runs.filter((candidate) => !archivedRunIds.includes(candidate.id)),
-    [archivedRunIds, runs],
+  const sessions = useMemo<ServerSession[]>(
+    () =>
+      Object.values(snapshots).flatMap((snapshot) =>
+        snapshot.runs.map((run) => ({ serverId: snapshot.server.id, run })),
+      ),
+    [snapshots],
+  );
+  const visibleSessions = useMemo(
+    () =>
+      sessions.filter(
+        (session) =>
+          !archivedRunIds.includes(sessionKey(session.serverId, session.run.id)) &&
+          !archivedRunIds.includes(session.run.id),
+      ),
+    [archivedRunIds, sessions],
   );
   const run = runs.find((candidate) => candidate.id === selectedRunId);
   const selectedAgent = agents.find((agent) => agent.id === run?.agentId);
+  const activeServer = servers.find((server) => server.id === activeServerId);
+  const selectedSessionKey =
+    activeServerId && selectedRunId ? sessionKey(activeServerId, selectedRunId) : undefined;
   const transcript = useMemo(() => mapPiEvents(events), [events]);
   const runIsActive = run?.status === 'queued' || run?.status === 'running';
 
@@ -468,7 +544,16 @@ export default function App({ client = supervisorClient }: AppProps) {
   useEffect(() => {
     const handlePopState = () => {
       const route = readAppRoute();
-      setSelectedRunId(route.kind === 'session' ? route.runId : undefined);
+      if (route.kind !== 'session') {
+        setSelectedRunId(undefined);
+        return;
+      }
+      const snapshot = route.serverId
+        ? snapshotsRef.current[route.serverId]
+        : Object.values(snapshotsRef.current).find((candidate) =>
+            candidate.runs.some((run) => run.id === route.runId),
+          );
+      if (snapshot) activateSnapshot(snapshot, route.runId);
     };
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
@@ -476,45 +561,114 @@ export default function App({ client = supervisorClient }: AppProps) {
 
   useEffect(() => {
     let active = true;
-    void Promise.all([
-      client.listAgents({ limit: 100 }),
-      client.listRuns({ limit: 100 }),
-      client.listProjects({ limit: 100 }),
-      client.listModels(),
-    ])
-      .then(([agentResponse, runResponse, projectResponse, modelResponse]) => {
+    void (async () => {
+      try {
+        const configuredServers = injectedClient
+          ? [fallbackServer]
+          : await connectionManager.list();
         if (!active) return;
-        setAgents(agentResponse.agents);
-        setRuns(runResponse.runs);
-        setProjects(projectResponse.projects);
-        setModels(modelResponse);
+        setServers(configuredServers);
+        if (configuredServers.length === 0) {
+          setSettingsSection('servers');
+          setSettingsOpen(true);
+          return;
+        }
+
+        const results = await Promise.allSettled(
+          configuredServers.map(async (server) => {
+            const serverClient = injectedClient ?? connectionManager.client(server);
+            const [agentResponse, runResponse, projectResponse, modelResponse] = await Promise.all([
+              serverClient.listAgents({ limit: 100 }),
+              serverClient.listRuns({ limit: 100 }),
+              serverClient.listProjects({ limit: 100 }),
+              serverClient.listModels(),
+            ]);
+            return {
+              server,
+              client: serverClient,
+              agents: agentResponse.agents,
+              runs: runResponse.runs,
+              projects: projectResponse.projects,
+              models: modelResponse,
+            } satisfies ServerSnapshot;
+          }),
+        );
+        if (!active) return;
+        const nextSnapshots: Record<string, ServerSnapshot> = {};
+        const failures: string[] = [];
+        results.forEach((result, index) => {
+          if (result.status === 'fulfilled') nextSnapshots[result.value.server.id] = result.value;
+          else {
+            const message = errorMessage(result.reason);
+            failures.push(
+              injectedClient
+                ? message
+                : `${configuredServers[index]?.name ?? 'Server'}: ${message}`,
+            );
+          }
+        });
+        snapshotsRef.current = nextSnapshots;
+        setSnapshots(nextSnapshots);
+        if (failures.length > 0) setError(failures.join('\n'));
 
         const route = initialRouteRef.current;
+        const routeSnapshot =
+          route.kind === 'session'
+            ? route.serverId
+              ? nextSnapshots[route.serverId]
+              : Object.values(nextSnapshots).find((snapshot) =>
+                  snapshot.runs.some((candidate) => candidate.id === route.runId),
+                )
+            : undefined;
         const routeRunId =
           route.kind === 'session' &&
-          runResponse.runs.some((candidate) => candidate.id === route.runId)
+          routeSnapshot?.runs.some((candidate) => candidate.id === route.runId)
             ? route.runId
             : undefined;
-        const nextRunId =
-          routeRunId ??
-          (route.kind === 'new'
-            ? undefined
-            : runResponse.runs.find(
-                (candidate) => !initialArchivedRunIdsRef.current.includes(candidate.id),
-              )?.id);
-        setSelectedRunId(nextRunId);
-        if (nextRunId && !routeRunId) writeAppRoute({ kind: 'session', runId: nextRunId }, true);
-      })
-      .catch((reason: unknown) => active && setError(errorMessage(reason)))
-      .finally(() => active && setLoading(false));
+        const firstSession = Object.values(nextSnapshots)
+          .flatMap((snapshot) => snapshot.runs.map((candidate) => ({ snapshot, run: candidate })))
+          .find(
+            ({ snapshot, run: candidate }) =>
+              !initialArchivedRunIdsRef.current.includes(
+                sessionKey(snapshot.server.id, candidate.id),
+              ) && !initialArchivedRunIdsRef.current.includes(candidate.id),
+          );
+        const targetSnapshot =
+          routeSnapshot ?? firstSession?.snapshot ?? Object.values(nextSnapshots)[0];
+        if (targetSnapshot) {
+          const nextRunId = routeRunId ?? (route.kind === 'new' ? undefined : firstSession?.run.id);
+          activateSnapshot(targetSnapshot, nextRunId);
+          if (nextRunId && !routeRunId) {
+            writeAppRoute(
+              { kind: 'session', serverId: targetSnapshot.server.id, runId: nextRunId },
+              true,
+            );
+          }
+        }
+      } catch (reason) {
+        if (active) setError(errorMessage(reason));
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
     return () => {
       active = false;
     };
-  }, [client]);
+  }, [connectionManager, fallbackServer, injectedClient]);
+
+  useEffect(() => {
+    if (!activeServerId || !snapshotsRef.current[activeServerId]) return;
+    const current = snapshotsRef.current[activeServerId];
+    const next = { ...current, agents, models, runs, projects };
+    const nextSnapshots = { ...snapshotsRef.current, [activeServerId]: next };
+    snapshotsRef.current = nextSnapshots;
+    setSnapshots(nextSnapshots);
+  }, [activeServerId, agents, models, projects, runs]);
 
   useEffect(() => {
     const runId = run?.id;
-    if (!runId || runAttachments[runId]) return;
+    const attachmentKey = selectedSessionKey;
+    if (!runId || !attachmentKey || runAttachments[attachmentKey]) return;
     let active = true;
     void client
       .listRunAttachments(runId)
@@ -522,7 +676,7 @@ export default function App({ client = supervisorClient }: AppProps) {
         if (!active) return;
         setRunAttachments((current) => ({
           ...current,
-          [runId]: response.attachments,
+          [attachmentKey]: response.attachments,
         }));
       })
       .catch((reason: unknown) => {
@@ -531,7 +685,7 @@ export default function App({ client = supervisorClient }: AppProps) {
     return () => {
       active = false;
     };
-  }, [client, run?.id, runAttachments]);
+  }, [client, run?.id, runAttachments, selectedSessionKey]);
 
   useEffect(() => {
     if (!run?.id) {
@@ -598,6 +752,23 @@ export default function App({ client = supervisorClient }: AppProps) {
     }, 1_000);
     return () => window.clearInterval(interval);
   }, [client, run, runIsActive]);
+
+  function activateSnapshot(snapshot: ServerSnapshot, runId?: string) {
+    setActiveServerId(snapshot.server.id);
+    setClient(snapshot.client);
+    setAgents(snapshot.agents);
+    setModels(snapshot.models);
+    setRuns(snapshot.runs);
+    setProjects(snapshot.projects);
+    setSelectedRunId(runId);
+  }
+
+  function selectComposerServer(serverId: string) {
+    const snapshot = snapshotsRef.current[serverId];
+    if (!snapshot) return;
+    activateSnapshot(snapshot);
+    writeAppRoute({ kind: 'new' });
+  }
 
   async function createAgent(name: string, systemPrompt: string) {
     setSubmitting(true);
@@ -666,10 +837,13 @@ export default function App({ client = supervisorClient }: AppProps) {
       if (input.attachments?.length) {
         setRunAttachments((current) => ({
           ...current,
-          [nextRun.id]: input.attachments ?? [],
+          [sessionKey(activeServerId ?? 'local', nextRun.id)]: input.attachments ?? [],
         }));
       }
-      openRun(nextRun.id);
+      if (activeServerId) {
+        setSelectedRunId(nextRun.id);
+        writeAppRoute({ kind: 'session', serverId: activeServerId, runId: nextRun.id });
+      }
       setEvents([]);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -790,9 +964,15 @@ export default function App({ client = supervisorClient }: AppProps) {
     }
   }
 
-  function openRun(runId: string) {
-    setSelectedRunId(runId);
-    writeAppRoute({ kind: 'session', runId });
+  function openRun(serverId: string, runId: string) {
+    const snapshot = snapshotsRef.current[serverId];
+    if (!snapshot) return;
+    activateSnapshot(snapshot, runId);
+    writeAppRoute({
+      kind: 'session',
+      serverId: injectedClient ? undefined : serverId,
+      runId,
+    });
   }
 
   function openNewSession() {
@@ -801,12 +981,15 @@ export default function App({ client = supervisorClient }: AppProps) {
     writeAppRoute({ kind: 'new' });
   }
 
-  function archiveRun(runId: string) {
-    setArchivedRunIds((current) => (current.includes(runId) ? current : [...current, runId]));
-    if (selectedRunId !== runId) return;
+  function archiveRun(serverId: string, runId: string) {
+    const key = sessionKey(serverId, runId);
+    setArchivedRunIds((current) => (current.includes(key) ? current : [...current, key]));
+    if (activeServerId !== serverId || selectedRunId !== runId) return;
 
-    const nextRun = visibleRuns.find((candidate) => candidate.id !== runId);
-    if (nextRun) openRun(nextRun.id);
+    const nextSession = visibleSessions.find(
+      (candidate) => candidate.serverId !== serverId || candidate.run.id !== runId,
+    );
+    if (nextSession) openRun(nextSession.serverId, nextSession.run.id);
     else openNewSession();
   }
 
@@ -878,7 +1061,7 @@ export default function App({ client = supervisorClient }: AppProps) {
                 <div className="flex items-center gap-1">
                   <motion.div layout initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }}>
                     <Badge variant="outline" className={sidebarCollapsed ? 'sr-only' : undefined}>
-                      Local
+                      {activeServer?.name ?? `${servers.length} servers`}
                     </Badge>
                   </motion.div>
                   <Button
@@ -925,7 +1108,7 @@ export default function App({ client = supervisorClient }: AppProps) {
                 aria-label="Sessions"
               >
                 <AnimatePresence initial={false} mode="popLayout">
-                  {visibleRuns.length === 0 ? (
+                  {visibleSessions.length === 0 ? (
                     <motion.p
                       key="empty-runs"
                       className={cn(
@@ -940,20 +1123,28 @@ export default function App({ client = supervisorClient }: AppProps) {
                       Runs will appear here after you start a session.
                     </motion.p>
                   ) : (
-                    visibleRuns.map((candidate, index) => {
-                      const agent = agents.find((item) => item.id === candidate.agentId);
-                      const selected = candidate.id === selectedRunId;
-                      const modelName = modelDisplayName(candidate.model, models);
+                    visibleSessions.map((session, index) => {
+                      const candidate = session.run;
+                      const snapshot = snapshots[session.serverId];
+                      const server = snapshot?.server;
+                      const sessionAgents = snapshot?.agents ?? [];
+                      const sessionModels = snapshot?.models;
+                      const sessionProjects = snapshot?.projects ?? [];
+                      const agent = sessionAgents.find((item) => item.id === candidate.agentId);
+                      const selected =
+                        session.serverId === activeServerId && candidate.id === selectedRunId;
+                      const modelName = modelDisplayName(candidate.model, sessionModels);
                       const thinkingLabel = candidate.thinkingLevel
                         ? titleCase(candidate.thinkingLevel)
                         : 'Default';
-                      const projectLabel = sessionProjectLabel(candidate.cwd, projects);
-                      const branchLabel = sessionBranchLabel(candidate.cwd, projects);
+                      const projectLabel = sessionProjectLabel(candidate.cwd, sessionProjects);
+                      const branchLabel = sessionBranchLabel(candidate.cwd, sessionProjects);
                       const sessionDetails = `${modelName} · ${thinkingLabel} thinking`;
-                      const sessionTooltip = `${sessionTitle(candidate.prompt)} · ${projectLabel} · ${branchLabel} · ${sessionDetails} · ${titleCase(candidate.status)}`;
+                      const serverDetail = injectedClient ? '' : ` · ${server?.name ?? 'Server'}`;
+                      const sessionTooltip = `${sessionTitle(candidate.prompt)}${serverDetail} · ${projectLabel} · ${branchLabel} · ${sessionDetails} · ${titleCase(candidate.status)}`;
                       return (
                         <motion.div
-                          key={candidate.id}
+                          key={sessionKey(session.serverId, candidate.id)}
                           layout
                           initial={{ opacity: 0, x: -12 }}
                           animate={{ opacity: 1, x: 0 }}
@@ -994,11 +1185,14 @@ export default function App({ client = supervisorClient }: AppProps) {
                                       aria-current={selected ? 'page' : undefined}
                                       aria-label={sidebarCollapsed ? sessionTooltip : undefined}
                                       title={sessionTooltip}
-                                      onClick={() => openRun(candidate.id)}
+                                      onClick={() => openRun(session.serverId, candidate.id)}
                                     >
                                       {sidebarCollapsed ? (
                                         <span className="relative flex size-7 items-center justify-center">
-                                          <SessionAvatar model={candidate.model} models={models} />
+                                          <SessionAvatar
+                                            model={candidate.model}
+                                            models={sessionModels}
+                                          />
                                           <span className="absolute -top-1 -right-1">
                                             <RunDot status={candidate.status} />
                                           </span>
@@ -1006,7 +1200,7 @@ export default function App({ client = supervisorClient }: AppProps) {
                                       ) : (
                                         <SessionAvatar
                                           model={candidate.model}
-                                          models={models}
+                                          models={sessionModels}
                                           className="size-9 rounded-full ring-1 ring-border/70"
                                         />
                                       )}
@@ -1020,7 +1214,9 @@ export default function App({ client = supervisorClient }: AppProps) {
                                               className="size-3 shrink-0"
                                               aria-hidden="true"
                                             />
-                                            <span className="truncate">{projectLabel}</span>
+                                            <span className="truncate">
+                                              {server?.name ?? 'Server'} · {projectLabel}
+                                            </span>
                                           </span>
                                           <span className="w-full truncate text-sm font-semibold leading-5 tracking-tight text-foreground">
                                             {sessionTitle(candidate.prompt)}
@@ -1063,7 +1259,7 @@ export default function App({ client = supervisorClient }: AppProps) {
                                 <ContextMenuPrimitive.Separator className="-mx-1 my-1 h-px bg-border" />
                                 <ContextMenuPrimitive.Item
                                   className="relative flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50"
-                                  onSelect={() => archiveRun(candidate.id)}
+                                  onSelect={() => archiveRun(session.serverId, candidate.id)}
                                 >
                                   <ArchiveIcon className="size-4" aria-hidden="true" />
                                   Archive
@@ -1081,7 +1277,7 @@ export default function App({ client = supervisorClient }: AppProps) {
                               title="Archive session"
                               onClick={(event) => {
                                 event.stopPropagation();
-                                archiveRun(candidate.id);
+                                archiveRun(session.serverId, candidate.id);
                               }}
                             >
                               <ArchiveIcon aria-hidden="true" />
@@ -1161,11 +1357,14 @@ export default function App({ client = supervisorClient }: AppProps) {
                     transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
                   >
                     <Conversation
+                      client={client}
                       agent={selectedAgent}
                       run={run}
                       models={models}
                       transcript={transcript}
-                      promptAttachments={runAttachments[run.id] ?? []}
+                      promptAttachments={
+                        runAttachments[sessionKey(activeServerId ?? 'local', run.id)] ?? []
+                      }
                       submitting={submitting}
                       runIsActive={runIsActive}
                       connectionState={connectionState}
@@ -1184,13 +1383,20 @@ export default function App({ client = supervisorClient }: AppProps) {
                     transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
                   >
                     <NewSession
+                      client={client}
+                      servers={servers}
+                      serverId={activeServerId}
                       agents={agents}
                       models={models}
                       projects={projects}
                       submitting={submitting}
                       onStart={startRun}
                       onDeleteProject={deleteProject}
-                      onOpenAgents={() => setSettingsOpen(true)}
+                      onServerChange={selectComposerServer}
+                      onOpenAgents={() => {
+                        setSettingsSection(servers.length === 0 ? 'servers' : 'agents');
+                        setSettingsOpen(true);
+                      }}
                     />
                   </motion.div>
                 )}
@@ -1199,6 +1405,28 @@ export default function App({ client = supervisorClient }: AppProps) {
 
             <AgentSettingsDialog
               client={client}
+              connectionManager={connectionManager}
+              servers={servers}
+              activeServerId={activeServerId}
+              section={settingsSection}
+              onSectionChange={setSettingsSection}
+              onServersChange={(nextServers, nextSnapshots) => {
+                setServers(nextServers);
+                snapshotsRef.current = nextSnapshots;
+                setSnapshots(nextSnapshots);
+                const nextActive = activeServerId
+                  ? (nextSnapshots[activeServerId] ?? Object.values(nextSnapshots)[0])
+                  : Object.values(nextSnapshots)[0];
+                if (nextActive) activateSnapshot(nextActive);
+                else {
+                  setActiveServerId(undefined);
+                  setAgents([]);
+                  setModels(undefined);
+                  setRuns([]);
+                  setProjects([]);
+                  setSelectedRunId(undefined);
+                }
+              }}
               open={settingsOpen}
               onOpenChange={setSettingsOpen}
               agents={agents}
@@ -1253,14 +1481,21 @@ function LoadingState() {
 }
 
 function NewSession({
+  client,
+  servers,
+  serverId,
   agents,
   models,
   projects,
   submitting,
   onStart,
   onDeleteProject,
+  onServerChange,
   onOpenAgents,
 }: {
+  client: Pick<SupervisorClientApi, 'listComposerSuggestions'>;
+  servers: ServerDefinition[];
+  serverId: string | undefined;
   agents: ManagedAgentResponse[];
   models: ManagedAgentModelsResponse | undefined;
   projects: ManagedProjectResponse[];
@@ -1274,6 +1509,7 @@ function NewSession({
     attachments?: AgentImageAttachment[];
   }): Promise<void>;
   onDeleteProject(project: ManagedProjectResponse): Promise<boolean>;
+  onServerChange(serverId: string): void;
   onOpenAgents(): void;
 }) {
   const [prompt, setPrompt] = useState('');
@@ -1384,14 +1620,15 @@ function NewSession({
   }
 
   useEffect(() => {
-    if (!agentId && agents[0]) {
-      setAgentId(agents[0].id);
-      setCwd(agents[0].cwd);
-    }
-  }, [agentId, agents]);
+    if (agents.some((agent) => agent.id === agentId)) return;
+    setAgentId(agents[0]?.id ?? '');
+    setCwd(agents[0]?.cwd ?? projects[0]?.path ?? '.');
+  }, [agentId, agents, projects]);
 
   useEffect(() => {
-    if (!modelKey && models?.defaultModel) setModelKey(encodeModel(models.defaultModel));
+    const availableKeys = new Set(models?.models.map(encodeModel) ?? []);
+    if (availableKeys.has(modelKey)) return;
+    setModelKey(models?.defaultModel ? encodeModel(models.defaultModel) : '');
   }, [modelKey, models]);
 
   async function submit(event: FormEvent) {
@@ -1416,6 +1653,35 @@ function NewSession({
     } catch {
       // Keep the draft and attachments visible while the app-level error explains what failed.
     }
+  }
+
+  if (servers.length === 0) {
+    return (
+      <motion.div
+        className="flex flex-1"
+        initial={{ opacity: 0, y: 14 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+      >
+        <Empty className="border-0">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <ServerIcon />
+            </EmptyMedia>
+            <EmptyTitle>Connect a server first</EmptyTitle>
+            <EmptyDescription>
+              Add the address of a piDeck server to load its sessions and start new work.
+            </EmptyDescription>
+          </EmptyHeader>
+          <EmptyContent>
+            <Button onClick={onOpenAgents}>
+              <SettingsIcon data-icon="inline-start" />
+              Open server settings
+            </Button>
+          </EmptyContent>
+        </Empty>
+      </motion.div>
+    );
   }
 
   if (agents.length === 0) {
@@ -1512,13 +1778,16 @@ function NewSession({
               </motion.div>
             ) : null}
           </AnimatePresence>
-          <Textarea
-            aria-label="Session task"
+          <ComposerInput
+            ariaLabel="Session task"
             placeholder="Ask Pi to inspect, build, fix, or explain…"
             value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
+            onChange={setPrompt}
+            cwd={cwd}
+            client={client}
             disabled={submitting}
             className="min-h-32 resize-none rounded-none border-0 bg-transparent px-5 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-36"
+            placement="top"
             onKeyDown={(event) => {
               if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
                 event.preventDefault();
@@ -1599,6 +1868,26 @@ function NewSession({
                 onChange={handleFileInput}
                 tabIndex={-1}
               />
+              <Select value={serverId} onValueChange={onServerChange}>
+                <SelectTrigger
+                  aria-label="Server"
+                  size="sm"
+                  className="max-w-44 border-0 bg-transparent shadow-none"
+                >
+                  <ServerIcon />
+                  <SelectValue placeholder="Choose server" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {servers.map((server) => (
+                      <SelectItem key={server.id} value={server.id}>
+                        {server.name}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <Separator orientation="vertical" className="hidden h-5 sm:block" />
               <Button
                 type="button"
                 variant="ghost"
@@ -2249,6 +2538,7 @@ function PromptAttachments({ attachments }: { attachments: AgentImageAttachment[
 }
 
 function Conversation({
+  client,
   agent,
   run,
   models,
@@ -2261,6 +2551,7 @@ function Conversation({
   onSteer,
   onSendMessage,
 }: {
+  client: Pick<SupervisorClientApi, 'listComposerSuggestions'>;
   agent: ManagedAgentResponse | undefined;
   run: ManagedAgentRunResponse;
   models: ManagedAgentModelsResponse | undefined;
@@ -2662,10 +2953,12 @@ function Conversation({
                 >
                   <PaperclipIcon />
                 </Button>
-                <Textarea
-                  aria-label="Message agent"
+                <ComposerInput
+                  ariaLabel="Message agent"
                   value={message}
-                  onChange={(event) => setMessage(event.target.value)}
+                  onChange={setMessage}
+                  cwd={run.cwd}
+                  client={client}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter' && !event.shiftKey) {
                       event.preventDefault();
@@ -2675,6 +2968,7 @@ function Conversation({
                   placeholder="Send a message to Pi…"
                   disabled={submitting}
                   rows={1}
+                  placement="top"
                   className="max-h-32 min-h-10 resize-none rounded-2xl bg-muted/40 py-2.5 shadow-none focus-visible:ring-2"
                 />
                 {runIsActive ? (
@@ -2712,6 +3006,12 @@ function Conversation({
 
 function AgentSettingsDialog({
   client,
+  connectionManager,
+  servers,
+  activeServerId,
+  section,
+  onSectionChange,
+  onServersChange,
   open,
   onOpenChange,
   agents,
@@ -2727,6 +3027,12 @@ function AgentSettingsDialog({
   onDeleteProject,
 }: {
   client: Pick<SupervisorClientApi, 'listExtensions' | 'updateExtensions'>;
+  connectionManager: ServerConnectionManager;
+  servers: ServerDefinition[];
+  activeServerId: string | undefined;
+  section: SettingsSection;
+  onSectionChange(section: SettingsSection): void;
+  onServersChange(servers: ServerDefinition[], snapshots: Record<string, ServerSnapshot>): void;
   open: boolean;
   onOpenChange(open: boolean): void;
   agents: ManagedAgentResponse[];
@@ -2748,7 +3054,6 @@ function AgentSettingsDialog({
   onDeleteProject(project: ManagedProjectResponse): Promise<boolean>;
 }) {
   const [editing, setEditing] = useState<string | 'new'>();
-  const [section, setSection] = useState<SettingsSection>('agents');
   const selectedAgent = agents.find((agent) => agent.id === editing);
 
   return (
@@ -2774,10 +3079,22 @@ function AgentSettingsDialog({
               <h2 className="px-2 text-lg font-semibold tracking-tight">Settings</h2>
               <nav className="mt-4 flex flex-col gap-1" aria-label="Settings sections">
                 <Button
+                  variant={section === 'servers' ? 'secondary' : 'ghost'}
+                  className="w-full justify-start"
+                  aria-current={section === 'servers' ? 'page' : undefined}
+                  onClick={() => onSectionChange('servers')}
+                >
+                  <ServerIcon data-icon="inline-start" />
+                  Servers
+                  <Badge variant="outline" className="ml-auto">
+                    {servers.length}
+                  </Badge>
+                </Button>
+                <Button
                   variant={section === 'appearance' ? 'secondary' : 'ghost'}
                   className="w-full justify-start"
                   aria-current={section === 'appearance' ? 'page' : undefined}
-                  onClick={() => setSection('appearance')}
+                  onClick={() => onSectionChange('appearance')}
                 >
                   <SunIcon data-icon="inline-start" />
                   Appearance
@@ -2786,7 +3103,7 @@ function AgentSettingsDialog({
                   variant={section === 'projects' ? 'secondary' : 'ghost'}
                   className="w-full justify-start"
                   aria-current={section === 'projects' ? 'page' : undefined}
-                  onClick={() => setSection('projects')}
+                  onClick={() => onSectionChange('projects')}
                 >
                   <FolderIcon data-icon="inline-start" />
                   Projects
@@ -2798,7 +3115,7 @@ function AgentSettingsDialog({
                   variant={section === 'agents' ? 'secondary' : 'ghost'}
                   className="w-full justify-start"
                   aria-current={section === 'agents' ? 'page' : undefined}
-                  onClick={() => setSection('agents')}
+                  onClick={() => onSectionChange('agents')}
                 >
                   <BotIcon data-icon="inline-start" />
                   Agents
@@ -2810,7 +3127,7 @@ function AgentSettingsDialog({
                   variant={section === 'skills' ? 'secondary' : 'ghost'}
                   className="w-full justify-start"
                   aria-current={section === 'skills' ? 'page' : undefined}
-                  onClick={() => setSection('skills')}
+                  onClick={() => onSectionChange('skills')}
                 >
                   <BookOpenIcon data-icon="inline-start" />
                   Skills
@@ -2822,7 +3139,7 @@ function AgentSettingsDialog({
                   variant={section === 'extensions' ? 'secondary' : 'ghost'}
                   className="w-full justify-start"
                   aria-current={section === 'extensions' ? 'page' : undefined}
-                  onClick={() => setSection('extensions')}
+                  onClick={() => onSectionChange('extensions')}
                 >
                   <PuzzleIcon data-icon="inline-start" />
                   Extensions
@@ -2838,7 +3155,14 @@ function AgentSettingsDialog({
               animate={{ opacity: 1, x: 0 }}
               transition={{ duration: 0.18, delay: 0.07 }}
             >
-              {section === 'projects' ? (
+              {section === 'servers' ? (
+                <ServersSettingsPage
+                  servers={servers}
+                  activeServerId={activeServerId}
+                  connectionManager={connectionManager}
+                  onServersChange={onServersChange}
+                />
+              ) : section === 'projects' ? (
                 <KnownProjectsSettingsPage
                   projects={projects}
                   submitting={submitting}
@@ -2983,6 +3307,346 @@ function AgentSettingsDialog({
         }}
       />
     </>
+  );
+}
+
+function ServersSettingsPage({
+  servers,
+  activeServerId,
+  connectionManager,
+  onServersChange,
+}: {
+  servers: ServerDefinition[];
+  activeServerId: string | undefined;
+  connectionManager: ServerConnectionManager;
+  onServersChange(servers: ServerDefinition[], snapshots: Record<string, ServerSnapshot>): void;
+}) {
+  const [editing, setEditing] = useState<ServerDefinition | 'new'>();
+  const [removing, setRemoving] = useState<ServerDefinition>();
+  const [busy, setBusy] = useState(false);
+  const [pageError, setPageError] = useState<string>();
+
+  async function refreshConnections() {
+    const nextServers = await connectionManager.list();
+    const results = await Promise.allSettled(
+      nextServers.map(async (server) => {
+        const nextClient = connectionManager.client(server);
+        const [agentResponse, runResponse, projectResponse, modelResponse] = await Promise.all([
+          nextClient.listAgents({ limit: 100 }),
+          nextClient.listRuns({ limit: 100 }),
+          nextClient.listProjects({ limit: 100 }),
+          nextClient.listModels(),
+        ]);
+        return {
+          server,
+          client: nextClient,
+          agents: agentResponse.agents,
+          runs: runResponse.runs,
+          projects: projectResponse.projects,
+          models: modelResponse,
+        } satisfies ServerSnapshot;
+      }),
+    );
+    const nextSnapshots: Record<string, ServerSnapshot> = {};
+    const failures: string[] = [];
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') nextSnapshots[result.value.server.id] = result.value;
+      else failures.push(`${nextServers[index]?.name ?? 'Server'}: ${errorMessage(result.reason)}`);
+    });
+    onServersChange(nextServers, nextSnapshots);
+    setPageError(failures.length > 0 ? failures.join('\n') : undefined);
+  }
+
+  async function saveServer(input: ServerInput) {
+    setBusy(true);
+    setPageError(undefined);
+    try {
+      await connectionManager.save(input);
+      await refreshConnections();
+      setEditing(undefined);
+    } catch (reason) {
+      setPageError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeServer() {
+    if (!removing) return;
+    setBusy(true);
+    setPageError(undefined);
+    try {
+      await connectionManager.remove(removing.id);
+      await refreshConnections();
+      setRemoving(undefined);
+    } catch (reason) {
+      setPageError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <motion.div
+        className="mx-auto flex max-w-3xl flex-col gap-5"
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+      >
+        <div className="flex flex-col items-start gap-4 pr-8 sm:flex-row sm:justify-between">
+          <div>
+            <h3 className="text-xl font-semibold tracking-tight">Servers</h3>
+            <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+              Connect piDeck to every supervisor you use. Sessions from connected servers appear
+              together in the sidebar.
+            </p>
+          </div>
+          <Button className="shrink-0" onClick={() => setEditing('new')}>
+            <PlusIcon data-icon="inline-start" />
+            Add server
+          </Button>
+        </div>
+
+        {pageError ? (
+          <Alert variant="destructive">
+            <AlertTitle>Some servers could not connect</AlertTitle>
+            <AlertDescription className="whitespace-pre-line">{pageError}</AlertDescription>
+          </Alert>
+        ) : null}
+
+        {servers.length === 0 ? (
+          <Empty className="min-h-72 border">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <ServerIcon />
+              </EmptyMedia>
+              <EmptyTitle>No servers configured</EmptyTitle>
+              <EmptyDescription>
+                Add a server address and access token to load sessions from that supervisor.
+              </EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent>
+              <Button onClick={() => setEditing('new')}>Add your first server</Button>
+            </EmptyContent>
+          </Empty>
+        ) : (
+          <ul className="overflow-hidden rounded-xl border" aria-label="Configured servers">
+            {servers.map((server, index) => (
+              <li key={server.id}>
+                {index > 0 ? <Separator /> : null}
+                <div className="flex items-center gap-3 px-4 py-3.5">
+                  <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
+                    <ServerIcon className="size-4" aria-hidden="true" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-2">
+                      <span className="truncate font-medium">{server.name}</span>
+                      {server.id === activeServerId ? (
+                        <Badge variant="secondary">Active</Badge>
+                      ) : null}
+                    </span>
+                    <span className="mt-0.5 block truncate font-mono text-xs text-muted-foreground">
+                      {server.address}
+                    </span>
+                    <span className="mt-1 block text-[0.7rem] text-muted-foreground/75">
+                      {server.hasToken ? 'Access token stored securely' : 'No access token'}
+                    </span>
+                  </span>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Edit server ${server.name}`}
+                      title="Edit server"
+                      disabled={busy}
+                      onClick={() => setEditing(server)}
+                    >
+                      <PencilIcon />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Remove server ${server.name}`}
+                      title="Remove server"
+                      disabled={busy}
+                      className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                      onClick={() => setRemoving(server)}
+                    >
+                      <Trash2Icon />
+                    </Button>
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </motion.div>
+
+      <ServerEditorDialog
+        server={editing === 'new' ? undefined : editing}
+        open={editing !== undefined}
+        busy={busy}
+        onOpenChange={(open) => {
+          if (!open && !busy) setEditing(undefined);
+        }}
+        onSave={saveServer}
+      />
+
+      <Dialog
+        open={removing !== undefined}
+        onOpenChange={(open) => {
+          if (!open && !busy) setRemoving(undefined);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove server?</DialogTitle>
+            <DialogDescription>
+              {removing
+                ? `Remove “${removing.name}” and its saved credentials from this client. The server and its sessions will not be changed.`
+                : ''}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button type="button" variant="outline" disabled={busy}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={busy}
+              onClick={() => void removeServer()}
+            >
+              Remove server
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function ServerEditorDialog({
+  server,
+  open,
+  busy,
+  onOpenChange,
+  onSave,
+}: {
+  server: ServerDefinition | undefined;
+  open: boolean;
+  busy: boolean;
+  onOpenChange(open: boolean): void;
+  onSave(input: ServerInput): Promise<void>;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {open ? (
+        <ServerEditorForm key={server?.id ?? 'new'} server={server} busy={busy} onSave={onSave} />
+      ) : null}
+    </Dialog>
+  );
+}
+
+function ServerEditorForm({
+  server,
+  busy,
+  onSave,
+}: {
+  server: ServerDefinition | undefined;
+  busy: boolean;
+  onSave(input: ServerInput): Promise<void>;
+}) {
+  const [name, setName] = useState(server?.name ?? '');
+  const [address, setAddress] = useState(
+    server?.address.startsWith('/') ? window.location.origin : (server?.address ?? ''),
+  );
+  const [token, setToken] = useState('');
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!name.trim() || !address.trim()) return;
+    await onSave({
+      ...(server ? { id: server.id } : {}),
+      name: name.trim(),
+      address: address.trim(),
+      ...(token ? { token } : {}),
+    });
+  }
+
+  return (
+    <DialogContent className="sm:max-w-xl">
+      <form onSubmit={submit}>
+        <DialogHeader>
+          <DialogTitle>{server ? 'Edit server' : 'Add server'}</DialogTitle>
+          <DialogDescription>
+            Use the origin where the piDeck server listens. Credentials stay in this Electron client
+            and are never exposed to the page.
+          </DialogDescription>
+        </DialogHeader>
+        <FieldGroup className="py-6">
+          <Field>
+            <FieldLabel htmlFor="server-name">Name</FieldLabel>
+            <Input
+              id="server-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="Build machine"
+              autoFocus
+              required
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="server-address">Server address</FieldLabel>
+            <Input
+              id="server-address"
+              value={address}
+              onChange={(event) => setAddress(event.target.value)}
+              placeholder="https://agents.example.com"
+              inputMode="url"
+              autoComplete="url"
+              required
+            />
+            <FieldDescription>
+              Enter an http:// or https:// origin without an API path.
+            </FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="server-token">Access token</FieldLabel>
+            <Input
+              id="server-token"
+              type="password"
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+              placeholder={
+                server?.hasToken ? 'Leave blank to keep the saved token' : 'Server token'
+              }
+              autoComplete="off"
+            />
+            <FieldDescription>
+              {server?.hasToken
+                ? 'A token is already stored. Enter a new value only to replace it.'
+                : 'Use the NEXTFLOW_SUPERVISOR_TOKEN configured on this server.'}
+            </FieldDescription>
+          </Field>
+        </FieldGroup>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button type="button" variant="outline" disabled={busy}>
+              Cancel
+            </Button>
+          </DialogClose>
+          <Button type="submit" disabled={busy || !name.trim() || !address.trim()}>
+            {busy ? 'Connecting…' : server ? 'Save changes' : 'Add server'}
+          </Button>
+        </DialogFooter>
+      </form>
+    </DialogContent>
   );
 }
 
@@ -4173,6 +4837,10 @@ function mergeEvents(
   return [
     ...new Map([...current, ...incoming].map((event) => [event.sequence, event])).values(),
   ].sort((left, right) => left.sequence - right.sequence);
+}
+
+function sessionKey(serverId: string, runId: string): string {
+  return `${serverId}:${runId}`;
 }
 
 function errorMessage(reason: unknown): string {
