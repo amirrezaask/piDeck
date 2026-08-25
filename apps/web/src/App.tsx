@@ -1,13 +1,18 @@
 import type {
+  AgentImageAttachment,
+  AgentModel,
   AgentThinkingLevel,
   JsonValue,
   ManagedAgentEvent,
+  ManagedAgentExtension,
+  ManagedAgentExtensionsResponse,
   ManagedAgentModelsResponse,
   ManagedAgentResponse,
   ManagedAgentRunResponse,
   ManagedProjectResponse,
 } from '@nextflow/contracts';
 import {
+  ArchiveIcon,
   ArrowUpIcon,
   BookOpenIcon,
   BotIcon,
@@ -20,12 +25,14 @@ import {
   FileIcon,
   FileTextIcon,
   FolderIcon,
+  GitBranchIcon,
   ImageIcon,
   LoaderCircleIcon,
   MoonIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
   PaperclipIcon,
+  PencilIcon,
   PlusIcon,
   PuzzleIcon,
   SearchIcon,
@@ -36,11 +43,13 @@ import {
   XIcon,
 } from 'lucide-react';
 import { AnimatePresence, LayoutGroup, MotionConfig, motion, useReducedMotion } from 'motion/react';
+import { ContextMenu as ContextMenuPrimitive } from 'radix-ui';
 import {
   type ChangeEvent,
   type DragEvent,
   type FormEvent,
   type SVGProps,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -63,10 +72,19 @@ import {
   AttachmentGroup,
   AttachmentMedia,
   AttachmentTitle,
+  AttachmentTrigger,
 } from '@/components/ui/attachment';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Bubble, BubbleContent } from '@/components/ui/bubble';
 import { Button } from '@/components/ui/button';
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandItem,
+  CommandList,
+} from '@/components/ui/command';
 import {
   Dialog,
   DialogClose,
@@ -75,6 +93,7 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from '@/components/ui/dialog';
 import {
   Empty,
@@ -96,6 +115,7 @@ import {
   MessageScrollerProvider,
   MessageScrollerViewport,
 } from '@/components/ui/message-scroller';
+import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import {
   Select,
   SelectContent,
@@ -106,9 +126,15 @@ import {
 } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { ApiError } from '@/lib/api-error';
 import { AVAILABLE_SKILLS } from '@/lib/skills';
-import { modelDisplayName, type SupervisorClient, supervisorClient } from '@/lib/supervisor-client';
+import {
+  modelDisplayName,
+  type StreamConnectionState,
+  type SupervisorClient,
+  supervisorClient,
+} from '@/lib/supervisor-client';
 import { collapseThinkingMarkers, mapPiEvents, type TranscriptEvent } from '@/lib/transcript';
 import { cn } from '@/lib/utils';
 
@@ -124,10 +150,43 @@ const THINKING_LEVELS: readonly AgentThinkingLevel[] = [
   'max',
 ];
 
-type SettingsSection = 'agents' | 'skills' | 'extensions' | 'appearance';
+type SettingsSection = 'agents' | 'projects' | 'skills' | 'extensions' | 'appearance';
 
 const THEME_STORAGE_KEY = 'pideck-theme';
 const SIDEBAR_STORAGE_KEY = 'pideck-sidebar-collapsed';
+const ARCHIVED_RUNS_STORAGE_KEY = 'pideck-archived-runs';
+
+type AppRoute = { kind: 'default' } | { kind: 'new' } | { kind: 'session'; runId: string };
+
+function readAppRoute(): AppRoute {
+  if (typeof window === 'undefined') return { kind: 'default' };
+
+  const match = window.location.pathname.match(/^\/sessions\/([^/]+)\/?$/);
+  if (match?.[1]) {
+    try {
+      return { kind: 'session', runId: decodeURIComponent(match[1]) };
+    } catch {
+      return { kind: 'default' };
+    }
+  }
+
+  return window.location.pathname === '/new' ? { kind: 'new' } : { kind: 'default' };
+}
+
+function writeAppRoute(route: AppRoute, replace = false) {
+  if (typeof window === 'undefined') return;
+
+  const path =
+    route.kind === 'session'
+      ? `/sessions/${encodeURIComponent(route.runId)}`
+      : route.kind === 'new'
+        ? '/new'
+        : '/';
+  if (window.location.pathname === path) return;
+
+  const method = replace ? 'replaceState' : 'pushState';
+  window.history[method]({}, '', path);
+}
 
 function PiIcon({ className, ...props }: SVGProps<SVGSVGElement>) {
   return (
@@ -139,6 +198,148 @@ function PiIcon({ className, ...props }: SVGProps<SVGSVGElement>) {
       />
       <path fill="currentColor" d="M517.36 400h117.36v234.72H517.36z" />
     </svg>
+  );
+}
+
+function modelProvider(model: AgentModel | null | undefined): string {
+  return model?.provider.trim().toLowerCase() ?? '';
+}
+
+function modelAvatarTone(provider: string): string {
+  if (provider.includes('openai'))
+    return 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300';
+  if (provider.includes('anthropic') || provider.includes('claude')) {
+    return 'bg-orange-500/15 text-orange-700 dark:text-orange-300';
+  }
+  if (provider.includes('google') || provider.includes('gemini')) {
+    return 'bg-blue-500/15 text-blue-700 dark:text-blue-300';
+  }
+  if (provider.includes('mistral')) return 'bg-amber-500/15 text-amber-700 dark:text-amber-300';
+  if (provider.includes('xai') || provider.includes('grok')) {
+    return 'bg-slate-500/15 text-slate-700 dark:text-slate-300';
+  }
+  if (provider.includes('deepseek')) return 'bg-cyan-500/15 text-cyan-700 dark:text-cyan-300';
+  if (provider.includes('meta') || provider.includes('llama')) {
+    return 'bg-indigo-500/15 text-indigo-700 dark:text-indigo-300';
+  }
+  return 'bg-muted text-muted-foreground';
+}
+
+function ModelLogo({ provider }: { provider: string }) {
+  const className = 'size-4 shrink-0';
+  if (provider.includes('openai')) {
+    return (
+      <svg className={className} viewBox="0 0 256 260" fill="currentColor" aria-hidden="true">
+        <path d="M239.184 106.203a64.72 64.72 0 0 0-5.576-53.103C219.452 28.459 191 15.784 163.213 21.74A65.586 65.586 0 0 0 52.096 45.22a64.72 64.72 0 0 0-43.23 31.36c-14.31 24.602-11.061 55.634 8.033 76.74a64.67 64.67 0 0 0 5.525 53.102c14.174 24.65 42.644 37.324 70.446 31.36a64.72 64.72 0 0 0 48.754 21.744c28.481.025 53.714-18.361 62.414-45.481a64.77 64.77 0 0 0 43.229-31.36c14.137-24.558 10.875-55.423-8.083-76.483m-97.56 136.338a48.4 48.4 0 0 1-31.105-11.255l1.535-.87l51.67-29.825a8.6 8.6 0 0 0 4.247-7.367v-72.85l21.845 12.636c.218.111.37.32.409.563v60.367c-.056 26.818-21.783 48.545-48.601 48.601M37.158 197.93a48.35 48.35 0 0 1-5.781-32.589l1.534.921l51.722 29.826a8.34 8.34 0 0 0 8.441 0l63.181-36.425v25.221a.87.87 0 0 1-.358.665l-52.335 30.184c-23.257 13.398-52.97 5.431-66.404-17.803M23.549 85.38a48.5 48.5 0 0 1 25.58-21.333v61.39a8.29 8.29 0 0 0 4.195 7.316l62.874 36.272l-21.845 12.636a.82.82 0 0 1-.767 0L41.353 151.53c-23.211-13.454-31.171-43.144-17.804-66.405zm179.466 41.695l-63.08-36.63L161.73 77.86a.82.82 0 0 1 .768 0l52.233 30.184a48.6 48.6 0 0 1-7.316 87.635v-61.391a8.54 8.54 0 0 0-4.4-7.213m21.742-32.69l-1.535-.922l-51.619-30.081a8.39 8.39 0 0 0-8.492 0L99.98 99.808V74.587a.72.72 0 0 1 .307-.665l52.233-30.133a48.652 48.652 0 0 1 72.236 50.391zM88.061 139.097l-21.845-12.585a.87.87 0 0 1-.41-.614V65.685a48.652 48.652 0 0 1 79.757-37.346l-1.535.87l-51.67 29.825a8.6 8.6 0 0 0-4.246 7.367zm11.868-25.58L128.067 97.3l28.188 16.218v32.434l-28.086 16.218l-28.188-16.218z" />
+      </svg>
+    );
+  }
+  if (provider.includes('anthropic') || provider.includes('claude')) {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z" />
+      </svg>
+    );
+  }
+  if (provider.includes('google') || provider.includes('gemini')) {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M12 1.5c.6 5.3 3.2 8 8.5 8.5-5.3.6-7.9 3.2-8.5 8.5-.6-5.3-3.2-7.9-8.5-8.5C8.8 9.5 11.4 6.8 12 1.5Z" />
+      </svg>
+    );
+  }
+  if (provider.includes('mistral')) {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M17.143 3.429v3.428h-3.429v3.429h-3.428V6.857H6.857V3.43H3.43v13.714H0v3.428h10.286v-3.428H6.857v-3.429h3.429v3.429h3.429v-3.429h3.428v3.429h-3.428v3.428H24v-3.428h-3.43V3.429z" />
+      </svg>
+    );
+  }
+  if (provider.includes('xai') || provider.includes('grok')) {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M14.234 10.162 22.977 0h-2.072l-7.591 8.824L7.251 0H.258l9.168 13.343L.258 24H2.33l8.016-9.318L16.749 24h6.993zm-2.837 3.299-.929-1.329L3.076 1.56h3.182l5.965 8.532.929 1.329 7.754 11.09h-3.182z" />
+      </svg>
+    );
+  }
+  if (provider.includes('deepseek')) {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254 1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45Z" />
+      </svg>
+    );
+  }
+  if (provider.includes('meta') || provider.includes('llama')) {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M6.915 4.03c-1.968 0-3.683 1.28-4.871 3.113C.704 9.208 0 11.883 0 14.449c0 .706.07 1.369.21 1.973.056.3.145.588.265.86.101.27.225.524.371.761.696 1.159 1.818 1.927 3.593 1.927 1.497 0 2.633-.671 3.965-2.444.76-1.012 1.144-1.626 2.663-4.32l.756-1.339.186-.325.183.3 2.152 3.595c.724 1.21 1.665 2.556 2.47 3.314 1.046.987 1.992 1.22 3.06 1.22 1.075 0 1.876-.355 2.455-.843.32-.27.59-.6.81-.973.542-.939.861-2.127.861-3.745 0-2.72-.681-5.357-2.084-7.45-1.282-1.912-2.957-2.93-4.923-2.93-1.497 0-2.633.671-3.965 2.444-.76 1.012-1.144 1.626-2.663 4.32l-.756 1.339-.186.325-.183-.3L9.01 7.54C8.286 6.33 7.345 4.984 6.54 4.227 5.494 3.24 4.548 4.03 6.915 4.03Zm-.037 12.02c-.67 0-1.164-.342-1.55-1.014-.264-.46-.45-1.1-.45-1.91 0-1.09.3-2.26.84-3.205.49-.86 1.077-1.28 1.768-1.28.676 0 1.1.305 1.58.876.45.535 1.03 1.46 1.77 2.7l.3.5c-1.145 2.03-1.47 2.54-1.94 3.165-.803 1.07-1.42 1.168-2.318 1.168Zm10.49 0c-.691 0-1.278-.42-1.768-1.28-.54-.946-.84-2.116-.84-3.206 0-.81.186-1.45.45-1.91.386-.672.88-1.014 1.55-1.014.899 0 1.515.098 2.318 1.168.47.625.795 1.136 1.94 3.165l-.3.5c-.74 1.24-1.32 2.165-1.77 2.7-.48.571-.904.876-1.58.876Z" />
+      </svg>
+    );
+  }
+  return <BotIcon className={className} aria-hidden="true" />;
+}
+
+function SessionAvatar({
+  model,
+  models,
+  className,
+}: {
+  model: AgentModel | null | undefined;
+  models: ManagedAgentModelsResponse | undefined;
+  className?: string;
+}) {
+  const effectiveModel = model ?? models?.defaultModel;
+  const provider = modelProvider(effectiveModel);
+
+  return (
+    <Avatar aria-hidden="true" className={cn('size-8', modelAvatarTone(provider), className)}>
+      <AvatarFallback className={cn('size-full', modelAvatarTone(provider), className)}>
+        <ModelLogo provider={provider} />
+      </AvatarFallback>
+    </Avatar>
+  );
+}
+
+function normalizePath(value: string): string {
+  const normalized = value.replace(/[\\/]+$/, '');
+  return normalized || value;
+}
+
+function lastPathSegment(value: string): string {
+  return normalizePath(value).split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+}
+
+function projectForCwd(cwd: string, projects: readonly ManagedProjectResponse[]) {
+  const normalizedCwd = normalizePath(cwd);
+  return projects
+    .filter((project) => {
+      const normalizedProjectPath = normalizePath(project.path);
+      return (
+        normalizedCwd === normalizedProjectPath ||
+        normalizedCwd.startsWith(`${normalizedProjectPath}/`) ||
+        normalizedCwd.startsWith(`${normalizedProjectPath}\\`)
+      );
+    })
+    .sort((left, right) => right.path.length - left.path.length)[0];
+}
+
+function sessionProjectLabel(cwd: string, projects: readonly ManagedProjectResponse[]): string {
+  return projectForCwd(cwd, projects)?.name || lastPathSegment(cwd) || 'Workspace';
+}
+
+function sessionBranchLabel(cwd: string, projects: readonly ManagedProjectResponse[]): string {
+  const project = projectForCwd(cwd, projects);
+  if (!project) return lastPathSegment(cwd) || 'working tree';
+
+  const normalizedCwd = normalizePath(cwd);
+  const normalizedProjectPath = normalizePath(project.path);
+  if (normalizedCwd === normalizedProjectPath) return 'working tree';
+
+  return (
+    normalizedCwd
+      .slice(normalizedProjectPath.length)
+      .replace(/^[\\/]/, '')
+      .replace(/[\\/]+/g, '/') || 'working tree'
   );
 }
 
@@ -162,36 +363,28 @@ function readSidebarCollapsedPreference() {
   }
 }
 
-const INSTALLED_EXTENSIONS = [
-  {
-    id: 'git-tools',
-    name: 'Git tools',
-    description: 'Inspect repository status, diffs, and branch context from Pi.',
-    version: '1.8.2',
-    latestVersion: '1.8.2',
-  },
-  {
-    id: 'terminal',
-    name: 'Terminal',
-    description: 'Run commands and inspect process output in the current workspace.',
-    version: '2.4.0',
-    latestVersion: '2.5.0',
-  },
-  {
-    id: 'project-indexer',
-    name: 'Project indexer',
-    description: 'Build a searchable symbol map for larger workspaces.',
-    version: '0.9.1',
-    latestVersion: '0.9.1',
-  },
-] as const;
+function readArchivedRunIds(): string[] {
+  if (typeof window === 'undefined') return [];
+
+  try {
+    const value: unknown = JSON.parse(
+      window.localStorage.getItem(ARCHIVED_RUNS_STORAGE_KEY) ?? '[]',
+    );
+    return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : [];
+  } catch {
+    return [];
+  }
+}
 
 export type SupervisorClientApi = Pick<
   SupervisorClient,
   | 'listAgents'
   | 'listModels'
+  | 'listExtensions'
+  | 'updateExtensions'
   | 'listRuns'
   | 'listProjects'
+  | 'listRunAttachments'
   | 'listRunEvents'
   | 'streamRunEvents'
   | 'getRun'
@@ -200,8 +393,10 @@ export type SupervisorClientApi = Pick<
   | 'deleteAgent'
   | 'createRun'
   | 'createProject'
+  | 'updateProject'
   | 'deleteProject'
   | 'cancelRun'
+  | 'steerRun'
   | 'followUpRun'
 >;
 
@@ -210,19 +405,31 @@ interface AppProps {
 }
 
 export default function App({ client = supervisorClient }: AppProps) {
+  const [initialRoute] = useState(readAppRoute);
+  const initialRouteRef = useRef(initialRoute);
   const [agents, setAgents] = useState<ManagedAgentResponse[]>([]);
   const [models, setModels] = useState<ManagedAgentModelsResponse>();
   const [runs, setRuns] = useState<ManagedAgentRunResponse[]>([]);
   const [projects, setProjects] = useState<ManagedProjectResponse[]>([]);
-  const [selectedRunId, setSelectedRunId] = useState<string>();
+  const [selectedRunId, setSelectedRunId] = useState<string | undefined>(() =>
+    initialRoute.kind === 'session' ? initialRoute.runId : undefined,
+  );
+  const [archivedRunIds, setArchivedRunIds] = useState<string[]>(readArchivedRunIds);
+  const initialArchivedRunIdsRef = useRef(archivedRunIds);
   const [events, setEvents] = useState<ManagedAgentEvent[]>([]);
+  const [runAttachments, setRunAttachments] = useState<Record<string, AgentImageAttachment[]>>({});
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [darkMode, setDarkMode] = useState(() => readDarkModePreference());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readSidebarCollapsedPreference());
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>();
+  const [connectionState, setConnectionState] = useState<StreamConnectionState>('stale');
 
+  const visibleRuns = useMemo(
+    () => runs.filter((candidate) => !archivedRunIds.includes(candidate.id)),
+    [archivedRunIds, runs],
+  );
   const run = runs.find((candidate) => candidate.id === selectedRunId);
   const selectedAgent = agents.find((agent) => agent.id === run?.agentId);
   const transcript = useMemo(() => mapPiEvents(events), [events]);
@@ -251,6 +458,23 @@ export default function App({ client = supervisorClient }: AppProps) {
   }, [sidebarCollapsed]);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(ARCHIVED_RUNS_STORAGE_KEY, JSON.stringify(archivedRunIds));
+    } catch {
+      // Preferences are a convenience; an unavailable storage API should not block the app.
+    }
+  }, [archivedRunIds]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const route = readAppRoute();
+      setSelectedRunId(route.kind === 'session' ? route.runId : undefined);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  useEffect(() => {
     let active = true;
     void Promise.all([
       client.listAgents({ limit: 100 }),
@@ -264,7 +488,22 @@ export default function App({ client = supervisorClient }: AppProps) {
         setRuns(runResponse.runs);
         setProjects(projectResponse.projects);
         setModels(modelResponse);
-        setSelectedRunId(runResponse.runs[0]?.id);
+
+        const route = initialRouteRef.current;
+        const routeRunId =
+          route.kind === 'session' &&
+          runResponse.runs.some((candidate) => candidate.id === route.runId)
+            ? route.runId
+            : undefined;
+        const nextRunId =
+          routeRunId ??
+          (route.kind === 'new'
+            ? undefined
+            : runResponse.runs.find(
+                (candidate) => !initialArchivedRunIdsRef.current.includes(candidate.id),
+              )?.id);
+        setSelectedRunId(nextRunId);
+        if (nextRunId && !routeRunId) writeAppRoute({ kind: 'session', runId: nextRunId }, true);
       })
       .catch((reason: unknown) => active && setError(errorMessage(reason)))
       .finally(() => active && setLoading(false));
@@ -272,6 +511,27 @@ export default function App({ client = supervisorClient }: AppProps) {
       active = false;
     };
   }, [client]);
+
+  useEffect(() => {
+    const runId = run?.id;
+    if (!runId || runAttachments[runId]) return;
+    let active = true;
+    void client
+      .listRunAttachments(runId)
+      .then((response) => {
+        if (!active) return;
+        setRunAttachments((current) => ({
+          ...current,
+          [runId]: response.attachments,
+        }));
+      })
+      .catch((reason: unknown) => {
+        if (active) setError(errorMessage(reason));
+      });
+    return () => {
+      active = false;
+    };
+  }, [client, run?.id, runAttachments]);
 
   useEffect(() => {
     if (!run?.id) {
@@ -290,9 +550,24 @@ export default function App({ client = supervisorClient }: AppProps) {
         lastSequence = Math.max(lastSequence, ...response.events.map((event) => event.sequence), 0);
         setEvents((current) => mergeEvents(current, response.events));
 
+        const onConnectionState = (state: StreamConnectionState) => {
+          setConnectionState(state);
+          if (state === 'connected') {
+            void client
+              .getRun(run.id)
+              .then((nextRun) => {
+                if (!active) return;
+                setRuns((current) =>
+                  current.map((candidate) => (candidate.id === nextRun.id ? nextRun : candidate)),
+                );
+              })
+              .catch(() => undefined);
+          }
+        };
         for await (const event of client.streamRunEvents(run.id, {
           afterSequence: lastSequence,
           signal: controller.signal,
+          onConnectionState,
         })) {
           if (!active) return;
           lastSequence = Math.max(lastSequence, event.sequence);
@@ -373,6 +648,7 @@ export default function App({ client = supervisorClient }: AppProps) {
     model?: { provider: string; id: string };
     thinkingLevel: AgentThinkingLevel;
     cwd: string;
+    attachments?: AgentImageAttachment[];
   }) {
     setSubmitting(true);
     setError(undefined);
@@ -387,10 +663,58 @@ export default function App({ client = supervisorClient }: AppProps) {
         nextRun,
         ...current.filter((candidate) => candidate.id !== nextRun.id),
       ]);
-      setSelectedRunId(nextRun.id);
+      if (input.attachments?.length) {
+        setRunAttachments((current) => ({
+          ...current,
+          [nextRun.id]: input.attachments ?? [],
+        }));
+      }
+      openRun(nextRun.id);
       setEvents([]);
     } catch (reason) {
       setError(errorMessage(reason));
+      throw reason;
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function createManagedProject(input: {
+    name?: string;
+    path: string;
+  }): Promise<ManagedProjectResponse | undefined> {
+    setSubmitting(true);
+    setError(undefined);
+    try {
+      const project = await client.createProject(input);
+      setProjects((current) => [
+        project,
+        ...current.filter((candidate) => candidate.id !== project.id),
+      ]);
+      return project;
+    } catch (reason) {
+      setError(errorMessage(reason));
+      return undefined;
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function updateManagedProject(
+    projectId: string,
+    input: { name?: string; path?: string },
+  ): Promise<ManagedProjectResponse | undefined> {
+    setSubmitting(true);
+    setError(undefined);
+    try {
+      const project = await client.updateProject(projectId, input);
+      setProjects((current) =>
+        current.map((candidate) => (candidate.id === project.id ? project : candidate)),
+      );
+      return project;
+    } catch (reason) {
+      setError(errorMessage(reason));
+      return undefined;
     } finally {
       setSubmitting(false);
     }
@@ -426,12 +750,15 @@ export default function App({ client = supervisorClient }: AppProps) {
     }
   }
 
-  async function followUpRun(message: string) {
+  async function steerRun(message: string, attachments?: AgentImageAttachment[]) {
     if (!run) return;
     setSubmitting(true);
     setError(undefined);
     try {
-      const nextRun = await client.followUpRun(run.id, { message });
+      const nextRun = await client.steerRun(run.id, {
+        message,
+        ...(attachments?.length ? { attachments } : {}),
+      });
       setRuns((current) =>
         current.map((candidate) => (candidate.id === nextRun.id ? nextRun : candidate)),
       );
@@ -443,327 +770,453 @@ export default function App({ client = supervisorClient }: AppProps) {
     }
   }
 
+  async function followUpRun(message: string, attachments?: AgentImageAttachment[]) {
+    if (!run) return;
+    setSubmitting(true);
+    setError(undefined);
+    try {
+      const nextRun = await client.followUpRun(run.id, {
+        message,
+        ...(attachments?.length ? { attachments } : {}),
+      });
+      setRuns((current) =>
+        current.map((candidate) => (candidate.id === nextRun.id ? nextRun : candidate)),
+      );
+    } catch (reason) {
+      setError(errorMessage(reason));
+      throw reason;
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function openRun(runId: string) {
+    setSelectedRunId(runId);
+    writeAppRoute({ kind: 'session', runId });
+  }
+
   function openNewSession() {
     setSelectedRunId(undefined);
     setEvents([]);
+    writeAppRoute({ kind: 'new' });
+  }
+
+  function archiveRun(runId: string) {
+    setArchivedRunIds((current) => (current.includes(runId) ? current : [...current, runId]));
+    if (selectedRunId !== runId) return;
+
+    const nextRun = visibleRuns.find((candidate) => candidate.id !== runId);
+    if (nextRun) openRun(nextRun.id);
+    else openNewSession();
   }
 
   return (
-    <MotionConfig reducedMotion="user">
-      <LayoutGroup>
-        <motion.main
-          className={cn(
-            'grid h-svh grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-background text-foreground motion-safe:transition-[grid-template-columns] motion-safe:duration-200 motion-safe:ease-out md:grid-rows-1',
-            sidebarCollapsed
-              ? 'md:grid-cols-[4.5rem_minmax(0,1fr)]'
-              : 'md:grid-cols-[18rem_minmax(0,1fr)]',
-          )}
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
-        >
-          <motion.aside
-            className="flex flex-col border-b bg-sidebar md:min-h-svh md:border-r md:border-b-0"
-            initial={{ opacity: 0, x: -18 }}
-            animate={{ opacity: 1, x: 0 }}
-            transition={{ duration: 0.16, delay: 0.04, ease: [0.22, 1, 0.36, 1] }}
-          >
-            <motion.div
-              className={cn(
-                'flex w-full items-center justify-between gap-3 px-4 py-3 md:py-4',
-                sidebarCollapsed && 'flex-col items-center gap-2 px-2 py-3',
-              )}
-              initial={{ opacity: 0, y: -8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.18, delay: 0.11, ease: [0.22, 1, 0.36, 1] }}
-            >
-              <motion.button
-                type="button"
-                className={cn(
-                  'flex min-w-0 items-center gap-2 rounded-lg font-semibold tracking-tight outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
-                  sidebarCollapsed && 'size-8 justify-center',
-                )}
-                aria-label={sidebarCollapsed ? 'piDeck — New session' : undefined}
-                title={sidebarCollapsed ? 'piDeck — New session' : undefined}
-                onClick={openNewSession}
-                whileHover={{ x: 2 }}
-                whileTap={{ scale: 0.98 }}
-              >
-                <motion.span
-                  className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground"
-                  initial={{ opacity: 0, scale: 0.7, rotate: -15 }}
-                  animate={{ opacity: 1, scale: 1, rotate: 0 }}
-                  transition={{ type: 'spring', stiffness: 420, damping: 24, delay: 0.15 }}
-                >
-                  <PiIcon className="size-4" />
-                </motion.span>
-                {sidebarCollapsed ? null : 'piDeck'}
-              </motion.button>
-              <div className="flex items-center gap-1">
-                <motion.div layout initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }}>
-                  <Badge variant="outline" className={sidebarCollapsed ? 'sr-only' : undefined}>
-                    Local
-                  </Badge>
-                </motion.div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-expanded={!sidebarCollapsed}
-                  aria-controls="sidebar-sessions"
-                  aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-                  title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-                  onClick={() => setSidebarCollapsed((current) => !current)}
-                >
-                  {sidebarCollapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
-                </Button>
-              </div>
-            </motion.div>
-            <motion.div
-              className={cn('px-3 pb-3', sidebarCollapsed && 'px-2')}
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.17, delay: 0.15 }}
-            >
-              <Button
-                size={sidebarCollapsed ? 'icon' : 'default'}
-                className={cn(
-                  'w-full justify-start',
-                  sidebarCollapsed && 'mx-auto w-auto justify-center px-0 md:w-full',
-                )}
-                aria-label="New session"
-                title={sidebarCollapsed ? 'New session' : undefined}
-                onClick={openNewSession}
-              >
-                <PlusIcon aria-hidden="true" />
-                {sidebarCollapsed ? null : 'New session'}
-              </Button>
-            </motion.div>
-            <Separator />
-            {sidebarCollapsed ? null : (
-              <motion.div
-                className="px-4 pt-3 pb-1 text-xs font-medium text-muted-foreground"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ duration: 0.17, delay: 0.18 }}
-              >
-                Sessions
-              </motion.div>
+    <TooltipProvider delayDuration={300}>
+      <MotionConfig reducedMotion="user" transition={{ duration: 0.12, ease: [0.22, 1, 0.36, 1] }}>
+        <LayoutGroup>
+          <motion.main
+            className={cn(
+              'grid h-svh grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-background text-foreground motion-safe:transition-[grid-template-columns] motion-safe:duration-120 motion-safe:ease-out md:grid-rows-1',
+              sidebarCollapsed
+                ? 'md:grid-cols-[4.5rem_minmax(0,1fr)]'
+                : 'md:grid-cols-[18rem_minmax(0,1fr)]',
             )}
-            <nav
-              id="sidebar-sessions"
-              className={cn(
-                'flex min-w-0 flex-1 gap-1 overflow-x-auto p-2 md:flex-col md:overflow-y-auto',
-                sidebarCollapsed && 'items-center',
-              )}
-              aria-label="Sessions"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.12, ease: [0.22, 1, 0.36, 1] }}
+          >
+            <motion.aside
+              className="flex flex-col border-b bg-sidebar md:min-h-svh md:border-r md:border-b-0"
+              initial={{ opacity: 0, x: -18 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{
+                duration: 0.12,
+                delay: 0.02,
+                ease: [0.22, 1, 0.36, 1],
+              }}
             >
-              <AnimatePresence initial={false} mode="popLayout">
-                {runs.length === 0 ? (
-                  <motion.p
-                    key="empty-runs"
-                    className={cn(
-                      'hidden px-2 py-3 text-xs leading-5 text-muted-foreground md:block',
-                      sidebarCollapsed && 'md:hidden',
-                    )}
-                    initial={{ opacity: 0, y: 8 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -8 }}
-                    transition={{ duration: 0.16 }}
+              <motion.div
+                className={cn(
+                  'flex w-full items-center justify-between gap-3 px-4 py-3 md:py-4',
+                  sidebarCollapsed && 'flex-col items-center gap-2 px-2 py-3',
+                )}
+                initial={{ opacity: 0, y: -8 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{
+                  duration: 0.12,
+                  delay: 0.06,
+                  ease: [0.22, 1, 0.36, 1],
+                }}
+              >
+                <motion.button
+                  type="button"
+                  className={cn(
+                    'flex min-w-0 items-center gap-2 rounded-lg font-semibold tracking-tight outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
+                    sidebarCollapsed && 'size-8 justify-center',
+                  )}
+                  aria-label={sidebarCollapsed ? 'piDeck — New session' : undefined}
+                  title={sidebarCollapsed ? 'piDeck — New session' : undefined}
+                  onClick={openNewSession}
+                  whileHover={{ x: 2 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  <motion.span
+                    className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground"
+                    initial={{ opacity: 0, scale: 0.7, rotate: -15 }}
+                    animate={{ opacity: 1, scale: 1, rotate: 0 }}
+                    transition={{
+                      type: 'spring',
+                      stiffness: 420,
+                      damping: 24,
+                      delay: 0.15,
+                    }}
                   >
-                    Runs will appear here after you start a session.
-                  </motion.p>
-                ) : (
-                  runs.map((candidate, index) => {
-                    const agent = agents.find((item) => item.id === candidate.agentId);
-                    const selected = candidate.id === selectedRunId;
-                    return (
-                      <motion.div
-                        key={candidate.id}
-                        layout
-                        initial={{ opacity: 0, x: -12 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        exit={{ opacity: 0, x: -12 }}
-                        transition={{ duration: 0.16, delay: Math.min(index, 8) * 0.025 }}
-                        className={cn(
-                          'relative min-w-52 md:min-w-0',
-                          sidebarCollapsed && 'min-w-0',
-                        )}
-                      >
-                        {selected ? (
-                          <motion.span
-                            layoutId="active-session"
-                            className="absolute inset-0 rounded-lg bg-secondary"
-                            transition={{ type: 'spring', stiffness: 500, damping: 36 }}
-                          />
-                        ) : null}
-                        <Button
-                          variant="ghost"
-                          size={sidebarCollapsed ? 'icon' : 'default'}
+                    <PiIcon className="size-4" />
+                  </motion.span>
+                  {sidebarCollapsed ? null : 'piDeck'}
+                </motion.button>
+                <div className="flex items-center gap-1">
+                  <motion.div layout initial={{ opacity: 0, x: 8 }} animate={{ opacity: 1, x: 0 }}>
+                    <Badge variant="outline" className={sidebarCollapsed ? 'sr-only' : undefined}>
+                      Local
+                    </Badge>
+                  </motion.div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-label="New session"
+                    title="New session"
+                    onClick={openNewSession}
+                  >
+                    <PlusIcon aria-hidden="true" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-expanded={!sidebarCollapsed}
+                    aria-controls="sidebar-sessions"
+                    aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                    title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                    onClick={() => setSidebarCollapsed((current) => !current)}
+                  >
+                    {sidebarCollapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
+                  </Button>
+                </div>
+              </motion.div>
+              <Separator />
+              {sidebarCollapsed ? null : (
+                <motion.div
+                  className="px-4 pt-3 pb-1 text-xs font-medium text-muted-foreground"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.17, delay: 0.18 }}
+                >
+                  Sessions
+                </motion.div>
+              )}
+              <nav
+                id="sidebar-sessions"
+                className={cn(
+                  'flex min-w-0 flex-1 gap-1 overflow-x-auto p-2 md:flex-col md:overflow-y-auto',
+                  sidebarCollapsed && 'items-center',
+                )}
+                aria-label="Sessions"
+              >
+                <AnimatePresence initial={false} mode="popLayout">
+                  {visibleRuns.length === 0 ? (
+                    <motion.p
+                      key="empty-runs"
+                      className={cn(
+                        'hidden px-2 py-3 text-xs leading-5 text-muted-foreground md:block',
+                        sidebarCollapsed && 'md:hidden',
+                      )}
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -8 }}
+                      transition={{ duration: 0.16 }}
+                    >
+                      Runs will appear here after you start a session.
+                    </motion.p>
+                  ) : (
+                    visibleRuns.map((candidate, index) => {
+                      const agent = agents.find((item) => item.id === candidate.agentId);
+                      const selected = candidate.id === selectedRunId;
+                      const modelName = modelDisplayName(candidate.model, models);
+                      const thinkingLabel = candidate.thinkingLevel
+                        ? titleCase(candidate.thinkingLevel)
+                        : 'Default';
+                      const projectLabel = sessionProjectLabel(candidate.cwd, projects);
+                      const branchLabel = sessionBranchLabel(candidate.cwd, projects);
+                      const sessionDetails = `${modelName} · ${thinkingLabel} thinking`;
+                      const sessionTooltip = `${sessionTitle(candidate.prompt)} · ${projectLabel} · ${branchLabel} · ${sessionDetails} · ${titleCase(candidate.status)}`;
+                      return (
+                        <motion.div
+                          key={candidate.id}
+                          layout
+                          initial={{ opacity: 0, x: -12 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          exit={{ opacity: 0, x: -12 }}
+                          transition={{
+                            duration: 0.16,
+                            delay: Math.min(index, 8) * 0.025,
+                          }}
                           className={cn(
-                            'relative z-10 h-auto min-w-52 justify-start px-2 py-2 text-left md:w-full md:min-w-0',
-                            sidebarCollapsed && 'min-w-0 justify-center px-0 py-2',
+                            'group/session-card relative min-w-52 md:min-w-0',
+                            sidebarCollapsed && 'min-w-0',
                           )}
-                          aria-label={
-                            sidebarCollapsed
-                              ? `${sessionTitle(candidate.prompt)} · ${titleCase(candidate.status)}`
-                              : undefined
-                          }
-                          title={
-                            sidebarCollapsed
-                              ? `${sessionTitle(candidate.prompt)} · ${titleCase(candidate.status)}`
-                              : undefined
-                          }
-                          onClick={() => setSelectedRunId(candidate.id)}
                         >
-                          {sidebarCollapsed ? (
-                            <span className="relative flex size-4 items-center justify-center">
-                              <BotIcon className="size-4" aria-hidden="true" />
-                              <span className="absolute -top-1 -right-1">
-                                <RunDot status={candidate.status} />
-                              </span>
-                            </span>
-                          ) : (
-                            <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
-                              <span className="w-full truncate">
-                                {sessionTitle(candidate.prompt)}
-                              </span>
-                              <span className="flex w-full items-center gap-1.5 text-xs font-normal text-muted-foreground">
-                                <RunDot status={candidate.status} />
-                                <span className="min-w-0 truncate">{agent?.name ?? 'Agent'}</span>
-                                <span aria-hidden="true">·</span>
-                                <span className="min-w-0 truncate">
-                                  {modelDisplayName(candidate.model, models)}
-                                </span>
-                                <span aria-hidden="true">·</span>
-                                <span className="shrink-0">
-                                  {formatRelativeDate(candidate.createdAt)}
-                                </span>
-                              </span>
-                            </span>
-                          )}
-                        </Button>
-                      </motion.div>
-                    );
-                  })
+                          {selected ? (
+                            <motion.span
+                              layoutId="active-session"
+                              className="absolute inset-0 rounded-lg bg-secondary"
+                              transition={{
+                                type: 'spring',
+                                stiffness: 500,
+                                damping: 36,
+                              }}
+                            />
+                          ) : null}
+                          <ContextMenuPrimitive.Root>
+                            <ContextMenuPrimitive.Trigger asChild>
+                              <div className="min-w-0">
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size={sidebarCollapsed ? 'icon' : 'default'}
+                                      className={cn(
+                                        'relative z-10 h-auto min-w-52 items-center justify-start gap-3 px-2 py-2 pr-10 text-left md:w-full md:min-w-0',
+                                        sidebarCollapsed &&
+                                          'min-w-0 items-center justify-center gap-0 px-0 py-1.5',
+                                      )}
+                                      aria-current={selected ? 'page' : undefined}
+                                      aria-label={sidebarCollapsed ? sessionTooltip : undefined}
+                                      title={sessionTooltip}
+                                      onClick={() => openRun(candidate.id)}
+                                    >
+                                      {sidebarCollapsed ? (
+                                        <span className="relative flex size-7 items-center justify-center">
+                                          <SessionAvatar model={candidate.model} models={models} />
+                                          <span className="absolute -top-1 -right-1">
+                                            <RunDot status={candidate.status} />
+                                          </span>
+                                        </span>
+                                      ) : (
+                                        <SessionAvatar
+                                          model={candidate.model}
+                                          models={models}
+                                          className="size-9 rounded-full ring-1 ring-border/70"
+                                        />
+                                      )}
+                                      {!sidebarCollapsed ? (
+                                        <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
+                                          <span
+                                            className="flex w-full min-w-0 items-center gap-1 truncate text-[0.68rem] font-medium leading-4 text-muted-foreground"
+                                            title={`Project: ${projectLabel}`}
+                                          >
+                                            <FolderIcon
+                                              className="size-3 shrink-0"
+                                              aria-hidden="true"
+                                            />
+                                            <span className="truncate">{projectLabel}</span>
+                                          </span>
+                                          <span className="w-full truncate text-sm font-semibold leading-5 tracking-tight text-foreground">
+                                            {sessionTitle(candidate.prompt)}
+                                          </span>
+                                          <span className="flex w-full min-w-0 items-center gap-1.5 pt-0.5 text-[0.68rem] font-normal leading-4 text-muted-foreground">
+                                            <GitBranchIcon
+                                              className="size-3 shrink-0"
+                                              aria-hidden="true"
+                                            />
+                                            <span
+                                              className="min-w-0 truncate"
+                                              title={`Branch: ${branchLabel}`}
+                                            >
+                                              {branchLabel}
+                                            </span>
+                                            <RunDot status={candidate.status} />
+                                          </span>
+                                          <span className="sr-only">
+                                            {agent?.name ?? 'Agent'} · {sessionDetails} ·{' '}
+                                            {formatRelativeDate(candidate.createdAt)}
+                                          </span>
+                                        </span>
+                                      ) : null}
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent side="right" align="start">
+                                    <p className="font-medium">{modelName}</p>
+                                    <p className="text-primary-foreground/70">
+                                      {thinkingLabel} thinking
+                                    </p>
+                                  </TooltipContent>
+                                </Tooltip>
+                              </div>
+                            </ContextMenuPrimitive.Trigger>
+                            <ContextMenuPrimitive.Portal>
+                              <ContextMenuPrimitive.Content className="z-50 min-w-44 overflow-hidden rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg outline-none data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95">
+                                <ContextMenuPrimitive.Label className="max-w-60 truncate px-2 py-1.5 text-xs font-medium text-muted-foreground">
+                                  {sessionTitle(candidate.prompt)}
+                                </ContextMenuPrimitive.Label>
+                                <ContextMenuPrimitive.Separator className="-mx-1 my-1 h-px bg-border" />
+                                <ContextMenuPrimitive.Item
+                                  className="relative flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50"
+                                  onSelect={() => archiveRun(candidate.id)}
+                                >
+                                  <ArchiveIcon className="size-4" aria-hidden="true" />
+                                  Archive
+                                </ContextMenuPrimitive.Item>
+                              </ContextMenuPrimitive.Content>
+                            </ContextMenuPrimitive.Portal>
+                          </ContextMenuPrimitive.Root>
+                          {!sidebarCollapsed ? (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-sm"
+                              className="absolute top-1/2 right-2 z-20 -translate-y-1/2 bg-background text-foreground opacity-0 shadow-md ring-1 ring-border/80 transition-opacity hover:bg-background/80 group-hover/session-card:opacity-100 group-focus-within/session-card:opacity-100"
+                              aria-label="Archive session"
+                              title="Archive session"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                archiveRun(candidate.id);
+                              }}
+                            >
+                              <ArchiveIcon aria-hidden="true" />
+                            </Button>
+                          ) : null}
+                        </motion.div>
+                      );
+                    })
+                  )}
+                </AnimatePresence>
+              </nav>
+              <Separator />
+              <motion.div
+                className="p-2"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.17, delay: 0.14 }}
+              >
+                <div className={cn('flex gap-1', sidebarCollapsed && 'flex-col')}>
+                  <Button
+                    variant="ghost"
+                    size={sidebarCollapsed ? 'icon' : 'default'}
+                    className={cn(
+                      'relative min-w-0 flex-1 justify-start',
+                      sidebarCollapsed && 'w-full justify-center px-0',
+                    )}
+                    aria-label="Settings"
+                    title={sidebarCollapsed ? 'Settings' : undefined}
+                    onClick={() => setSettingsOpen(true)}
+                  >
+                    <SettingsIcon aria-hidden="true" />
+                    {sidebarCollapsed ? null : 'Settings'}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    aria-pressed={darkMode}
+                    aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+                    title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+                    onClick={() => setDarkMode((current) => !current)}
+                  >
+                    {darkMode ? <SunIcon /> : <MoonIcon />}
+                  </Button>
+                </div>
+              </motion.div>
+            </motion.aside>
+
+            <section className="flex h-full min-h-0 min-w-0 flex-col">
+              <AnimatePresence initial={false}>
+                {error ? (
+                  <motion.div
+                    key={error}
+                    initial={{ opacity: 0, y: -10, scale: 0.98 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: -8, scale: 0.98 }}
+                    transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+                  >
+                    <Alert variant="destructive" className="m-4 mb-0 w-auto">
+                      <AlertTitle>Supervisor request failed</AlertTitle>
+                      <AlertDescription>{error}</AlertDescription>
+                    </Alert>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
+
+              <AnimatePresence initial={false} mode="wait">
+                {loading ? (
+                  <LoadingState key="loading" />
+                ) : run ? (
+                  <motion.div
+                    key={`conversation-${run.id}`}
+                    className="flex min-h-0 min-w-0 flex-1"
+                    initial={{ opacity: 0, y: 14 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
+                  >
+                    <Conversation
+                      agent={selectedAgent}
+                      run={run}
+                      models={models}
+                      transcript={transcript}
+                      promptAttachments={runAttachments[run.id] ?? []}
+                      submitting={submitting}
+                      runIsActive={runIsActive}
+                      connectionState={connectionState}
+                      onCancel={cancelRun}
+                      onSteer={steerRun}
+                      onSendMessage={followUpRun}
+                    />
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="new-session"
+                    className="flex min-h-0 min-w-0 flex-1"
+                    initial={{ opacity: 0, y: 14 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
+                  >
+                    <NewSession
+                      agents={agents}
+                      models={models}
+                      projects={projects}
+                      submitting={submitting}
+                      onStart={startRun}
+                      onDeleteProject={deleteProject}
+                      onOpenAgents={() => setSettingsOpen(true)}
+                    />
+                  </motion.div>
                 )}
               </AnimatePresence>
-            </nav>
-            <Separator />
-            <motion.div
-              className="p-2"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.17, delay: 0.14 }}
-            >
-              <div className={cn('flex gap-1', sidebarCollapsed && 'flex-col')}>
-                <Button
-                  variant="ghost"
-                  size={sidebarCollapsed ? 'icon' : 'default'}
-                  className={cn(
-                    'relative min-w-0 flex-1 justify-start',
-                    sidebarCollapsed && 'w-full justify-center px-0',
-                  )}
-                  aria-label="Settings"
-                  title={sidebarCollapsed ? 'Settings' : undefined}
-                  onClick={() => setSettingsOpen(true)}
-                >
-                  <SettingsIcon aria-hidden="true" />
-                  {sidebarCollapsed ? null : 'Settings'}
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  aria-pressed={darkMode}
-                  aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-                  title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-                  onClick={() => setDarkMode((current) => !current)}
-                >
-                  {darkMode ? <SunIcon /> : <MoonIcon />}
-                </Button>
-              </div>
-            </motion.div>
-          </motion.aside>
+            </section>
 
-          <section className="flex h-full min-h-0 min-w-0 flex-col">
-            <AnimatePresence initial={false}>
-              {error ? (
-                <motion.div
-                  key={error}
-                  initial={{ opacity: 0, y: -10, scale: 0.98 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: -8, scale: 0.98 }}
-                  transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
-                >
-                  <Alert variant="destructive" className="m-4 mb-0 w-auto">
-                    <AlertTitle>Supervisor request failed</AlertTitle>
-                    <AlertDescription>{error}</AlertDescription>
-                  </Alert>
-                </motion.div>
-              ) : null}
-            </AnimatePresence>
-
-            <AnimatePresence initial={false} mode="wait">
-              {loading ? (
-                <LoadingState key="loading" />
-              ) : run ? (
-                <motion.div
-                  key={`conversation-${run.id}`}
-                  className="flex min-h-0 min-w-0 flex-1"
-                  initial={{ opacity: 0, y: 14 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                >
-                  <Conversation
-                    agent={selectedAgent}
-                    run={run}
-                    models={models}
-                    transcript={transcript}
-                    submitting={submitting}
-                    runIsActive={runIsActive}
-                    onCancel={cancelRun}
-                    onSendMessage={followUpRun}
-                  />
-                </motion.div>
-              ) : (
-                <motion.div
-                  key="new-session"
-                  className="flex min-h-0 min-w-0 flex-1"
-                  initial={{ opacity: 0, y: 14 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                >
-                  <NewSession
-                    agents={agents}
-                    models={models}
-                    projects={projects}
-                    submitting={submitting}
-                    onStart={startRun}
-                    onDeleteProject={deleteProject}
-                    onOpenAgents={() => setSettingsOpen(true)}
-                  />
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </section>
-
-          <AgentSettingsDialog
-            open={settingsOpen}
-            onOpenChange={setSettingsOpen}
-            agents={agents}
-            submitting={submitting}
-            darkMode={darkMode}
-            onDarkModeChange={setDarkMode}
-            onCreate={createAgent}
-            onUpdate={updateAgent}
-            onDelete={deleteAgent}
-          />
-        </motion.main>
-      </LayoutGroup>
-    </MotionConfig>
+            <AgentSettingsDialog
+              client={client}
+              open={settingsOpen}
+              onOpenChange={setSettingsOpen}
+              agents={agents}
+              projects={projects}
+              submitting={submitting}
+              darkMode={darkMode}
+              onDarkModeChange={setDarkMode}
+              onCreate={createAgent}
+              onUpdate={updateAgent}
+              onDelete={deleteAgent}
+              onCreateProject={createManagedProject}
+              onUpdateProject={updateManagedProject}
+              onDeleteProject={deleteProject}
+            />
+          </motion.main>
+        </LayoutGroup>
+      </MotionConfig>
+    </TooltipProvider>
   );
 }
 
@@ -818,6 +1271,7 @@ function NewSession({
     model?: { provider: string; id: string };
     thinkingLevel: AgentThinkingLevel;
     cwd: string;
+    attachments?: AgentImageAttachment[];
   }): Promise<void>;
   onDeleteProject(project: ManagedProjectResponse): Promise<boolean>;
   onOpenAgents(): void;
@@ -829,6 +1283,105 @@ function NewSession({
   );
   const [thinkingLevel, setThinkingLevel] = useState<AgentThinkingLevel>('medium');
   const [cwd, setCwd] = useState(agents[0]?.cwd ?? '.');
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string>();
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepthRef = useRef(0);
+  const attachmentSequenceRef = useRef(0);
+  const attachmentsRef = useRef(attachments);
+
+  useEffect(() => {
+    attachmentsRef.current = attachments;
+  }, [attachments]);
+
+  useEffect(() => {
+    return () => {
+      attachmentsRef.current.forEach(revokeAttachmentPreview);
+    };
+  }, []);
+
+  function addFiles(fileList: FileList | File[]) {
+    const nextAttachments = Array.from(fileList).map((file) => ({
+      id: `attachment-${attachmentSequenceRef.current++}`,
+      file,
+      previewUrl: createAttachmentPreview(file),
+    }));
+    if (nextAttachments.length > 0) setAttachments((current) => [...current, ...nextAttachments]);
+  }
+
+  function handleFileInput(event: ChangeEvent<HTMLInputElement>) {
+    if (event.currentTarget.files) addFiles(event.currentTarget.files);
+    event.currentTarget.value = '';
+  }
+
+  function removeAttachment(id: string) {
+    const attachment = attachments.find((item) => item.id === id);
+    if (attachment) revokeAttachmentPreview(attachment);
+    setAttachments((current) => current.filter((item) => item.id !== id));
+  }
+
+  function clearAttachments() {
+    attachmentsRef.current.forEach(revokeAttachmentPreview);
+    setAttachments([]);
+  }
+
+  function handleDragEnter(event: DragEvent<HTMLFormElement>) {
+    if (!hasFileDragPayload(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLFormElement>) {
+    if (!hasFileDragPayload(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    setDragActive(true);
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLFormElement>) {
+    if (!hasFileDragPayload(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  }
+
+  function handleDrop(event: DragEvent<HTMLFormElement>) {
+    if (!hasFileDragPayload(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    addFiles(event.dataTransfer.files);
+  }
+
+  async function prepareImageAttachments(): Promise<AgentImageAttachment[] | undefined> {
+    if (attachments.length === 0) return undefined;
+    const unsupported = attachments.filter(
+      (attachment) =>
+        !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(attachment.file.type),
+    );
+    if (unsupported.length > 0) {
+      setAttachmentError(
+        'Only PNG, JPEG, GIF, and WebP images can be sent to Pi. Remove other files first.',
+      );
+      return undefined;
+    }
+    if (
+      attachments.length > 4 ||
+      attachments.some((attachment) => attachment.file.size > 6_000_000)
+    ) {
+      setAttachmentError('Use at most four images, each smaller than 6 MB.');
+      return undefined;
+    }
+    return Promise.all(
+      attachments.map(async (attachment) => ({
+        name: attachment.file.name,
+        mimeType: attachment.file.type as AgentImageAttachment['mimeType'],
+        data: await fileToBase64(attachment.file),
+      })),
+    );
+  }
 
   useEffect(() => {
     if (!agentId && agents[0]) {
@@ -844,15 +1397,25 @@ function NewSession({
   async function submit(event: FormEvent) {
     event.preventDefault();
     const value = prompt.trim();
-    if (!value || !agentId || !cwd.trim()) return;
-    const model = decodeModel(modelKey);
-    await onStart({
-      agentId,
-      prompt: value,
-      ...(model ? { model } : {}),
-      thinkingLevel,
-      cwd: cwd.trim(),
-    });
+    if ((!value && attachments.length === 0) || !agentId || !cwd.trim() || submitting) return;
+    try {
+      const imageAttachments = await prepareImageAttachments();
+      if (attachments.length > 0 && !imageAttachments) return;
+      const model = decodeModel(modelKey);
+      await onStart({
+        agentId,
+        prompt: value || 'Please inspect the attached image.',
+        ...(model ? { model } : {}),
+        thinkingLevel,
+        cwd: cwd.trim(),
+        ...(imageAttachments ? { attachments: imageAttachments } : {}),
+      });
+      setPrompt('');
+      setAttachmentError(undefined);
+      clearAttachments();
+    } catch {
+      // Keep the draft and attachments visible while the app-level error explains what failed.
+    }
   }
 
   if (agents.length === 0) {
@@ -868,7 +1431,12 @@ function NewSession({
             <motion.div
               initial={{ opacity: 0, scale: 0.75, rotate: -8 }}
               animate={{ opacity: 1, scale: 1, rotate: 0 }}
-              transition={{ type: 'spring', stiffness: 420, damping: 24, delay: 0.07 }}
+              transition={{
+                type: 'spring',
+                stiffness: 420,
+                damping: 24,
+                delay: 0.07,
+              }}
             >
               <EmptyMedia variant="icon">
                 <BotIcon />
@@ -911,24 +1479,46 @@ function NewSession({
       >
         <div>
           <h1 className="font-semibold">New session</h1>
-          <p className="text-sm text-muted-foreground">Configure a Pi run and describe the task.</p>
         </div>
       </motion.header>
-      <div className="flex flex-1 items-center justify-center overflow-y-auto px-4 py-10 md:px-8">
+      <div className="flex flex-1 items-center justify-center overflow-y-auto px-4 py-8 md:px-8">
         <motion.form
-          className="relative w-full max-w-4xl rounded-3xl border bg-card shadow-[0_18px_50px_-28px_oklch(0.145_0_0/0.35)]"
+          aria-label="New session composer"
+          className="relative w-full max-w-3xl overflow-hidden rounded-xl border bg-card transition-colors focus-within:border-foreground/20"
           initial={{ opacity: 0, y: 18, scale: 0.985 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
-          transition={{ duration: 0.28, delay: 0.06, ease: [0.22, 1, 0.36, 1] }}
+          transition={{ duration: 0.18, delay: 0.03, ease: [0.22, 1, 0.36, 1] }}
           onSubmit={submit}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
         >
+          <AnimatePresence>
+            {dragActive ? (
+              <motion.div
+                className="pointer-events-none absolute inset-3 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary bg-background/90 px-6 text-center shadow-lg"
+                role="status"
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.98 }}
+              >
+                <div>
+                  <p className="font-medium">Drop files to attach</p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Images and other file types are supported
+                  </p>
+                </div>
+              </motion.div>
+            ) : null}
+          </AnimatePresence>
           <Textarea
             aria-label="Session task"
             placeholder="Ask Pi to inspect, build, fix, or explain…"
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
             disabled={submitting}
-            className="min-h-44 resize-none rounded-none border-0 bg-transparent px-6 py-5 text-base shadow-none focus-visible:ring-0 md:min-h-52 md:px-8 md:py-7 md:text-lg"
+            className="min-h-32 resize-none rounded-none border-0 bg-transparent px-5 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-36"
             onKeyDown={(event) => {
               if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
                 event.preventDefault();
@@ -937,12 +1527,88 @@ function NewSession({
             }}
           />
           <motion.div
-            className="flex flex-col rounded-b-3xl border-t bg-muted/25"
+            className="flex flex-col border-t bg-muted/20"
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.18, delay: 0.14 }}
           >
-            <div className="flex flex-wrap items-center gap-2 px-4 py-3 md:px-6">
+            {attachmentError ? (
+              <p role="alert" className="px-3 pt-2.5 text-xs text-destructive">
+                {attachmentError}
+              </p>
+            ) : null}
+            {attachments.length > 0 ? (
+              <AttachmentGroup aria-label="Attached files" className="px-3 pt-2.5">
+                {attachments.map((attachment) => {
+                  const isImage = attachment.file.type.startsWith('image/');
+                  if (isImage && attachment.previewUrl) {
+                    return (
+                      <ImageAttachmentCard
+                        key={attachment.id}
+                        name={attachment.file.name}
+                        src={attachment.previewUrl}
+                        description={`${attachmentTypeLabel(attachment.file)} · ${formatFileSize(attachment.file.size)} · Ready to send`}
+                        state="idle"
+                        onRemove={() => removeAttachment(attachment.id)}
+                      />
+                    );
+                  }
+
+                  return (
+                    <Attachment
+                      key={attachment.id}
+                      state="idle"
+                      size="sm"
+                      orientation={isImage ? 'vertical' : 'horizontal'}
+                    >
+                      <AttachmentMedia variant={isImage ? 'image' : 'icon'}>
+                        {isImage ? (
+                          <ImageIcon aria-hidden="true" />
+                        ) : (
+                          attachmentIcon(attachment.file)
+                        )}
+                      </AttachmentMedia>
+                      <AttachmentContent>
+                        <AttachmentTitle>{attachment.file.name}</AttachmentTitle>
+                        <AttachmentDescription>
+                          {attachmentTypeLabel(attachment.file)} {'·'}
+                          {formatFileSize(attachment.file.size)} {'·'} Ready to send
+                        </AttachmentDescription>
+                      </AttachmentContent>
+                      <AttachmentActions>
+                        <AttachmentAction
+                          type="button"
+                          aria-label={`Remove ${attachment.file.name}`}
+                          onClick={() => removeAttachment(attachment.id)}
+                        >
+                          <XIcon />
+                        </AttachmentAction>
+                      </AttachmentActions>
+                    </Attachment>
+                  );
+                })}
+              </AttachmentGroup>
+            ) : null}
+            <div className="flex flex-wrap items-center gap-1 px-3 py-2">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="sr-only"
+                aria-label="Files to attach"
+                onChange={handleFileInput}
+                tabIndex={-1}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Attach files"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={submitting}
+              >
+                <PaperclipIcon />
+              </Button>
               <motion.div
                 whileHover={{ y: -1 }}
                 whileTap={{ scale: 0.99 }}
@@ -951,7 +1617,8 @@ function NewSession({
                 <Select value={agentId} onValueChange={setAgentId}>
                   <SelectTrigger
                     aria-label="Agent profile"
-                    className="max-w-52 border-0 bg-transparent shadow-none"
+                    size="sm"
+                    className="max-w-40 border-0 bg-transparent shadow-none"
                   >
                     <BotIcon />
                     <SelectValue placeholder="Choose agent" />
@@ -976,7 +1643,8 @@ function NewSession({
                 <Select value={modelKey} onValueChange={setModelKey}>
                   <SelectTrigger
                     aria-label="Model"
-                    className="max-w-64 border-0 bg-transparent shadow-none"
+                    size="sm"
+                    className="max-w-52 border-0 bg-transparent shadow-none"
                   >
                     <SparklesIcon />
                     <SelectValue placeholder="Default model" />
@@ -1004,6 +1672,7 @@ function NewSession({
                 >
                   <SelectTrigger
                     aria-label="Thinking level"
+                    size="sm"
                     className="border-0 bg-transparent shadow-none"
                   >
                     <BrainIcon />
@@ -1031,8 +1700,14 @@ function NewSession({
               <Button
                 type="submit"
                 size="icon-lg"
-                className="ml-auto rounded-full"
-                disabled={submitting || !prompt.trim() || !agentId || !cwd.trim()}
+                className="ml-auto rounded-lg"
+                title="Start session (⌘Enter)"
+                disabled={
+                  submitting ||
+                  (!prompt.trim() && attachments.length === 0) ||
+                  !agentId ||
+                  !cwd.trim()
+                }
               >
                 <ArrowUpIcon />
                 <span className="sr-only">Start session</span>
@@ -1042,6 +1717,110 @@ function NewSession({
         </motion.form>
       </div>
     </motion.div>
+  );
+}
+
+function ProjectPathAutocomplete({
+  id,
+  projects,
+  path,
+  onPathChange,
+  disabled,
+  placeholder = '/path/to/project',
+  required = false,
+  autoFocus = false,
+}: {
+  id: string;
+  projects: ManagedProjectResponse[];
+  path: string;
+  onPathChange(path: string): void;
+  disabled?: boolean;
+  placeholder?: string;
+  required?: boolean;
+  autoFocus?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const suggestions = useMemo(() => {
+    const query = path.trim().toLowerCase();
+    return projects
+      .filter(
+        (project) =>
+          !query ||
+          project.name.toLowerCase().includes(query) ||
+          project.path.toLowerCase().includes(query),
+      )
+      .slice(0, 8);
+  }, [path, projects]);
+
+  function selectPath(nextPath: string) {
+    onPathChange(nextPath);
+    setOpen(false);
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverAnchor asChild>
+        <Input
+          id={id}
+          value={path}
+          disabled={disabled}
+          required={required}
+          placeholder={placeholder}
+          autoFocus={autoFocus}
+          autoComplete="off"
+          aria-autocomplete="list"
+          aria-expanded={open}
+          role="combobox"
+          className="font-mono text-sm"
+          onFocus={() => setOpen(true)}
+          onChange={(event) => {
+            onPathChange(event.target.value);
+            setOpen(true);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && open && suggestions.length === 1) {
+              event.preventDefault();
+              selectPath(suggestions[0].path);
+            }
+          }}
+        />
+      </PopoverAnchor>
+      <PopoverContent
+        side="top"
+        align="start"
+        className="w-(--radix-popover-trigger-width) min-w-72 p-1"
+        onOpenAutoFocus={(event) => event.preventDefault()}
+      >
+        <Command shouldFilter={false} aria-label="Project path suggestions">
+          <CommandList>
+            {suggestions.length > 0 ? (
+              <CommandGroup heading="Saved project paths">
+                {suggestions.map((project) => (
+                  <CommandItem
+                    key={project.id}
+                    value={project.path}
+                    onSelect={() => selectPath(project.path)}
+                  >
+                    <FolderIcon aria-hidden="true" />
+                    <span className="min-w-0">
+                      <span className="block truncate font-medium">{project.name}</span>
+                      <span className="block truncate font-mono text-xs text-muted-foreground">
+                        {project.path}
+                      </span>
+                    </span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            ) : (
+              <CommandEmpty>No saved paths match.</CommandEmpty>
+            )}
+          </CommandList>
+          <p className="border-t px-2 py-2 text-[0.7rem] text-muted-foreground">
+            Type any existing directory, or choose a saved path.
+          </p>
+        </Command>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -1063,7 +1842,6 @@ function ProjectPicker({
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [draftPath, setDraftPath] = useState('');
   const [projectToDelete, setProjectToDelete] = useState<ManagedProjectResponse>();
-  const pickerRef = useRef<HTMLDivElement>(null);
   const selectedProject = projects.find((project) => project.path === path);
   const selectedName = selectedProject?.name ?? projectNameFromPath(path);
   const filteredProjects = useMemo(() => {
@@ -1074,31 +1852,6 @@ function ProjectPicker({
         project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query),
     );
   }, [projects, search]);
-
-  useEffect(() => {
-    if (!open) return;
-
-    function handlePointerDown(event: PointerEvent) {
-      if (!pickerRef.current?.contains(event.target as Node)) setOpen(false);
-    }
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === 'Escape') setOpen(false);
-    }
-
-    document.addEventListener('pointerdown', handlePointerDown);
-    document.addEventListener('keydown', handleKeyDown);
-    return () => {
-      document.removeEventListener('pointerdown', handlePointerDown);
-      document.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const selector = newProjectOpen ? '[data-project-path]' : '[data-project-search]';
-    const input = pickerRef.current?.querySelector<HTMLInputElement>(selector);
-    input?.focus();
-  }, [open, newProjectOpen]);
 
   function selectProject(projectPath: string) {
     onPathChange(projectPath);
@@ -1129,186 +1882,194 @@ function ProjectPicker({
   }
 
   return (
-    <div ref={pickerRef} className="relative min-w-0">
-      <Button
-        type="button"
-        variant="ghost"
-        disabled={disabled}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-label="Choose project"
-        className="h-auto max-w-full justify-start gap-2 rounded-full bg-background/55 px-3 py-1.5 text-left hover:bg-background/85 dark:bg-background/30 dark:hover:bg-background/45"
-        onClick={() => setOpen((current) => !current)}
-      >
-        <FolderIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-        <span className="min-w-0 truncate">
-          <span className="font-medium">{selectedName}</span>
-          <span className="ml-2 hidden font-mono text-[0.68rem] font-normal text-muted-foreground md:inline">
-            {path}
-          </span>
-        </span>
-        <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-      </Button>
-
-      <AnimatePresence>
-        {open ? (
-          <motion.div
-            role="dialog"
+    <div className="relative min-w-0 basis-full sm:min-w-36 sm:flex-1 sm:basis-auto">
+      <Popover open={open} onOpenChange={setOpen} modal={false}>
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={disabled}
+            aria-haspopup="listbox"
+            aria-expanded={open}
             aria-label="Choose project"
-            className="absolute bottom-[calc(100%+8rem)] left-0 z-50 w-[min(34rem,calc(100vw-4rem))] md:bottom-[calc(100%+3.5rem)] overflow-hidden rounded-2xl border bg-popover p-2 text-popover-foreground shadow-[0_20px_60px_-24px_oklch(0.145_0_0/0.65)] ring-1 ring-foreground/8"
-            initial={{ opacity: 0, y: 8, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.98 }}
-            transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+            className="h-7 max-w-full justify-start gap-2 rounded-md bg-transparent px-2 text-left hover:bg-background/70 dark:bg-transparent dark:hover:bg-background/40"
           >
-            {newProjectOpen ? (
-              <div>
-                <div className="flex items-center gap-2 px-2 pb-2 pt-1">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="Back to saved projects"
-                    onClick={() => setNewProjectOpen(false)}
-                  >
-                    <ChevronRightIcon className="rotate-180" />
-                  </Button>
-                  <div>
-                    <p className="text-sm font-semibold">New project</p>
-                    <p className="text-xs text-muted-foreground">
-                      Add a workspace to your project list.
-                    </p>
-                  </div>
-                </div>
-                <div className="space-y-2 border-t px-2 pb-2 pt-3">
-                  <label
-                    htmlFor="new-project-path"
-                    className="text-xs font-medium text-muted-foreground"
-                  >
-                    Working directory
-                  </label>
-                  <input
-                    id="new-project-path"
-                    data-project-path
-                    value={draftPath}
-                    onChange={(event) => setDraftPath(event.target.value)}
-                    placeholder="/path/to/project"
-                    className="h-9 w-full rounded-lg border border-input bg-background px-3 font-mono text-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                  />
-                  <p className="text-[0.7rem] leading-4 text-muted-foreground">
-                    It will be saved when you start the session.
+            <FolderIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+            <span className="min-w-0 truncate">
+              <span className="font-medium">{selectedName}</span>
+              <span className="ml-2 hidden font-mono text-[0.68rem] font-normal text-muted-foreground md:inline">
+                {path}
+              </span>
+            </span>
+            <ChevronDownIcon
+              className="size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden="true"
+            />
+          </Button>
+        </PopoverTrigger>
+
+        {/* Keep the menu below the full composer instead of letting it cover the textarea. */}
+        <PopoverContent
+          role="dialog"
+          aria-label="Choose project"
+          side="bottom"
+          align="start"
+          sideOffset={8}
+          collisionPadding={{ top: 12, right: 12, bottom: -44, left: 12 }}
+          onInteractOutside={(event) => {
+            const target = event.target;
+            if (
+              target instanceof Element &&
+              target.closest('[data-slot="dialog-content"], [data-slot="dialog-overlay"]')
+            ) {
+              event.preventDefault();
+            }
+          }}
+          className="mt-11 w-[min(34rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border bg-popover p-2 text-popover-foreground shadow-[0_20px_60px_-24px_oklch(0.145_0_0/0.65)] ring-1 ring-foreground/8"
+        >
+          {newProjectOpen ? (
+            <div>
+              <div className="flex items-center gap-2 px-2 pb-2 pt-1">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Back to saved projects"
+                  onClick={() => setNewProjectOpen(false)}
+                >
+                  <ChevronRightIcon className="rotate-180" />
+                </Button>
+                <div>
+                  <p className="text-sm font-semibold">New project</p>
+                  <p className="text-xs text-muted-foreground">
+                    Add a workspace to your project list.
                   </p>
                 </div>
-                <div className="flex justify-end gap-2 border-t px-2 pb-1 pt-2">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setNewProjectOpen(false)}
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    disabled={!draftPath.trim()}
-                    onClick={useNewProject}
-                  >
-                    Use project
-                  </Button>
-                </div>
               </div>
-            ) : (
-              <>
-                <div className="flex items-center gap-2 rounded-xl bg-muted/65 px-3 py-2">
-                  <SearchIcon
-                    className="size-4 shrink-0 text-muted-foreground"
-                    aria-hidden="true"
-                  />
-                  <input
-                    data-project-search
-                    value={search}
-                    onChange={(event) => setSearch(event.target.value)}
-                    placeholder="Search projects"
-                    aria-label="Search projects"
-                    className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-                  />
-                  <kbd className="hidden rounded border bg-background px-1.5 py-0.5 font-mono text-[0.65rem] text-muted-foreground sm:inline">
-                    /
-                  </kbd>
-                </div>
-                <div
-                  className="max-h-64 overflow-y-auto py-1"
-                  role="listbox"
-                  aria-label="Saved projects"
+              <div className="space-y-2 border-t px-2 pb-2 pt-3">
+                <label
+                  htmlFor="new-project-path"
+                  className="text-xs font-medium text-muted-foreground"
                 >
-                  {filteredProjects.length > 0 ? (
-                    filteredProjects.map((project) => (
-                      <div
-                        key={project.id}
-                        role="option"
-                        tabIndex={-1}
-                        aria-selected={project.path === path}
-                        className="group flex w-full items-center gap-1 rounded-xl p-1 transition-colors aria-selected:bg-accent"
+                  Working directory
+                </label>
+                <ProjectPathAutocomplete
+                  id="new-project-path"
+                  projects={projects}
+                  path={draftPath}
+                  onPathChange={setDraftPath}
+                  placeholder="/path/to/project"
+                  autoFocus
+                />
+                <p className="text-[0.7rem] leading-4 text-muted-foreground">
+                  It will be saved when you start the session.
+                </p>
+              </div>
+              <div className="flex justify-end gap-2 border-t px-2 pb-1 pt-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setNewProjectOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={!draftPath.trim()}
+                  onClick={useNewProject}
+                >
+                  Use project
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center gap-2 rounded-xl bg-muted/65 px-3 py-2">
+                <SearchIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                <input
+                  data-project-search
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Search projects"
+                  aria-label="Search projects"
+                  autoFocus={!newProjectOpen}
+                  className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                />
+                <kbd className="hidden rounded border bg-background px-1.5 py-0.5 font-mono text-[0.65rem] text-muted-foreground sm:inline">
+                  /
+                </kbd>
+              </div>
+              <div
+                className="max-h-64 overflow-y-auto py-1"
+                role="listbox"
+                aria-label="Saved projects"
+              >
+                {filteredProjects.length > 0 ? (
+                  filteredProjects.map((project) => (
+                    <div
+                      key={project.id}
+                      role="option"
+                      tabIndex={-1}
+                      aria-selected={project.path === path}
+                      className="group flex w-full items-center gap-1 rounded-xl p-1 transition-colors aria-selected:bg-accent"
+                    >
+                      <button
+                        type="button"
+                        className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-2 py-1.5 text-left hover:bg-accent hover:text-accent-foreground"
+                        onClick={() => selectProject(project.path)}
                       >
-                        <button
-                          type="button"
-                          className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-2 py-1.5 text-left hover:bg-accent hover:text-accent-foreground"
-                          onClick={() => selectProject(project.path)}
-                        >
-                          <FolderIcon
-                            className="size-5 shrink-0 text-muted-foreground group-hover:text-current"
-                            aria-hidden="true"
-                          />
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-sm font-medium">
-                              {project.name}
-                            </span>
-                            <span className="block truncate font-mono text-[0.68rem] text-muted-foreground group-hover:text-current/70">
-                              {project.path}
-                            </span>
+                        <FolderIcon
+                          className="size-5 shrink-0 text-muted-foreground group-hover:text-current"
+                          aria-hidden="true"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-medium">{project.name}</span>
+                          <span className="block truncate font-mono text-[0.68rem] text-muted-foreground group-hover:text-current/70">
+                            {project.path}
                           </span>
-                          {project.path === path ? (
-                            <CheckCircle2Icon
-                              className="size-4 shrink-0 text-primary"
-                              aria-label="Selected"
-                            />
-                          ) : null}
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`Delete project ${project.name}`}
-                          title="Delete project"
-                          className="shrink-0 rounded-lg p-2 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                          onClick={() => setProjectToDelete(project)}
-                        >
-                          <Trash2Icon className="size-4" aria-hidden="true" />
-                        </button>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="px-3 py-5 text-center text-xs text-muted-foreground">
-                      {projects.length === 0 ? 'No saved projects yet.' : 'No matching projects.'}
-                    </p>
-                  )}
-                </div>
-                <div className="border-t pt-1">
-                  <button
-                    type="button"
-                    className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
-                    onClick={openNewProject}
-                  >
-                    <span className="flex size-5 items-center justify-center rounded-md border border-dashed border-muted-foreground/70">
-                      <PlusIcon className="size-3.5" aria-hidden="true" />
-                    </span>
-                    New project
-                  </button>
-                </div>
-              </>
-            )}
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+                        </span>
+                        {project.path === path ? (
+                          <CheckCircle2Icon
+                            className="size-4 shrink-0 text-primary"
+                            aria-label="Selected"
+                          />
+                        ) : null}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Delete project ${project.name}`}
+                        title="Delete project"
+                        className="shrink-0 rounded-lg p-2 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        onClick={() => setProjectToDelete(project)}
+                      >
+                        <Trash2Icon className="size-4" aria-hidden="true" />
+                      </button>
+                    </div>
+                  ))
+                ) : (
+                  <p className="px-3 py-5 text-center text-xs text-muted-foreground">
+                    {projects.length === 0 ? 'No saved projects yet.' : 'No matching projects.'}
+                  </p>
+                )}
+              </div>
+              <div className="border-t pt-1">
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
+                  onClick={openNewProject}
+                >
+                  <span className="flex size-5 items-center justify-center rounded-md border border-dashed border-muted-foreground/70">
+                    <PlusIcon className="size-3.5" aria-hidden="true" />
+                  </span>
+                  New project
+                </button>
+              </div>
+            </>
+          )}
+        </PopoverContent>
+      </Popover>
       <Dialog
         open={projectToDelete !== undefined}
         onOpenChange={(nextOpen) => {
@@ -1376,6 +2137,16 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+async function fileToBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
 function attachmentTypeLabel(file: File): string {
   const extension = file.name.split('.').pop();
   if (extension && extension !== file.name) return extension.toUpperCase();
@@ -1397,27 +2168,114 @@ function hasFileDragPayload(dataTransfer: DataTransfer): boolean {
   return Array.from(dataTransfer.types).includes('Files');
 }
 
+function ImageAttachmentCard({
+  name,
+  src,
+  description,
+  className,
+  state = 'done',
+  onRemove,
+}: {
+  name: string;
+  src: string;
+  description: string;
+  className?: string;
+  state?: 'idle' | 'uploading' | 'processing' | 'error' | 'done';
+  onRemove?: () => void;
+}) {
+  return (
+    <Dialog>
+      <Attachment state={state} size="sm" orientation="vertical" className={className}>
+        <DialogTrigger asChild>
+          <AttachmentTrigger aria-label={`Open ${name}`} />
+        </DialogTrigger>
+        <AttachmentMedia variant="image">
+          <img src={src} alt={name} />
+        </AttachmentMedia>
+        <AttachmentContent>
+          <AttachmentTitle title={name}>{name}</AttachmentTitle>
+          <AttachmentDescription>{description}</AttachmentDescription>
+        </AttachmentContent>
+        {onRemove ? (
+          <AttachmentActions>
+            <AttachmentAction type="button" aria-label={`Remove ${name}`} onClick={onRemove}>
+              <XIcon />
+            </AttachmentAction>
+          </AttachmentActions>
+        ) : null}
+      </Attachment>
+      <DialogContent
+        className="max-w-[min(92vw,64rem)] gap-3 border-white/10 bg-zinc-950/95 p-2 text-zinc-100 shadow-2xl sm:max-w-[min(92vw,64rem)] sm:p-3"
+        overlayClassName="bg-black/80 supports-backdrop-filter:backdrop-blur-sm"
+      >
+        <DialogHeader className="sr-only">
+          <DialogTitle>{name}</DialogTitle>
+          <DialogDescription>Full-size preview of {name}</DialogDescription>
+        </DialogHeader>
+        <div className="flex max-h-[min(78vh,48rem)] min-h-0 items-center justify-center overflow-hidden rounded-lg bg-black/30">
+          <img src={src} alt={name} className="max-h-[min(78vh,48rem)] max-w-full object-contain" />
+        </div>
+        <div className="flex min-w-0 items-center justify-between gap-3 px-1 text-xs text-zinc-400">
+          <span className="truncate" title={name}>
+            {name}
+          </span>
+          <span className="shrink-0">Click outside or press Esc to close</span>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function PromptAttachments({ attachments }: { attachments: AgentImageAttachment[] }) {
+  if (attachments.length === 0) return null;
+
+  return (
+    <AttachmentGroup
+      role="group"
+      aria-label="Prompt attachments"
+      className="max-w-full justify-end gap-2"
+    >
+      {attachments.map((attachment) => (
+        <ImageAttachmentCard
+          key={`${attachment.name}-${attachment.mimeType}`}
+          name={attachment.name}
+          src={`data:${attachment.mimeType};base64,${attachment.data}`}
+          description={`${attachment.mimeType.split('/')[1]?.toUpperCase() ?? 'IMAGE'} · Prompt attachment`}
+          className="w-28"
+        />
+      ))}
+    </AttachmentGroup>
+  );
+}
+
 function Conversation({
   agent,
   run,
   models,
   transcript,
+  promptAttachments,
   submitting,
   runIsActive,
+  connectionState,
   onCancel,
+  onSteer,
   onSendMessage,
 }: {
   agent: ManagedAgentResponse | undefined;
   run: ManagedAgentRunResponse;
   models: ManagedAgentModelsResponse | undefined;
   transcript: ReturnType<typeof mapPiEvents>;
+  promptAttachments: AgentImageAttachment[];
   submitting: boolean;
   runIsActive: boolean;
+  connectionState: StreamConnectionState;
   onCancel(): Promise<void>;
-  onSendMessage(message: string): Promise<void>;
+  onSteer(message: string, attachments?: AgentImageAttachment[]): Promise<void>;
+  onSendMessage(message: string, attachments?: AgentImageAttachment[]): Promise<void>;
 }) {
   const [message, setMessage] = useState('');
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string>();
   const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
@@ -1489,13 +2347,59 @@ function Conversation({
     addFiles(event.dataTransfer.files);
   }
 
+  async function prepareImageAttachments(): Promise<AgentImageAttachment[] | undefined> {
+    if (attachments.length === 0) return undefined;
+    const unsupported = attachments.filter(
+      (attachment) =>
+        !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(attachment.file.type),
+    );
+    if (unsupported.length > 0) {
+      setAttachmentError(
+        'Only PNG, JPEG, GIF, and WebP images can be sent to Pi. Remove other files first.',
+      );
+      return undefined;
+    }
+    if (
+      attachments.length > 4 ||
+      attachments.some((attachment) => attachment.file.size > 6_000_000)
+    ) {
+      setAttachmentError('Use at most four images, each smaller than 6 MB.');
+      return undefined;
+    }
+    return Promise.all(
+      attachments.map(async (attachment) => ({
+        name: attachment.file.name,
+        mimeType: attachment.file.type as AgentImageAttachment['mimeType'],
+        data: await fileToBase64(attachment.file),
+      })),
+    );
+  }
+
   async function submitMessage(event: FormEvent) {
     event.preventDefault();
     const value = message.trim();
     if ((!value && attachments.length === 0) || submitting || !canChat) return;
     try {
-      await onSendMessage(value || 'Please inspect the attached file.');
+      const imageAttachments = await prepareImageAttachments();
+      if (attachments.length > 0 && !imageAttachments) return;
+      await onSendMessage(value || 'Please inspect the attached image.', imageAttachments);
       setMessage('');
+      setAttachmentError(undefined);
+      clearAttachments();
+    } catch {
+      // Keep the draft and attachments visible while the app-level error explains what failed.
+    }
+  }
+
+  async function submitSteer() {
+    const value = message.trim();
+    if (!value || submitting || !runIsActive) return;
+    try {
+      const imageAttachments = await prepareImageAttachments();
+      if (attachments.length > 0 && !imageAttachments) return;
+      await onSteer(value, imageAttachments);
+      setMessage('');
+      setAttachmentError(undefined);
       clearAttachments();
     } catch {
       // Keep the draft and attachments visible while the app-level error explains what failed.
@@ -1516,43 +2420,67 @@ function Conversation({
       transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
     >
       <motion.header
-        className="flex min-h-16 items-center justify-between gap-4 border-b px-5 py-3"
-        initial={{ opacity: 0, y: -8 }}
+        className="flex h-12 shrink-0 items-center justify-between gap-3 border-b px-3 sm:px-4"
+        initial={{ opacity: 0, y: -6 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.18, delay: 0.06 }}
+        transition={{ duration: 0.16, delay: 0.04 }}
       >
         <motion.div
-          className="min-w-0"
-          initial={{ opacity: 0, x: -8 }}
+          className="flex min-w-0 items-baseline gap-2"
+          initial={{ opacity: 0, x: -6 }}
           animate={{ opacity: 1, x: 0 }}
-          transition={{ duration: 0.16, delay: 0.07 }}
+          transition={{ duration: 0.14, delay: 0.05 }}
         >
-          <h1 className="truncate font-semibold">{sessionTitle(run.prompt)}</h1>
-          <p className="truncate text-sm text-muted-foreground">
+          <h1 className="truncate text-sm font-semibold">{sessionTitle(run.prompt)}</h1>
+          <span
+            className="hidden shrink-0 text-xs text-muted-foreground md:inline"
+            aria-hidden="true"
+          >
+            ·
+          </span>
+          <p
+            className="hidden min-w-0 truncate text-xs text-muted-foreground md:block"
+            title={run.cwd}
+          >
             {agent?.name ?? 'Agent'} · {modelDisplayName(run.model, models)} ·{' '}
-            {run.thinkingLevel ? titleCase(run.thinkingLevel) : 'Default thinking'} · {run.cwd}
+            {run.thinkingLevel ? titleCase(run.thinkingLevel) : 'Default thinking'}
           </p>
         </motion.div>
         <motion.div
-          className="flex items-center gap-2"
-          initial={{ opacity: 0, x: 8 }}
+          className="flex shrink-0 items-center gap-1.5"
+          initial={{ opacity: 0, x: 6 }}
           animate={{ opacity: 1, x: 0 }}
-          transition={{ duration: 0.16, delay: 0.11 }}
+          transition={{ duration: 0.14, delay: 0.08 }}
         >
           <RunStatus status={run.status} />
+          <span
+            role="status"
+            aria-label={`Event stream ${connectionState}`}
+            className="flex items-center gap-1 text-[11px] text-muted-foreground"
+            title={`Event stream: ${connectionState}`}
+          >
+            <span
+              className={cn(
+                'size-1.5 rounded-full',
+                connectionState === 'connected' ? 'bg-emerald-500' : 'bg-muted-foreground/60',
+              )}
+              aria-hidden="true"
+            />
+            <span className="hidden sm:inline">{titleCase(connectionState)}</span>
+          </span>
           <AnimatePresence initial={false}>
             {runIsActive ? (
               <motion.div
                 key="cancel-run"
-                initial={{ opacity: 0, scale: 0.82, x: 8 }}
-                animate={{ opacity: 1, scale: 1, x: 0 }}
-                exit={{ opacity: 0, scale: 0.82, x: -8 }}
-                transition={{ type: 'spring', stiffness: 480, damping: 28 }}
+                initial={{ opacity: 0, scale: 0.88 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.88 }}
+                transition={{ duration: 0.12 }}
               >
                 <Button
                   type="button"
-                  variant="outline"
-                  size="icon"
+                  variant="ghost"
+                  size="icon-sm"
                   onClick={onCancel}
                   disabled={submitting}
                 >
@@ -1567,7 +2495,7 @@ function Conversation({
       <AnimatePresence>
         {dragActive ? (
           <motion.div
-            className="pointer-events-none absolute inset-x-3 top-20 bottom-3 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary bg-background/90 px-6 text-center shadow-lg"
+            className="pointer-events-none absolute inset-x-3 top-15 bottom-3 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary bg-background/90 px-6 text-center shadow-lg"
             role="status"
             initial={{ opacity: 0, scale: 0.98 }}
             animate={{ opacity: 1, scale: 1 }}
@@ -1597,8 +2525,11 @@ function Conversation({
                     <MessageContent>
                       <MessageHeader>You</MessageHeader>
                       <Bubble align="end">
-                        <BubbleContent className="whitespace-pre-wrap">{run.prompt}</BubbleContent>
+                        <BubbleContent>
+                          <MarkdownContent content={run.prompt} />
+                        </BubbleContent>
                       </Bubble>
+                      <PromptAttachments attachments={promptAttachments} />
                       <MessageFooter>{formatTime(run.createdAt)}</MessageFooter>
                     </MessageContent>
                   </Message>
@@ -1609,10 +2540,14 @@ function Conversation({
                   layout="position"
                   initial={{ opacity: 0, scaleX: 0.94 }}
                   animate={{ opacity: 1, scaleX: 1 }}
-                  transition={{ duration: 0.18, delay: 0.06, ease: [0.22, 1, 0.36, 1] }}
+                  transition={{
+                    duration: 0.18,
+                    delay: 0.06,
+                    ease: [0.22, 1, 0.36, 1],
+                  }}
                 >
                   <Marker variant="separator">
-                    <MarkerContent>PI event stream</MarkerContent>
+                    <MarkerContent>Activity</MarkerContent>
                   </Marker>
                 </motion.div>
               </MessageScrollerItem>
@@ -1649,21 +2584,37 @@ function Conversation({
             transition={{ duration: 0.18 }}
           >
             <div className="mx-auto flex max-w-3xl flex-col gap-2">
+              {attachmentError ? (
+                <p role="alert" className="text-xs text-destructive">
+                  {attachmentError}
+                </p>
+              ) : null}
               {attachments.length > 0 ? (
                 <AttachmentGroup aria-label="Attached files">
                   {attachments.map((attachment) => {
                     const isImage = attachment.file.type.startsWith('image/');
+                    if (isImage && attachment.previewUrl) {
+                      return (
+                        <ImageAttachmentCard
+                          key={attachment.id}
+                          name={attachment.file.name}
+                          src={attachment.previewUrl}
+                          description={`${attachmentTypeLabel(attachment.file)} · ${formatFileSize(attachment.file.size)} · Ready to send`}
+                          state="idle"
+                          onRemove={() => removeAttachment(attachment.id)}
+                        />
+                      );
+                    }
+
                     return (
                       <Attachment
                         key={attachment.id}
-                        state="done"
+                        state="idle"
                         size="sm"
                         orientation={isImage ? 'vertical' : 'horizontal'}
                       >
                         <AttachmentMedia variant={isImage ? 'image' : 'icon'}>
-                          {isImage && attachment.previewUrl ? (
-                            <img src={attachment.previewUrl} alt={attachment.file.name} />
-                          ) : isImage ? (
+                          {isImage ? (
                             <ImageIcon aria-hidden="true" />
                           ) : (
                             attachmentIcon(attachment.file)
@@ -1673,7 +2624,7 @@ function Conversation({
                           <AttachmentTitle>{attachment.file.name}</AttachmentTitle>
                           <AttachmentDescription>
                             {attachmentTypeLabel(attachment.file)} {'·'}
-                            {formatFileSize(attachment.file.size)}
+                            {formatFileSize(attachment.file.size)} {'·'} Ready to send
                           </AttachmentDescription>
                         </AttachmentContent>
                         <AttachmentActions>
@@ -1726,6 +2677,18 @@ function Conversation({
                   rows={1}
                   className="max-h-32 min-h-10 resize-none rounded-2xl bg-muted/40 py-2.5 shadow-none focus-visible:ring-2"
                 />
+                {runIsActive ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void submitSteer()}
+                    disabled={submitting || !message.trim()}
+                    aria-label="Steer now"
+                  >
+                    Steer now
+                  </Button>
+                ) : null}
                 <Button
                   type="submit"
                   size="icon-lg"
@@ -1748,25 +2711,41 @@ function Conversation({
 }
 
 function AgentSettingsDialog({
+  client,
   open,
   onOpenChange,
   agents,
+  projects,
   submitting,
   darkMode,
   onDarkModeChange,
   onCreate,
   onUpdate,
   onDelete,
+  onCreateProject,
+  onUpdateProject,
+  onDeleteProject,
 }: {
+  client: Pick<SupervisorClientApi, 'listExtensions' | 'updateExtensions'>;
   open: boolean;
   onOpenChange(open: boolean): void;
   agents: ManagedAgentResponse[];
+  projects: ManagedProjectResponse[];
   submitting: boolean;
   darkMode: boolean;
   onDarkModeChange(darkMode: boolean): void;
   onCreate(name: string, systemPrompt: string): Promise<ManagedAgentResponse | undefined>;
   onUpdate(agentId: string, name: string, systemPrompt: string): Promise<void>;
   onDelete(agentId: string): Promise<void>;
+  onCreateProject(input: {
+    name?: string;
+    path: string;
+  }): Promise<ManagedProjectResponse | undefined>;
+  onUpdateProject(
+    projectId: string,
+    input: { name?: string; path?: string },
+  ): Promise<ManagedProjectResponse | undefined>;
+  onDeleteProject(project: ManagedProjectResponse): Promise<boolean>;
 }) {
   const [editing, setEditing] = useState<string | 'new'>();
   const [section, setSection] = useState<SettingsSection>('agents');
@@ -1804,6 +2783,18 @@ function AgentSettingsDialog({
                   Appearance
                 </Button>
                 <Button
+                  variant={section === 'projects' ? 'secondary' : 'ghost'}
+                  className="w-full justify-start"
+                  aria-current={section === 'projects' ? 'page' : undefined}
+                  onClick={() => setSection('projects')}
+                >
+                  <FolderIcon data-icon="inline-start" />
+                  Projects
+                  <Badge variant="outline" className="ml-auto">
+                    {projects.length}
+                  </Badge>
+                </Button>
+                <Button
                   variant={section === 'agents' ? 'secondary' : 'ghost'}
                   className="w-full justify-start"
                   aria-current={section === 'agents' ? 'page' : undefined}
@@ -1836,7 +2827,7 @@ function AgentSettingsDialog({
                   <PuzzleIcon data-icon="inline-start" />
                   Extensions
                   <Badge variant="outline" className="ml-auto">
-                    {INSTALLED_EXTENSIONS.length}
+                    Pi
                   </Badge>
                 </Button>
               </nav>
@@ -1847,7 +2838,15 @@ function AgentSettingsDialog({
               animate={{ opacity: 1, x: 0 }}
               transition={{ duration: 0.18, delay: 0.07 }}
             >
-              {section === 'agents' ? (
+              {section === 'projects' ? (
+                <KnownProjectsSettingsPage
+                  projects={projects}
+                  submitting={submitting}
+                  onCreate={onCreateProject}
+                  onUpdate={onUpdateProject}
+                  onDelete={onDeleteProject}
+                />
+              ) : section === 'agents' ? (
                 <div className="mx-auto flex max-w-3xl flex-col gap-6">
                   <motion.div
                     className="flex items-start justify-between gap-4 pr-8"
@@ -1923,7 +2922,10 @@ function AgentSettingsDialog({
                             initial={{ opacity: 0, x: -10 }}
                             animate={{ opacity: 1, x: 0 }}
                             exit={{ opacity: 0, x: -10 }}
-                            transition={{ duration: 0.16, delay: Math.min(index, 6) * 0.03 }}
+                            transition={{
+                              duration: 0.16,
+                              delay: Math.min(index, 6) * 0.03,
+                            }}
                           >
                             {index > 0 ? <Separator /> : null}
                             <motion.button
@@ -1953,7 +2955,7 @@ function AgentSettingsDialog({
               ) : section === 'appearance' ? (
                 <AppearanceSettingsPage darkMode={darkMode} onDarkModeChange={onDarkModeChange} />
               ) : (
-                <ExtensionsSettingsPage />
+                <ExtensionsSettingsPage client={client} />
               )}
             </motion.section>
           </motion.div>
@@ -1981,6 +2983,297 @@ function AgentSettingsDialog({
         }}
       />
     </>
+  );
+}
+
+function KnownProjectsSettingsPage({
+  projects,
+  submitting,
+  onCreate,
+  onUpdate,
+  onDelete,
+}: {
+  projects: ManagedProjectResponse[];
+  submitting: boolean;
+  onCreate(input: { name?: string; path: string }): Promise<ManagedProjectResponse | undefined>;
+  onUpdate(
+    projectId: string,
+    input: { name?: string; path?: string },
+  ): Promise<ManagedProjectResponse | undefined>;
+  onDelete(project: ManagedProjectResponse): Promise<boolean>;
+}) {
+  const [editing, setEditing] = useState<ManagedProjectResponse | 'new'>();
+  const [projectToDelete, setProjectToDelete] = useState<ManagedProjectResponse>();
+
+  async function confirmDelete() {
+    if (!projectToDelete) return;
+    const deleted = await onDelete(projectToDelete);
+    if (deleted) setProjectToDelete(undefined);
+  }
+
+  return (
+    <>
+      <motion.div
+        className="mx-auto flex max-w-3xl flex-col gap-5"
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+      >
+        <div className="flex items-start justify-between gap-4 pr-8">
+          <div>
+            <h3 className="text-xl font-semibold tracking-tight">Known projects</h3>
+            <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+              Save the workspaces you return to often. They will be ready in the new-session project
+              picker.
+            </p>
+          </div>
+          <Button onClick={() => setEditing('new')}>
+            <PlusIcon data-icon="inline-start" />
+            Add project
+          </Button>
+        </div>
+
+        {projects.length === 0 ? (
+          <Empty className="min-h-72 border">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <FolderIcon />
+              </EmptyMedia>
+              <EmptyTitle>No known projects</EmptyTitle>
+              <EmptyDescription>
+                Add a workspace once and it will stay available across new sessions.
+              </EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent>
+              <Button onClick={() => setEditing('new')}>Add your first project</Button>
+            </EmptyContent>
+          </Empty>
+        ) : (
+          <ul className="overflow-hidden rounded-xl border" aria-label="Known projects">
+            <AnimatePresence initial={false} mode="popLayout">
+              {projects.map((project, index) => (
+                <motion.li
+                  key={project.id}
+                  layout
+                  initial={{ opacity: 0, x: -10 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -10 }}
+                  transition={{
+                    duration: 0.16,
+                    delay: Math.min(index, 6) * 0.03,
+                  }}
+                >
+                  {index > 0 ? <Separator /> : null}
+                  <div className="flex items-center gap-3 px-4 py-3.5">
+                    <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
+                      <FolderIcon className="size-4" aria-hidden="true" />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium">{project.name}</span>
+                      <span className="mt-0.5 block truncate font-mono text-xs text-muted-foreground">
+                        {project.path}
+                      </span>
+                      <span className="mt-1 block text-[0.7rem] text-muted-foreground/75">
+                        Last used {formatRelativeDate(project.lastUsedAt)}
+                      </span>
+                    </span>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={`Edit project ${project.name}`}
+                        title="Edit project"
+                        disabled={submitting}
+                        onClick={() => setEditing(project)}
+                      >
+                        <PencilIcon />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={`Delete project ${project.name}`}
+                        title="Delete project"
+                        disabled={submitting}
+                        className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                        onClick={() => setProjectToDelete(project)}
+                      >
+                        <Trash2Icon />
+                      </Button>
+                    </div>
+                  </div>
+                </motion.li>
+              ))}
+            </AnimatePresence>
+          </ul>
+        )}
+      </motion.div>
+
+      <ProjectEditorDialog
+        projects={projects}
+        project={editing === 'new' ? undefined : editing}
+        open={editing !== undefined}
+        submitting={submitting}
+        onOpenChange={(open) => {
+          if (!open) setEditing(undefined);
+        }}
+        onCreate={async (name, path) => {
+          const created = await onCreate({ name, path });
+          if (created) setEditing(undefined);
+        }}
+        onUpdate={async (projectId, name, path) => {
+          const updated = await onUpdate(projectId, { name, path });
+          if (updated) setEditing(undefined);
+        }}
+      />
+
+      <Dialog
+        open={projectToDelete !== undefined}
+        onOpenChange={(open) => {
+          if (!open && !submitting) setProjectToDelete(undefined);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove known project?</DialogTitle>
+            <DialogDescription>
+              {projectToDelete
+                ? `Remove “${projectToDelete.name}” from piDeck. Files on disk will not be changed.`
+                : ''}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button type="button" variant="outline" disabled={submitting}>
+                Cancel
+              </Button>
+            </DialogClose>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={submitting}
+              onClick={() => void confirmDelete()}
+            >
+              Remove project
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+function ProjectEditorDialog({
+  projects,
+  project,
+  open,
+  submitting,
+  onOpenChange,
+  onCreate,
+  onUpdate,
+}: {
+  projects: ManagedProjectResponse[];
+  project: ManagedProjectResponse | undefined;
+  open: boolean;
+  submitting: boolean;
+  onOpenChange(open: boolean): void;
+  onCreate(name: string, path: string): Promise<void>;
+  onUpdate(projectId: string, name: string, path: string): Promise<void>;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <ProjectEditorForm
+        key={project?.id ?? 'new'}
+        projects={projects}
+        project={project}
+        submitting={submitting}
+        onCreate={onCreate}
+        onUpdate={onUpdate}
+      />
+    </Dialog>
+  );
+}
+
+function ProjectEditorForm({
+  projects,
+  project,
+  submitting,
+  onCreate,
+  onUpdate,
+}: {
+  projects: ManagedProjectResponse[];
+  project: ManagedProjectResponse | undefined;
+  submitting: boolean;
+  onCreate(name: string, path: string): Promise<void>;
+  onUpdate(projectId: string, name: string, path: string): Promise<void>;
+}) {
+  const [name, setName] = useState(project?.name ?? '');
+  const [path, setPath] = useState(project?.path ?? '');
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const nextPath = path.trim();
+    const nextName = name.trim() || projectNameFromPath(nextPath);
+    if (!nextPath || !nextName) return;
+    if (project) await onUpdate(project.id, nextName, nextPath);
+    else await onCreate(nextName, nextPath);
+  }
+
+  return (
+    <DialogContent className="sm:max-w-2xl">
+      <motion.form
+        onSubmit={submit}
+        initial={{ opacity: 0, y: 12, scale: 0.98 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+      >
+        <DialogHeader>
+          <DialogTitle>{project ? 'Edit known project' : 'Add known project'}</DialogTitle>
+          <DialogDescription>
+            Save a workspace for quick access from the new-session project picker. Removing it never
+            deletes files on disk.
+          </DialogDescription>
+        </DialogHeader>
+        <FieldGroup className="py-6">
+          <Field>
+            <FieldLabel htmlFor="project-name">Display name</FieldLabel>
+            <Input
+              id="project-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="piDeck"
+            />
+            <FieldDescription>Leave blank to use the folder name.</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="project-path">Working directory</FieldLabel>
+            <ProjectPathAutocomplete
+              id="project-path"
+              projects={projects}
+              path={path}
+              onPathChange={setPath}
+              disabled={submitting}
+              required
+              placeholder="/path/to/project"
+            />
+            <FieldDescription>
+              The directory must exist on the machine running the supervisor.
+            </FieldDescription>
+          </Field>
+        </FieldGroup>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button type="button" variant="outline" disabled={submitting}>
+              Cancel
+            </Button>
+          </DialogClose>
+          <Button type="submit" disabled={submitting || !path.trim()}>
+            {project ? 'Save changes' : 'Add project'}
+          </Button>
+        </DialogFooter>
+      </motion.form>
+    </DialogContent>
   );
 }
 
@@ -2058,11 +3351,15 @@ function AppearanceSettingsPage({
 
 function SkillsSettingsPage() {
   const [selectedSkill, setSelectedSkill] = useState<(typeof AVAILABLE_SKILLS)[number]>();
+  const [query, setQuery] = useState('');
+  const visibleSkills = AVAILABLE_SKILLS.filter((skill) =>
+    `${skill.name} ${skill.description}`.toLowerCase().includes(query.trim().toLowerCase()),
+  );
 
   return (
     <>
       <motion.div
-        className="mx-auto flex max-w-3xl flex-col gap-6"
+        className="mx-auto flex max-w-3xl flex-col gap-5"
         initial={{ opacity: 0, y: 10 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
@@ -2071,8 +3368,7 @@ function SkillsSettingsPage() {
           <div>
             <h3 className="text-xl font-semibold tracking-tight">Skills</h3>
             <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-              Skills available to Pi for focused workflows. Select one to browse its files and
-              preview the instructions.
+              Browse the skill catalog bundled with this piDeck build and inspect its source files.
             </p>
           </div>
           <Badge variant="outline" className="mt-1 shrink-0">
@@ -2080,35 +3376,56 @@ function SkillsSettingsPage() {
           </Badge>
         </div>
 
-        <div
-          className="overflow-hidden rounded-xl border"
-          aria-label="Available skills"
-          role="list"
-        >
-          {AVAILABLE_SKILLS.map((skill, index) => (
-            <div key={skill.name} role="listitem">
-              {index > 0 ? <Separator /> : null}
-              <button
-                type="button"
-                className="flex w-full items-center gap-3 px-4 py-4 text-left outline-none transition-colors hover:bg-muted/50 focus-visible:bg-muted focus-visible:ring-3 focus-visible:ring-inset focus-visible:ring-ring/50"
-                onClick={() => setSelectedSkill(skill)}
-              >
-                <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
-                  <BookOpenIcon className="size-4" aria-hidden="true" />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block font-medium">{skill.name}</span>
-                  <span className="mt-0.5 block text-sm leading-5 text-muted-foreground">
-                    {skill.description}
-                  </span>
-                </span>
-                <Badge variant="outline" className="hidden shrink-0 sm:inline-flex">
-                  {skill.files.length} files
-                </Badge>
-              </button>
-            </div>
-          ))}
+        <div className="relative">
+          <SearchIcon
+            className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true"
+          />
+          <Input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Filter skills…"
+            aria-label="Filter skills"
+            className="pl-9"
+          />
         </div>
+
+        {visibleSkills.length > 0 ? (
+          <ul className="overflow-hidden rounded-xl border" aria-label="Available skills">
+            {visibleSkills.map((skill, index) => (
+              <li key={skill.name}>
+                {index > 0 ? <Separator /> : null}
+                <button
+                  type="button"
+                  className="group flex w-full items-center gap-3 px-4 py-3 text-left outline-none transition-colors hover:bg-muted/50 focus-visible:bg-muted focus-visible:ring-3 focus-visible:ring-inset focus-visible:ring-ring/50"
+                  onClick={() => setSelectedSkill(skill)}
+                >
+                  <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted">
+                    <BookOpenIcon className="size-3.5" aria-hidden="true" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">{skill.name}</span>
+                    <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
+                      {skill.description}
+                    </span>
+                  </span>
+                  <span className="hidden shrink-0 text-xs text-muted-foreground sm:inline">
+                    {skill.files.length} files
+                  </span>
+                  <ChevronRightIcon
+                    className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5"
+                    aria-hidden="true"
+                  />
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="rounded-xl border border-dashed px-5 py-10 text-center">
+            <p className="text-sm font-medium">No matching skills</p>
+            <p className="mt-1 text-sm text-muted-foreground">Try a broader name or workflow.</p>
+          </div>
+        )}
       </motion.div>
 
       <SkillViewerDialog
@@ -2203,12 +3520,63 @@ function SkillViewerContent({ skill }: { skill: (typeof AVAILABLE_SKILLS)[number
   );
 }
 
-function ExtensionsSettingsPage() {
-  const [updatedExtensions, setUpdatedExtensions] = useState<Set<string>>(() => new Set());
-  const updateCount = INSTALLED_EXTENSIONS.filter(
-    (extension) =>
-      extension.version !== extension.latestVersion && !updatedExtensions.has(extension.id),
+function ExtensionsSettingsPage({
+  client,
+}: {
+  client: Pick<SupervisorClientApi, 'listExtensions' | 'updateExtensions'>;
+}) {
+  const [data, setData] = useState<ManagedAgentExtensionsResponse>();
+  const [loadError, setLoadError] = useState<string>();
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [updatingSource, setUpdatingSource] = useState<string>();
+
+  const loadExtensions = useCallback(
+    async (refresh = false) => {
+      if (refresh) setRefreshing(true);
+      else setLoading(true);
+      setLoadError(undefined);
+      try {
+        setData(await client.listExtensions());
+      } catch (reason) {
+        setLoadError(errorMessage(reason));
+      } finally {
+        if (refresh) setRefreshing(false);
+        else setLoading(false);
+      }
+    },
+    [client],
+  );
+
+  useEffect(() => {
+    void loadExtensions();
+  }, [loadExtensions]);
+
+  async function updateExtensions(source?: string) {
+    const updateKey = source ?? '__all__';
+    setUpdatingSource(updateKey);
+    setLoadError(undefined);
+    try {
+      setData(await client.updateExtensions(source));
+    } catch (reason) {
+      setLoadError(errorMessage(reason));
+    } finally {
+      setUpdatingSource(undefined);
+    }
+  }
+
+  const extensions = data?.extensions ?? [];
+  const updateCount = extensions.filter(
+    (extension) => extension.status === 'update_available',
   ).length;
+  const unknownCount = extensions.filter((extension) => extension.status === 'unknown').length;
+  const updateSummary = data?.updateCheckError
+    ? 'Check failed'
+    : updateCount > 0
+      ? `${updateCount} update${updateCount === 1 ? '' : 's'}`
+      : unknownCount > 0
+        ? `${unknownCount} unchecked`
+        : 'All current';
 
   return (
     <motion.div
@@ -2221,70 +3589,178 @@ function ExtensionsSettingsPage() {
         <div>
           <h3 className="text-xl font-semibold tracking-tight">Extensions</h3>
           <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-            Extensions already installed in this Pi environment. Keep them current from here.
+            Every extension Pi resolves for this environment, including local files and installed
+            packages.
           </p>
         </div>
-        <Badge variant={updateCount > 0 ? 'secondary' : 'outline'} className="mt-1 shrink-0">
-          {updateCount > 0 ? `${updateCount} update${updateCount === 1 ? '' : 's'}` : 'All current'}
-        </Badge>
+        <div className="flex shrink-0 items-center gap-2">
+          {data ? (
+            <Badge variant={updateCount > 0 ? 'secondary' : 'outline'}>{updateSummary}</Badge>
+          ) : null}
+          {updateCount > 0 ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void updateExtensions()}
+              disabled={updatingSource !== undefined}
+            >
+              {updatingSource === '__all__' ? (
+                <LoaderCircleIcon className="animate-spin" data-icon="inline-start" />
+              ) : (
+                <DownloadIcon data-icon="inline-start" />
+              )}
+              {updatingSource === '__all__' ? 'Updating…' : 'Update all'}
+            </Button>
+          ) : null}
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => void loadExtensions(true)}
+            disabled={loading || refreshing}
+          >
+            <LoaderCircleIcon
+              className={cn(refreshing && 'animate-spin')}
+              data-icon="inline-start"
+            />
+            Refresh
+          </Button>
+        </div>
       </div>
 
-      <div
-        className="overflow-hidden rounded-xl border"
-        aria-label="Installed extensions"
-        role="list"
-      >
-        {INSTALLED_EXTENSIONS.map((extension, index) => {
-          const isCurrent =
-            extension.version === extension.latestVersion || updatedExtensions.has(extension.id);
+      {data?.updateCheckError ? (
+        <Alert variant="destructive">
+          <AlertTitle>Could not check for extension updates</AlertTitle>
+          <AlertDescription>{data.updateCheckError}</AlertDescription>
+        </Alert>
+      ) : null}
+      {loadError ? (
+        <Alert variant="destructive">
+          <AlertTitle>Extension discovery failed</AlertTitle>
+          <AlertDescription>{loadError}</AlertDescription>
+        </Alert>
+      ) : null}
 
-          return (
-            <div key={extension.id} role="listitem">
-              {index > 0 ? <Separator /> : null}
-              <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center">
-                <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
-                  <PuzzleIcon className="size-4" aria-hidden="true" />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block font-medium">{extension.name}</span>
-                  <span className="mt-0.5 block text-sm leading-5 text-muted-foreground">
-                    {extension.description}
-                  </span>
-                  <span className="mt-1 block font-mono text-xs text-muted-foreground">
-                    v{extension.version}
-                    {!isCurrent ? ` · v${extension.latestVersion} available` : ''}
-                  </span>
-                </span>
-                <span className="flex shrink-0 items-center justify-end">
-                  {isCurrent ? (
-                    <Badge
-                      variant="outline"
-                      className="gap-1 text-emerald-700 dark:text-emerald-400"
-                    >
-                      <CheckCircle2Icon aria-hidden="true" />
-                      Up to date
-                    </Badge>
-                  ) : (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() =>
-                        setUpdatedExtensions((current) => new Set(current).add(extension.id))
-                      }
-                    >
-                      <DownloadIcon data-icon="inline-start" />
-                      Update
-                    </Button>
-                  )}
-                </span>
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      {loading ? (
+        <div
+          className="flex min-h-72 items-center justify-center rounded-xl border text-sm text-muted-foreground"
+          role="status"
+        >
+          <LoaderCircleIcon className="mr-2 size-4 animate-spin" />
+          Discovering Pi extensions…
+        </div>
+      ) : extensions.length === 0 ? (
+        <Empty className="min-h-72 border">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <PuzzleIcon />
+            </EmptyMedia>
+            <EmptyTitle>No extensions found</EmptyTitle>
+            <EmptyDescription>
+              Pi has no enabled extension files in its global or project extension locations.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : (
+        <ul className="overflow-hidden rounded-xl border" aria-label="Installed extensions">
+          {extensions.map((extension, index) => (
+            <ExtensionRow
+              key={extension.id}
+              extension={extension}
+              index={index}
+              updating={updatingSource === extension.source}
+              onUpdate={() => void updateExtensions(extension.source)}
+            />
+          ))}
+        </ul>
+      )}
     </motion.div>
   );
+}
+
+function ExtensionRow({
+  extension,
+  index,
+  updating,
+  onUpdate,
+}: {
+  extension: ManagedAgentExtension;
+  index: number;
+  updating: boolean;
+  onUpdate(): void;
+}) {
+  const status = extensionStatusLabel(extension);
+  const isUpdateAvailable = extension.status === 'update_available';
+
+  return (
+    <li>
+      {index > 0 ? <Separator /> : null}
+      <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center">
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
+          <PuzzleIcon className="size-4" aria-hidden="true" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block font-medium">{extension.name}</span>
+          <span className="mt-0.5 block text-sm leading-5 text-muted-foreground">
+            {extension.description}
+          </span>
+          <span
+            className="mt-1 block truncate font-mono text-xs text-muted-foreground"
+            title={extension.path}
+          >
+            {extension.version ? `v${extension.version}` : extension.relativePath} ·{' '}
+            {extension.scope}
+          </span>
+        </span>
+        <span className="flex shrink-0 items-center justify-end">
+          {isUpdateAvailable ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onUpdate}
+              disabled={updating}
+              aria-label={`Update ${extension.name}`}
+            >
+              {updating ? (
+                <LoaderCircleIcon className="animate-spin" data-icon="inline-start" />
+              ) : (
+                <DownloadIcon data-icon="inline-start" />
+              )}
+              {updating ? 'Updating…' : 'Update'}
+            </Button>
+          ) : (
+            <Badge
+              variant="outline"
+              className={cn(
+                extension.status === 'up_to_date' || extension.status === 'local'
+                  ? 'text-emerald-700 dark:text-emerald-400'
+                  : 'text-muted-foreground',
+              )}
+            >
+              {status}
+            </Badge>
+          )}
+        </span>
+      </div>
+    </li>
+  );
+}
+
+function extensionStatusLabel(extension: ManagedAgentExtension): string {
+  switch (extension.status) {
+    case 'up_to_date':
+      return 'Up to date';
+    case 'local':
+      return 'Local';
+    case 'disabled':
+      return 'Disabled';
+    case 'unknown':
+      return 'Update status unavailable';
+    case 'update_available':
+      return 'Update available';
+  }
 }
 
 function AgentEditorDialog({
@@ -2494,12 +3970,19 @@ function EventGroupRow({
   transition,
 }: {
   item: Extract<ReturnType<typeof mapPiEvents>[number], { kind: 'event-group' }>;
-  transition: { duration: number; delay: number; ease: readonly [number, number, number, number] };
+  transition: {
+    duration: number;
+    delay: number;
+    ease: readonly [number, number, number, number];
+  };
 }) {
   const [expanded, setExpanded] = useState(false);
   const hasError = item.events.some((event) => event.kind === 'error');
-  const summary = item.events.at(-1);
   const visibleEvents = collapseThinkingMarkers(item.events);
+  const summary = visibleEvents.at(-1);
+  const fileEvent = [...visibleEvents]
+    .reverse()
+    .find((event) => event.kind === 'marker' && event.filePath);
 
   return (
     <MessageScrollerItem messageId={item.id}>
@@ -2511,7 +3994,7 @@ function EventGroupRow({
       >
         <button
           type="button"
-          className="group/event flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm text-muted-foreground outline-none transition-colors hover:bg-muted/60 focus-visible:ring-3 focus-visible:ring-ring/50"
+          className="group/event flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground outline-none transition-colors hover:bg-muted/60 focus-visible:ring-3 focus-visible:ring-ring/50"
           aria-expanded={expanded}
           onClick={() => setExpanded((current) => !current)}
         >
@@ -2519,10 +4002,21 @@ function EventGroupRow({
             className="size-3.5 shrink-0 transition-transform duration-150 group-aria-expanded/event:rotate-90"
             aria-hidden="true"
           />
-          <span className={hasError ? 'text-destructive' : 'text-foreground'}>
-            {item.events.length} events
+          <span
+            className={cn(
+              'min-w-0 truncate font-medium',
+              hasError ? 'text-destructive' : 'text-foreground',
+              summary?.kind === 'marker' && summary.shimmer && 'shimmer',
+            )}
+          >
+            {summary?.label ?? 'Activity'}
           </span>
-          <span className="min-w-0 truncate">{summary?.label ?? 'Activity'}</span>
+          {item.events.length > 1 ? (
+            <span className="shrink-0 text-muted-foreground/70">{item.events.length} events</span>
+          ) : null}
+          {fileEvent?.kind === 'marker' && fileEvent.filePath ? (
+            <FileNameBadge filePath={fileEvent.filePath} />
+          ) : null}
           <span className="ml-auto shrink-0 text-xs text-muted-foreground/70">
             {formatTime(item.createdAt)}
           </span>
@@ -2534,10 +4028,12 @@ function EventGroupRow({
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -4 }}
               transition={{ duration: 0.14 }}
-              className="mt-2 flex flex-col gap-4 pl-5"
+              className="mt-1 ml-4 flex flex-col border-l pl-3"
             >
               {visibleEvents.map((event) => (
-                <EventMarker key={event.id} item={event} />
+                <div key={event.id} className="py-1">
+                  <EventMarker item={event} />
+                </div>
               ))}
             </motion.div>
           ) : null}
@@ -2550,6 +4046,17 @@ function EventGroupRow({
 function formatToolArguments(value: JsonValue | undefined): string {
   if (value === undefined) return 'No arguments provided';
   return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
+function FileNameBadge({ filePath }: { filePath: string }) {
+  const normalizedPath = filePath.replaceAll('\\', '/');
+  const fileName = normalizedPath.split('/').at(-1) || filePath;
+
+  return (
+    <Badge variant="outline" title={filePath}>
+      {fileName}
+    </Badge>
+  );
 }
 
 function EventMarker({ item }: { item: TranscriptEvent }) {
@@ -2567,6 +4074,12 @@ function EventMarker({ item }: { item: TranscriptEvent }) {
       >
         {item.label}
         {item.detail ? ` · ${item.detail}` : ''}
+        {item.kind === 'marker' && item.filePath ? (
+          <>
+            {' '}
+            <FileNameBadge filePath={item.filePath} />
+          </>
+        ) : null}
       </MarkerContent>
     </Marker>
   );
@@ -2579,12 +4092,11 @@ function EventMarker({ item }: { item: TranscriptEvent }) {
         <AccordionTrigger className="rounded-md py-1 hover:no-underline">{marker}</AccordionTrigger>
         <AccordionContent className="pl-6">
           <p className="mb-1 text-xs font-medium text-muted-foreground">Arguments</p>
-          <pre
-            aria-label="Tool call arguments"
-            className="overflow-x-auto rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5 whitespace-pre-wrap break-words"
-          >
-            {formatToolArguments(item.toolArguments)}
-          </pre>
+          <section aria-label="Tool call arguments">
+            <pre className="overflow-x-auto rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5 whitespace-pre-wrap break-words">
+              {formatToolArguments(item.toolArguments)}
+            </pre>
+          </section>
         </AccordionContent>
       </AccordionItem>
     </Accordion>
@@ -2602,7 +4114,10 @@ function RunStatus({ status }: { status: ManagedAgentRunResponse['status'] }) {
         exit={{ opacity: 0, y: 6, scale: 0.9 }}
         transition={{ type: 'spring', stiffness: 440, damping: 28 }}
       >
-        <Badge variant={status === 'failed' ? 'destructive' : 'secondary'}>
+        <Badge
+          variant={status === 'failed' ? 'destructive' : 'secondary'}
+          className="h-5 px-1.5 text-[10px]"
+        >
           {titleCase(status)}
         </Badge>
       </motion.div>
@@ -2640,7 +4155,10 @@ function encodeModel(model: { provider: string; id: string }): string {
 function decodeModel(value: string): { provider: string; id: string } | undefined {
   const separator = value.indexOf('\u0000');
   if (separator < 1 || separator === value.length - 1) return undefined;
-  return { provider: value.slice(0, separator), id: value.slice(separator + 1) };
+  return {
+    provider: value.slice(0, separator),
+    id: value.slice(separator + 1),
+  };
 }
 
 function sessionTitle(prompt: string): string {
@@ -2667,14 +4185,18 @@ function titleCase(value: string): string {
 }
 
 function formatTime(value: string): string {
-  return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }).format(
-    new Date(value),
-  );
+  return new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(value));
 }
 
 function formatRelativeDate(value: string): string {
   const date = new Date(value);
   const today = new Date();
   if (date.toDateString() === today.toDateString()) return formatTime(value);
-  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(date);
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+  }).format(date);
 }

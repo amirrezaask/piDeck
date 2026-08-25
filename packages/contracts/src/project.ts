@@ -8,6 +8,16 @@ export const CreateManagedProjectRequestSchema = z.object({
 });
 export type CreateManagedProjectRequest = z.infer<typeof CreateManagedProjectRequestSchema>;
 
+export const UpdateManagedProjectRequestSchema = z
+  .object({
+    name: z.string().trim().min(1).max(256).optional(),
+    path: z.string().trim().min(1).max(4096).optional(),
+  })
+  .refine((request) => request.name !== undefined || request.path !== undefined, {
+    message: 'At least one project field must be provided',
+  });
+export type UpdateManagedProjectRequest = z.infer<typeof UpdateManagedProjectRequestSchema>;
+
 export const ManagedProjectResponseSchema = z.object({
   id: IdSchema,
   name: z.string().min(1).max(256),

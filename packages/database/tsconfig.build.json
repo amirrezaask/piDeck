@@ -4,5 +4,5 @@
     "rootDir": ".",
     "outDir": "dist"
   },
-  "include": ["src", "migrations"]
+  "include": ["index.ts", "src", "migrations"]
 }

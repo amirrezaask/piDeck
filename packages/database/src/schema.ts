@@ -202,6 +202,7 @@ export interface SupervisorAgentsTable {
   thinking_level: Nullable<string>;
   created_at: string;
   updated_at: string;
+  deleted_at: Nullable<string>;
 }
 
 export interface SupervisorAgentEventsTable {
@@ -227,6 +228,15 @@ export interface SupervisorAgentRunsTable {
   created_at: string;
   started_at: Nullable<string>;
   completed_at: Nullable<string>;
+}
+
+export interface SupervisorAgentRunAttachmentsTable {
+  run_id: string;
+  position: number;
+  name: string;
+  mime_type: string;
+  data: string;
+  created_at: string;
 }
 
 export interface SupervisorAgentCommandReceiptsTable {
@@ -280,6 +290,7 @@ export interface SupervisorDatabase {
   supervisor_agents: SupervisorAgentsTable;
   supervisor_agent_events: SupervisorAgentEventsTable;
   supervisor_agent_runs: SupervisorAgentRunsTable;
+  supervisor_agent_run_attachments: SupervisorAgentRunAttachmentsTable;
   supervisor_agent_command_receipts: SupervisorAgentCommandReceiptsTable;
   supervisor_projects: SupervisorProjectsTable;
 }

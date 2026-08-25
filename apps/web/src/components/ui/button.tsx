@@ -74,7 +74,7 @@ function Button({
       className={classes}
       whileHover={props.disabled ? undefined : { scale: 1.02 }}
       whileTap={props.disabled ? undefined : { scale: 0.97 }}
-      transition={{ type: 'spring', stiffness: 520, damping: 30 }}
+      transition={{ type: 'spring', stiffness: 700, damping: 36 }}
       {...props}
     />
   );

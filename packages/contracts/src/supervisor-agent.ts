@@ -40,6 +40,52 @@ export const ManagedAgentModelsResponseSchema = z.object({
 });
 export type ManagedAgentModelsResponse = z.infer<typeof ManagedAgentModelsResponseSchema>;
 
+export const AgentExtensionScopeSchema = z.enum(['user', 'project', 'temporary']);
+export type AgentExtensionScope = z.infer<typeof AgentExtensionScopeSchema>;
+
+export const AgentExtensionOriginSchema = z.enum(['package', 'top-level']);
+export type AgentExtensionOrigin = z.infer<typeof AgentExtensionOriginSchema>;
+
+export const AgentExtensionStatusSchema = z.enum([
+  'up_to_date',
+  'update_available',
+  'local',
+  'disabled',
+  'unknown',
+]);
+export type AgentExtensionStatus = z.infer<typeof AgentExtensionStatusSchema>;
+
+export const ManagedAgentExtensionSchema = z.object({
+  id: z.string().min(1).max(32_768),
+  name: z.string().min(1).max(512),
+  description: z.string().max(4_096).nullable(),
+  path: z.string().min(1).max(16_384),
+  relativePath: z.string().min(1).max(16_384),
+  source: z.string().min(1).max(4_096),
+  packageName: z.string().min(1).max(512).nullable(),
+  scope: AgentExtensionScopeSchema,
+  origin: AgentExtensionOriginSchema,
+  enabled: z.boolean(),
+  version: z.string().min(1).max(256).nullable(),
+  status: AgentExtensionStatusSchema,
+});
+export type ManagedAgentExtension = z.infer<typeof ManagedAgentExtensionSchema>;
+
+export const ManagedAgentExtensionsResponseSchema = z.object({
+  extensions: z.array(ManagedAgentExtensionSchema),
+  cwd: z.string().min(1).max(16_384),
+  checkedAt: IsoTimestampSchema,
+  updateCheckError: z.string().min(1).max(4_096).nullable(),
+});
+export type ManagedAgentExtensionsResponse = z.infer<typeof ManagedAgentExtensionsResponseSchema>;
+
+export const UpdateManagedExtensionsRequestSchema = z
+  .object({
+    source: z.string().trim().min(1).max(4_096).optional(),
+  })
+  .strict();
+export type UpdateManagedExtensionsRequest = z.infer<typeof UpdateManagedExtensionsRequestSchema>;
+
 export const CreateManagedAgentRequestSchema = z.object({
   name: z.string().trim().min(1).max(256).optional(),
   systemPrompt: z.string().min(1).max(250_000),
@@ -95,12 +141,24 @@ export const ManagedAgentRunStatusSchema = z.enum([
 ]);
 export type ManagedAgentRunStatus = z.infer<typeof ManagedAgentRunStatusSchema>;
 
+export const AgentImageAttachmentSchema = z.object({
+  name: z.string().trim().min(1).max(256),
+  mimeType: z.enum(['image/png', 'image/jpeg', 'image/gif', 'image/webp']),
+  data: z
+    .string()
+    .regex(/^[A-Za-z0-9+/]*={0,2}$/, 'Attachment data must be base64')
+    .max(8_000_000),
+});
+export type AgentImageAttachment = z.infer<typeof AgentImageAttachmentSchema>;
+
 export const CreateManagedAgentRunRequestSchema = z.object({
   agentId: IdSchema,
   prompt: z.string().min(1).max(1_000_000),
   model: AgentModelSchema.optional(),
   thinkingLevel: AgentThinkingLevelSchema.optional(),
   cwd: z.string().trim().min(1).max(4096).optional(),
+  idempotencyKey: IdempotencyKeySchema.optional(),
+  attachments: z.array(AgentImageAttachmentSchema).max(4).optional(),
 });
 export type CreateManagedAgentRunRequest = z.infer<typeof CreateManagedAgentRunRequestSchema>;
 
@@ -112,6 +170,7 @@ export type ManagedAgentRunError = z.infer<typeof ManagedAgentRunErrorSchema>;
 
 export const ManagedAgentRunResponseSchema = z.object({
   id: IdSchema,
+  acknowledgementId: IdSchema.optional(),
   agentId: IdSchema,
   prompt: z.string().min(1),
   model: AgentModelSchema.nullable(),
@@ -124,6 +183,13 @@ export const ManagedAgentRunResponseSchema = z.object({
   completedAt: IsoTimestampSchema.nullable(),
 });
 export type ManagedAgentRunResponse = z.infer<typeof ManagedAgentRunResponseSchema>;
+
+export const ManagedAgentRunAttachmentsResponseSchema = z.object({
+  attachments: z.array(AgentImageAttachmentSchema),
+});
+export type ManagedAgentRunAttachmentsResponse = z.infer<
+  typeof ManagedAgentRunAttachmentsResponseSchema
+>;
 
 export const ManagedAgentRunListQuerySchema = PaginationQuerySchema.extend({
   agentId: IdSchema.optional(),
@@ -139,6 +205,8 @@ export type ManagedAgentRunListResponse = z.infer<typeof ManagedAgentRunListResp
 
 export const AgentMessageRequestSchema = z.object({
   message: z.string().min(1).max(1_000_000),
+  idempotencyKey: IdempotencyKeySchema.optional(),
+  attachments: z.array(AgentImageAttachmentSchema).max(4).optional(),
 });
 export type AgentMessageRequest = z.infer<typeof AgentMessageRequestSchema>;
 
@@ -154,15 +222,33 @@ export type ManagedAgentEvent = z.infer<typeof ManagedAgentEventSchema>;
 
 export const ManagedAgentEventsQuerySchema = z.object({
   afterSequence: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
 });
-export type ManagedAgentEventsQuery = z.infer<typeof ManagedAgentEventsQuerySchema>;
+export interface ManagedAgentEventsQuery {
+  afterSequence: number;
+  limit?: number;
+}
 
 export const ManagedAgentEventsResponseSchema = z.object({
   events: z.array(ManagedAgentEventSchema),
+  // Optional keeps old clients and stored fixtures readable; new servers
+  // always provide both values so consumers have an explicit continuation
+  // contract.
+  nextSequence: z.number().int().positive().nullable().optional(),
+  hasMore: z.boolean().optional(),
 });
 export type ManagedAgentEventsResponse = z.infer<typeof ManagedAgentEventsResponseSchema>;
 
-export const ManagedAgentCommandTypeSchema = z.enum(['create', 'prompt', 'abort', 'dispose']);
+export const ManagedAgentCommandTypeSchema = z.enum([
+  'create',
+  'prompt',
+  'abort',
+  'dispose',
+  'run_create',
+  'steer',
+  'follow_up',
+  'cancel',
+]);
 export type ManagedAgentCommandType = z.infer<typeof ManagedAgentCommandTypeSchema>;
 
 export const ManagedAgentCommandStatusSchema = z.enum([

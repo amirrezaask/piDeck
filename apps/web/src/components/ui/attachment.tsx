@@ -1,6 +1,6 @@
-import * as React from 'react';
 import { cva, type VariantProps } from 'class-variance-authority';
 import { Slot } from 'radix-ui';
+import type * as React from 'react';
 
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -56,7 +56,7 @@ const attachmentMediaVariants = cva(
       variant: {
         icon: '',
         image:
-          'opacity-60 group-data-[state=done]/attachment:opacity-100 group-data-[state=idle]/attachment:opacity-100 *:[img]:aspect-square *:[img]:w-full *:[img]:object-cover',
+          'opacity-60 group-data-[state=done]/attachment:opacity-100 group-data-[state=idle]/attachment:opacity-100 *:[img]:size-full *:[img]:object-contain',
       },
     },
     defaultVariants: {
@@ -164,7 +164,7 @@ function AttachmentTrigger({
     <Comp
       data-slot="attachment-trigger"
       type={asChild ? undefined : (type ?? 'button')}
-      className={cn('absolute inset-0 z-10 outline-none', className)}
+      className={cn('absolute inset-0 z-10 cursor-zoom-in outline-none', className)}
       {...props}
     />
   );

@@ -37,6 +37,15 @@ const run = {
 };
 
 test.beforeEach(async ({ page }) => {
+  await page.route('**/supervisor/v1/ws-tickets**', (route) =>
+    route.fulfill({
+      json: { ticket: 'test-ticket', expiresAt: new Date(Date.now() + 30_000).toISOString() },
+    }),
+  );
+  await page.route(`**/supervisor/v1/runs/${run.id}`, (route) => route.fulfill({ json: run }));
+  await page.route(`**/supervisor/v1/runs/${run.id}/attachments`, (route) =>
+    route.fulfill({ json: { attachments: [] } }),
+  );
   await page.route('**/supervisor/v1/projects?**', (route) =>
     route.fulfill({ json: { projects: [project], nextCursor: null } }),
   );
@@ -79,6 +88,19 @@ test('renders persisted and streamed PI events with chat primitives', async ({
       json: {
         models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
         defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
+      },
+    }),
+  );
+  await page.route(`**/supervisor/v1/runs/${run.id}/attachments`, (route) =>
+    route.fulfill({
+      json: {
+        attachments: [
+          {
+            name: 'screen.png',
+            mimeType: 'image/png',
+            data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+          },
+        ],
       },
     }),
   );
@@ -147,7 +169,12 @@ test('renders persisted and streamed PI events with chat primitives', async ({
         runId: run.id,
         sequence: 7,
         type: 'message_update',
-        payload: { assistantMessageEvent: { type: 'text_delta', delta: 'Everything checks out.' } },
+        payload: {
+          assistantMessageEvent: {
+            type: 'text_delta',
+            delta: 'Everything checks out.\n\n```ts\nconst answer: number = 42;\n```',
+          },
+        },
         createdAt: timestamp,
       }),
     );
@@ -158,19 +185,34 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   await expect(
     page.getByRole('heading', { name: 'Review the changes.', exact: true }),
   ).toBeVisible();
-  const activity = page.getByRole('button', { name: /6 events/ });
+  const activity = page.getByRole('button', { name: /5 events/ });
   await expect(activity).toBeVisible();
   await activity.click();
   await expect(page.getByText('Thinking...', { exact: true })).toHaveCount(1);
-  const toolCall = page.getByRole('button', { name: 'Running bash' });
+  const toolCall = page.getByRole('button', { name: 'Ran bash', exact: true });
   await expect(toolCall).toBeVisible();
   await toolCall.click();
-  await expect(page.locator('pre')).toContainText('"command": "pwd"');
+  await expect(page.getByLabel('Tool call arguments')).toContainText('"command": "pwd"');
   await expect(
     page.locator('[data-slot="marker-content"]').filter({ hasText: 'bash finished' }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await expect(page.getByText('Everything checks out.')).toBeVisible();
+  await expect(page.locator('[data-slot="code-highlight"] .shiki')).toContainText(
+    'const answer: number = 42;',
+  );
+  await expect(page.getByRole('button', { name: 'Copy code' })).toBeVisible();
   await expect(page.getByLabel('Workspace agent conversation')).toBeVisible();
+  await expect(page.getByRole('group', { name: 'Prompt attachments' })).toBeVisible();
+  await page.getByRole('button', { name: 'Open screen.png' }).click();
+  const attachmentPreview = page.getByRole('dialog', { name: 'screen.png' });
+  await expect(attachmentPreview).toBeVisible();
+  await expect(attachmentPreview.getByRole('img', { name: 'screen.png' })).toBeVisible();
+  await page.screenshot({
+    path: `.impeccable/review/attachment-preview-${testInfo.project.name}.png`,
+    fullPage: true,
+  });
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog', { name: 'screen.png' })).toHaveCount(0);
   await expect(page.locator('html')).not.toHaveAttribute('data-scroll-locked');
   const bubbleBox = await page.locator('[data-slot="bubble-content"]').first().boundingBox();
   expect(bubbleBox).not.toBeNull();
@@ -184,6 +226,14 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
   await page.screenshot({
     path: `.impeccable/review/conversation-${viewport}.png`,
+    fullPage: true,
+  });
+  await page.evaluate(() => {
+    document.documentElement.classList.add('dark');
+    localStorage.setItem('pideck-theme', 'dark');
+  });
+  await page.screenshot({
+    path: `.impeccable/review/conversation-dark-${viewport}.png`,
     fullPage: true,
   });
 });
@@ -243,7 +293,7 @@ test('accepts dropped images and documents in the chat composer', async ({ page 
   });
 });
 
-test('navigates skills and installed extensions in settings', async ({ page }, testInfo) => {
+test('navigates skills and reports extension availability honestly', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
   await page.route('**/supervisor/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [], nextCursor: null } }),
@@ -293,6 +343,10 @@ test('navigates skills and installed extensions in settings', async ({ page }, t
   await settings.getByRole('button', { name: /^Skills/ }).click();
   await expect(settings.getByRole('heading', { name: 'Skills' })).toBeVisible();
   await expect(settings.getByRole('list', { name: 'Available skills' })).toBeVisible();
+  const skillFilter = settings.getByRole('textbox', { name: 'Filter skills' });
+  await skillFilter.fill('verification');
+  await expect(settings.getByRole('button', { name: /Web app verification/ })).toBeVisible();
+  await skillFilter.fill('');
   await settings.getByRole('button', { name: /Code review/ }).click();
   const skillViewer = page.getByRole('dialog', { name: 'Code review' });
   await expect(skillViewer).toBeVisible();
@@ -310,15 +364,15 @@ test('navigates skills and installed extensions in settings', async ({ page }, t
 
   await settings.getByRole('button', { name: /^Extensions/ }).click();
   await expect(settings.getByRole('heading', { name: 'Extensions' })).toBeVisible();
-  await expect(settings.getByRole('list', { name: 'Installed extensions' })).toBeVisible();
+  await expect(settings.getByText('Extension discovery is not available yet')).toBeVisible();
+  await expect(settings.getByText('API unavailable')).toBeVisible();
+  await expect(settings.getByRole('button', { name: 'Update' })).toHaveCount(0);
   expect(errors).toEqual([]);
   mkdirSync('.impeccable/review', { recursive: true });
   await page.screenshot({
     path: `.impeccable/review/settings-extensions-${viewport}.png`,
     fullPage: true,
   });
-  await settings.getByRole('button', { name: 'Update' }).click();
-  await expect(settings.getByText('All current')).toBeVisible();
 });
 
 test('chooses a saved project or prepares a new workspace', async ({ page }, testInfo) => {
@@ -346,6 +400,11 @@ test('chooses a saved project or prepares a new workspace', async ({ page }, tes
   await expect(picker.getByRole('button', { name: 'Delete project workspace' })).toBeVisible();
   await expect(picker.getByPlaceholder('Search projects')).toBeVisible();
   await expect(picker).toHaveCSS('opacity', '1');
+  const composerBox = await page.getByRole('form', { name: 'New session composer' }).boundingBox();
+  const pickerBox = await picker.boundingBox();
+  expect(composerBox).not.toBeNull();
+  expect(pickerBox).not.toBeNull();
+  expect(pickerBox?.top ?? 0).toBeGreaterThanOrEqual(composerBox?.bottom ?? 0);
   mkdirSync('.impeccable/review', { recursive: true });
   const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
   await page.screenshot({

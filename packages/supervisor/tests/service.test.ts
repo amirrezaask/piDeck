@@ -12,7 +12,7 @@ import {
 import { createTestAgentFactory } from '@nextflow/test-agents';
 import { describe, expect, it } from 'vitest';
 
-import { ExecutionNotCancellableError, SupervisorService } from '../src/service';
+import { ExecutionNotCancellableError, SupervisorService } from '../service';
 
 async function createService(agentFactory = createTestAgentFactory()): Promise<{
   service: SupervisorService;

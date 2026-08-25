@@ -1,4 +1,8 @@
+import { createHash } from 'node:crypto';
+
 import {
+  type AgentImageAttachment,
+  AgentImageAttachmentSchema,
   type AgentMessageRequest,
   AgentMessageRequestSchema,
   type AgentThinkingLevel,
@@ -17,6 +21,7 @@ import {
   type ManagedAgentModelsResponse,
   type ManagedAgentResponse,
   ManagedAgentResponseSchema,
+  type ManagedAgentRunAttachmentsResponse,
   type ManagedAgentRunListQuery,
   type ManagedAgentRunResponse,
   ManagedAgentRunResponseSchema,
@@ -28,14 +33,20 @@ import {
 import {
   createId,
   nowIso,
+  type SupervisorAgentRunAttachmentsTable,
   type SupervisorAgentRunsTable,
   type SupervisorAgentsTable,
   type SupervisorDatabase,
   withBusyRetry,
 } from '@nextflow/database';
-import { type Kysely, type Selectable, sql } from 'kysely';
+import { type Kysely, type Selectable, sql, type Transaction } from 'kysely';
 import { ManagedAgentEventHub } from './agent-event-hub.js';
-import type { CreatePiSessionOptions, ManagedPiSession, PiSessionFactory } from './pi-session.js';
+import type {
+  CreatePiSessionOptions,
+  ManagedPiSession,
+  PiImageContent,
+  PiSessionFactory,
+} from './pi-session.js';
 import { ProjectService } from './project-service.js';
 import type { SupervisorLogger } from './service.js';
 import { resolveWorkingDirectory } from './working-directory.js';
@@ -48,13 +59,23 @@ const defaultLogger: SupervisorLogger = {
 
 type AgentRow = Selectable<SupervisorAgentsTable>;
 type AgentRunRow = Selectable<SupervisorAgentRunsTable>;
+type AgentRunAttachmentRow = Selectable<SupervisorAgentRunAttachmentsTable>;
+
+export interface EventPayloadLimits {
+  readonly maxBytes: number;
+  readonly maxDepth: number;
+  readonly maxItems: number;
+}
 
 interface ActiveRun {
   readonly runId: string;
   readonly agentId: string;
   readonly session: ManagedPiSession;
   readonly operations: Set<Promise<void>>;
+  generation: number;
   settled: boolean;
+  unsubscribed: boolean;
+  disposePromise?: Promise<void>;
   unsubscribe: () => void;
 }
 
@@ -100,6 +121,34 @@ export class ManagedAgentRunNotFoundError extends Error {
   }
 }
 
+export class ManagedAgentIdempotencyConflictError extends Error {
+  readonly code = 'idempotency_conflict';
+
+  constructor(readonly idempotencyKey: string) {
+    super(`Idempotency key ${idempotencyKey} was already used for a different request`);
+    this.name = 'ManagedAgentIdempotencyConflictError';
+  }
+}
+
+export class ManagedAgentCommandInProgressError extends Error {
+  readonly code = 'idempotency_in_progress';
+
+  constructor(readonly idempotencyKey: string) {
+    super(`The command for idempotency key ${idempotencyKey} is still in progress`);
+    this.name = 'ManagedAgentCommandInProgressError';
+  }
+}
+
+export class ManagedAgentCommandReplayError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+    this.name = 'ManagedAgentCommandReplayError';
+  }
+}
+
 export class ManagedAgentRunNotCancellableError extends Error {
   readonly code = 'run_not_cancellable';
 
@@ -117,6 +166,12 @@ export interface ManagedAgentServiceOptions {
   readonly now?: () => string;
   readonly idFactory?: () => string;
   readonly projectService?: ProjectService;
+  /** Bounds shutdown and abort cleanup when an SDK session is unhealthy. */
+  readonly shutdownTimeoutMs?: number;
+  readonly operationTimeoutMs?: number;
+  readonly eventPayloadLimits?: Partial<EventPayloadLimits>;
+  /** Optional explicit retention policy; undefined retains full history. */
+  readonly eventRetentionDays?: number;
 }
 
 /**
@@ -136,9 +191,16 @@ export class ManagedAgentService {
   private readonly now: () => string;
   private readonly idFactory: () => string;
   private readonly projectService: ProjectService;
+  private readonly shutdownTimeoutMs: number;
+  private readonly operationTimeoutMs: number;
+  private readonly eventPayloadLimits: EventPayloadLimits;
+  private readonly eventRetentionDays: number | undefined;
   private readonly activeRuns = new Map<string, ActiveRun>();
-  private readonly eventTails = new Map<string, Promise<void>>();
+  private readonly eventTails = new Map<string, Promise<unknown>>();
   private readonly commandTails = new Map<string, Promise<void>>();
+  private readonly startTasks = new Map<string, { agentId: string; task: Promise<void> }>();
+  private readonly stoppingAgents = new Set<string>();
+  private closePromise?: Promise<void>;
   private legacyAgentStatusColumn?: Promise<boolean>;
   private started = false;
   private closed = false;
@@ -152,48 +214,108 @@ export class ManagedAgentService {
     this.idFactory = options.idFactory ?? createId;
     this.projectService =
       options.projectService ?? new ProjectService({ db: options.db, now: this.now });
+    this.shutdownTimeoutMs = Math.max(1, options.shutdownTimeoutMs ?? 5_000);
+    this.operationTimeoutMs = Math.max(1, options.operationTimeoutMs ?? this.shutdownTimeoutMs);
+    this.eventPayloadLimits = {
+      maxBytes: Math.max(1, options.eventPayloadLimits?.maxBytes ?? 256_000),
+      maxDepth: Math.max(1, options.eventPayloadLimits?.maxDepth ?? 16),
+      maxItems: Math.max(1, options.eventPayloadLimits?.maxItems ?? 10_000),
+    };
+    this.eventRetentionDays =
+      options.eventRetentionDays === undefined
+        ? undefined
+        : Math.max(1, Math.floor(options.eventRetentionDays));
   }
 
   async start(): Promise<void> {
     if (this.started) return;
     if (this.closed) throw new Error('managed_agent_service_closed');
     this.started = true;
+    await this.projectService.initialize();
+    await this.compactEventsIfConfigured();
 
-    // Sessions are process-local and are intentionally not reconstructed. Only
-    // runs have runtime state, so restart recovery only touches run rows.
-    await this.db
-      .updateTable('supervisor_agent_runs')
-      .set({
-        status: 'failed',
-        error_code: 'supervisor_restarted',
-        error_message: 'The run was interrupted when the Supervisor restarted',
-        completed_at: this.now(),
-      })
+    // Sessions are process-local and are intentionally not reconstructed. A
+    // recovery event is written for every row whose reservation was lost.
+    const interrupted = await this.db
+      .selectFrom('supervisor_agent_runs')
+      .select(['id', 'agent_id'])
       .where('status', 'in', ['queued', 'running'])
       .execute();
+    for (const run of interrupted) {
+      await this.finalizeRunWithoutSession(
+        run.agent_id,
+        run.id,
+        'failed',
+        {
+          code: 'supervisor_restarted',
+          message: 'The run was interrupted when the Supervisor restarted',
+        },
+        'supervisor.run_failed',
+      );
+    }
+  }
+
+  private async compactEventsIfConfigured(): Promise<void> {
+    if (this.eventRetentionDays === undefined) return;
+    const cutoff = new Date(Date.now() - this.eventRetentionDays * 86_400_000).toISOString();
+    await this.db.deleteFrom('supervisor_agent_events').where('created_at', '<', cutoff).execute();
+    this.logger.info('Compacted Supervisor event history', {
+      retentionDays: this.eventRetentionDays,
+      cutoff,
+    });
   }
 
   async close(): Promise<void> {
+    this.closePromise ??= this.closeInternal();
+    return this.closePromise;
+  }
+
+  private async closeInternal(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     const activeRuns = [...this.activeRuns.values()];
     await Promise.allSettled(
       activeRuns.map(async (active) => {
-        try {
-          await active.session.abort();
-          await Promise.allSettled([...active.operations]);
-        } finally {
-          active.unsubscribe();
-          await active.session.dispose();
-          await this.waitForEvents(active.agentId);
-        }
+        active.generation += 1;
+        await this.tryAbort(active, 'shutdown');
+        await this.waitForOperations(active, 'shutdown');
+        await this.disposeActiveRun(active);
       }),
     );
+
+    const starts = [...this.startTasks.values()].map((entry) => entry.task);
+    await this.withTimeout(
+      Promise.allSettled(starts).then(() => undefined),
+      this.shutdownTimeoutMs,
+      'session starts during shutdown',
+    ).catch((error: unknown) => {
+      this.logger.warn('Sessions did not stop before shutdown deadline', {
+        error: sanitizeError(error),
+      });
+    });
+    await Promise.allSettled(
+      [...this.activeRuns.values()].map((active) => this.disposeActiveRun(active)),
+    );
+    for (const agentId of new Set([...this.eventTails.keys()])) {
+      await this.withTimeout(
+        this.waitForEvents(agentId),
+        this.shutdownTimeoutMs,
+        'event persistence',
+      ).catch((error: unknown) => {
+        this.logger.warn('Event persistence did not stop before shutdown deadline', {
+          agentId,
+          error: sanitizeError(error),
+        });
+      });
+    }
+    this.eventTails.clear();
+    this.commandTails.clear();
     this.activeRuns.clear();
+    this.startTasks.clear();
   }
 
   async createAgent(input: CreateManagedAgentRequest): Promise<ManagedAgentResponse> {
-    if (this.closed) throw new Error('managed_agent_service_closed');
+    this.assertMutable();
 
     const request = CreateManagedAgentRequestSchema.parse(input);
     const id = this.idFactory();
@@ -229,6 +351,7 @@ export class ManagedAgentService {
           thinking_level: request.thinkingLevel ?? null,
           created_at: createdAt,
           updated_at: createdAt,
+          deleted_at: null,
         })
         .execute();
     }
@@ -238,43 +361,131 @@ export class ManagedAgentService {
   }
 
   async createRun(input: CreateManagedAgentRunRequest): Promise<ManagedAgentRunResponse> {
+    this.assertMutable();
     const request = CreateManagedAgentRunRequestSchema.parse(input);
-    const agent = await this.getAgentRow(request.agentId);
-    if (!agent) throw new ManagedAgentNotFoundError(request.agentId);
-    if (this.findActiveRun(agent.id)) {
-      throw new ManagedAgentBusyError(agent.id);
+    if (!(await this.getAgentRow(request.agentId))) {
+      throw new ManagedAgentNotFoundError(request.agentId);
     }
+    const receipt = await this.beginReceipt(
+      request.agentId,
+      'run_create',
+      request.idempotencyKey,
+      request,
+    );
+    if (receipt.result) {
+      return {
+        ...ManagedAgentRunResponseSchema.parse(receipt.result),
+        acknowledgementId: receipt.id,
+      };
+    }
+    try {
+      const result = await this.createRunAdmitted(request);
+      if (receipt.id) {
+        await this.completeReceipt(receipt.id, result);
+        return { ...result, acknowledgementId: receipt.id };
+      }
+      return result;
+    } catch (error) {
+      if (receipt.id) await this.failReceipt(receipt.id, error);
+      throw error;
+    }
+  }
 
-    const sessionOptions = createSessionOptions(agent, request);
-    await this.projectService.touchPath(sessionOptions.cwd ?? this.defaultCwd);
-    const runId = this.idFactory();
-    const createdAt = this.now();
-    await this.db
-      .insertInto('supervisor_agent_runs')
-      .values({
-        id: runId,
-        agent_id: agent.id,
-        prompt: request.prompt,
-        model_provider: sessionOptions.model?.provider ?? null,
-        model_id: sessionOptions.model?.id ?? null,
-        thinking_level: sessionOptions.thinkingLevel ?? null,
-        cwd: sessionOptions.cwd ?? this.defaultCwd,
-        status: 'queued',
-        error_code: null,
-        error_message: null,
-        created_at: createdAt,
-        started_at: null,
-        completed_at: null,
-      })
-      .execute();
+  private async createRunAdmitted(
+    request: CreateManagedAgentRunRequest,
+  ): Promise<ManagedAgentRunResponse> {
+    // The in-process fence avoids a check-then-insert race. The partial
+    // unique index below is the cross-process backstop.
+    return this.serializeCommand(`agent:${request.agentId}`, async () => {
+      const agent = await this.getAgentRow(request.agentId);
+      if (!agent) throw new ManagedAgentNotFoundError(request.agentId);
+      const existing = await this.db
+        .selectFrom('supervisor_agent_runs')
+        .select('id')
+        .where('agent_id', '=', agent.id)
+        .where('status', 'in', ['queued', 'running'])
+        .executeTakeFirst();
+      if (existing) throw new ManagedAgentBusyError(agent.id);
 
-    await this.startRun(agent, runId, request.prompt, sessionOptions);
-    return this.requireRun(runId);
+      const sessionOptions = createSessionOptions(agent, request);
+      await this.projectService.touchPath(sessionOptions.cwd ?? this.defaultCwd);
+      const runId = this.idFactory();
+      const createdAt = this.now();
+      try {
+        await this.db.transaction().execute(async (transaction) => {
+          await transaction
+            .insertInto('supervisor_agent_runs')
+            .values({
+              id: runId,
+              agent_id: agent.id,
+              prompt: request.prompt,
+              model_provider: sessionOptions.model?.provider ?? null,
+              model_id: sessionOptions.model?.id ?? null,
+              thinking_level: sessionOptions.thinkingLevel ?? null,
+              cwd: sessionOptions.cwd ?? this.defaultCwd,
+              status: 'queued',
+              error_code: null,
+              error_message: null,
+              created_at: createdAt,
+              started_at: null,
+              completed_at: null,
+            })
+            .execute();
+          if (request.attachments?.length) {
+            await transaction
+              .insertInto('supervisor_agent_run_attachments')
+              .values(
+                request.attachments.map((attachment, position) => ({
+                  run_id: runId,
+                  position,
+                  name: attachment.name,
+                  mime_type: attachment.mimeType,
+                  data: attachment.data,
+                  created_at: createdAt,
+                })),
+              )
+              .execute();
+          }
+        });
+      } catch (error) {
+        if (isUniqueConstraintError(error)) throw new ManagedAgentBusyError(agent.id);
+        throw error;
+      }
+
+      const startTask = this.startRun(
+        agent,
+        runId,
+        request.prompt,
+        sessionOptions,
+        request.attachments,
+      );
+      this.startTasks.set(runId, { agentId: agent.id, task: startTask });
+      try {
+        await startTask;
+      } finally {
+        if (this.startTasks.get(runId)?.task === startTask) this.startTasks.delete(runId);
+      }
+      return this.requireRun(runId);
+    });
   }
 
   async getRun(runId: string): Promise<ManagedAgentRunResponse | null> {
     const row = await this.getRunRow(runId);
     return row ? this.toRunResponse(row) : null;
+  }
+
+  async listRunAttachments(runId: string): Promise<ManagedAgentRunAttachmentsResponse> {
+    const run = await this.getRunRow(runId);
+    if (!run) throw new ManagedAgentRunNotFoundError(runId);
+    const rows = await this.db
+      .selectFrom('supervisor_agent_run_attachments')
+      .selectAll()
+      .where('run_id', '=', runId)
+      .orderBy('position', 'asc')
+      .execute();
+    return {
+      attachments: rows.map((row) => this.toRunAttachment(row)),
+    };
   }
 
   async listRuns(options: ManagedAgentRunListQuery): Promise<{
@@ -314,22 +525,53 @@ export class ManagedAgentService {
     };
   }
 
-  async cancelRun(runId: string): Promise<ManagedAgentRunResponse> {
-    const row = await this.getRunRow(runId);
-    if (!row) throw new ManagedAgentRunNotFoundError(runId);
-    const status = ManagedAgentRunStatusSchema.parse(row.status);
-    if (isTerminalRunStatus(status)) throw new ManagedAgentRunNotCancellableError(runId);
+  async cancelRun(runId: string, idempotencyKey?: string): Promise<ManagedAgentRunResponse> {
+    this.assertMutable();
+    return this.serializeRunCommand(runId, async () => {
+      const row = await this.getRunRow(runId);
+      if (!row) throw new ManagedAgentRunNotFoundError(runId);
+      const receipt = await this.beginReceipt(row.agent_id, 'cancel', idempotencyKey, {
+        command: 'cancel',
+        runId,
+      });
+      if (receipt.result) {
+        return {
+          ...ManagedAgentRunResponseSchema.parse(receipt.result),
+          acknowledgementId: receipt.id,
+        };
+      }
+      try {
+        const status = ManagedAgentRunStatusSchema.parse(row.status);
+        if (isTerminalRunStatus(status)) throw new ManagedAgentRunNotCancellableError(runId);
 
-    await this.markRunTerminal(runId, 'cancelled', {
-      code: 'run_cancelled',
-      message: 'The run was cancelled by an operator',
+        const active = this.activeRuns.get(runId);
+        if (active) {
+          // Invalidate every older prompt before asking the SDK to stop. Even a
+          // rejected abort therefore cannot turn the cancelled row into failed.
+          active.generation += 1;
+          await this.tryAbort(active, 'cancel');
+          await this.waitForOperations(active, 'cancel');
+          await this.waitForEvents(active.agentId);
+        }
+        const won = await this.finalizeRun(
+          row.agent_id,
+          runId,
+          'cancelled',
+          { code: 'run_cancelled', message: 'The run was cancelled by an operator' },
+          'supervisor.run_cancelled',
+        );
+        if (won && active) await this.disposeActiveRun(active);
+        const result = await this.requireRun(runId);
+        if (receipt.id) {
+          await this.completeReceipt(receipt.id, result);
+          return { ...result, acknowledgementId: receipt.id };
+        }
+        return result;
+      } catch (error) {
+        if (receipt.id) await this.failReceipt(receipt.id, error);
+        throw error;
+      }
     });
-    const active = this.activeRuns.get(runId);
-    if (active) {
-      await active.session.abort();
-      await Promise.allSettled([...active.operations]);
-    }
-    return this.requireRun(runId);
   }
 
   async getAgent(agentId: string): Promise<ManagedAgentResponse | null> {
@@ -350,8 +592,9 @@ export class ManagedAgentService {
     agentId: string,
     input: UpdateManagedAgentRequest,
   ): Promise<ManagedAgentResponse> {
+    this.assertMutable();
     const request = UpdateManagedAgentRequestSchema.parse(input);
-    return this.serializeCommand(agentId, async () => {
+    return this.serializeCommand(`agent:${agentId}`, async () => {
       if (!(await this.getAgentRow(agentId))) throw new ManagedAgentNotFoundError(agentId);
       const updatedAt = this.now();
       await this.db
@@ -374,7 +617,7 @@ export class ManagedAgentService {
     agents: ManagedAgentResponse[];
     nextCursor: string | null;
   }> {
-    let query = this.db.selectFrom('supervisor_agents').selectAll();
+    let query = this.db.selectFrom('supervisor_agents').selectAll().where('deleted_at', 'is', null);
     if (options.cursor) {
       const cursor = decodeCursor(options.cursor);
       if (cursor) {
@@ -406,62 +649,152 @@ export class ManagedAgentService {
   }
 
   async deleteAgent(agentId: string): Promise<ManagedAgentResponse> {
-    return this.serializeCommand(agentId, async () => {
+    this.assertMutable();
+    return this.serializeCommand(`agent:${agentId}`, async () => {
+      this.stoppingAgents.add(agentId);
+      const pendingStarts = [...this.startTasks.values()]
+        .filter((entry) => entry.agentId === agentId)
+        .map((entry) => entry.task);
       const activeRuns = [...this.activeRuns.values()].filter(
         (active) => active.agentId === agentId,
       );
-      if (activeRuns.some((active) => active.session.isStreaming)) {
-        throw new ManagedAgentBusyError(agentId, 'The agent has an active run');
-      }
-      await Promise.all(
+      await Promise.allSettled(
         activeRuns.map(async (active) => {
-          await Promise.allSettled([...active.operations]);
+          active.generation += 1;
+          await this.tryAbort(active, 'agent deletion');
+          await this.waitForOperations(active, 'agent deletion');
+          await this.finalizeRun(
+            agentId,
+            active.runId,
+            'cancelled',
+            { code: 'agent_deleted', message: 'The agent profile was deleted' },
+            'supervisor.run_cancelled',
+          );
           await this.disposeActiveRun(active);
         }),
       );
-      const row = await this.getAgentRow(agentId);
+      await this.withTimeout(
+        Promise.allSettled(pendingStarts).then(() => undefined),
+        this.shutdownTimeoutMs,
+        'agent deletion session starts',
+      );
+      const lateRuns = [...this.activeRuns.values()].filter((active) => active.agentId === agentId);
+      await Promise.allSettled(
+        lateRuns.map(async (active) => {
+          active.generation += 1;
+          await this.tryAbort(active, 'agent deletion');
+          await this.waitForOperations(active, 'agent deletion');
+          await this.finalizeRun(
+            agentId,
+            active.runId,
+            'cancelled',
+            { code: 'agent_deleted', message: 'The agent profile was deleted' },
+            'supervisor.run_cancelled',
+          );
+          await this.disposeActiveRun(active);
+        }),
+      );
+      const row = await this.db
+        .selectFrom('supervisor_agents')
+        .selectAll()
+        .where('id', '=', agentId)
+        .where('deleted_at', 'is', null)
+        .executeTakeFirst();
       if (!row) throw new ManagedAgentNotFoundError(agentId);
-      await this.db.deleteFrom('supervisor_agents').where('id', '=', agentId).execute();
+      await this.db
+        .updateTable('supervisor_agents')
+        .set({ deleted_at: this.now(), updated_at: this.now() })
+        .where('id', '=', agentId)
+        .where('deleted_at', 'is', null)
+        .execute();
       return this.toResponse(row);
+    }).finally(() => {
+      this.stoppingAgents.delete(agentId);
     });
   }
 
   async steerRun(runId: string, input: AgentMessageRequest): Promise<ManagedAgentRunResponse> {
+    this.assertMutable();
     const request = AgentMessageRequestSchema.parse(input);
-    return this.serializeCommand(runId, async () => {
+    return this.serializeRunCommand(runId, async () => {
       const active = await this.requireActiveRun(runId);
-      if (!active.session.isStreaming) {
-        throw new ManagedAgentBusyError(active.agentId, `Run ${runId} is not running`);
+      const receipt = await this.beginReceipt(active.agentId, 'steer', request.idempotencyKey, {
+        command: 'steer',
+        message: request.message,
+        runId,
+      });
+      if (receipt.result) {
+        return {
+          ...ManagedAgentRunResponseSchema.parse(receipt.result),
+          acknowledgementId: receipt.id,
+        };
       }
       try {
-        await active.session.steer(request.message);
+        if (!active.session.isStreaming) {
+          throw new ManagedAgentBusyError(active.agentId, `Run ${runId} is not running`);
+        }
+        await active.session.steer(request.message, toPiImages(request.attachments));
+        await this.enqueueCustomEvent(active.agentId, runId, 'supervisor.steer_accepted', {});
+        const result = await this.requireRun(runId);
+        if (receipt.id) {
+          await this.completeReceipt(receipt.id, result);
+          return { ...result, acknowledgementId: receipt.id };
+        }
+        return result;
       } catch (error) {
+        if (receipt.id) await this.failReceipt(receipt.id, error);
+        if (error instanceof ManagedAgentBusyError) throw error;
         throw commandError(active.agentId, error);
       }
-      await this.enqueueCustomEvent(active.agentId, runId, 'supervisor.steer_accepted', {});
-      return this.requireRun(runId);
     });
   }
 
   async followUpRun(runId: string, input: AgentMessageRequest): Promise<ManagedAgentRunResponse> {
+    this.assertMutable();
     const request = AgentMessageRequestSchema.parse(input);
-    return this.serializeCommand(runId, async () => {
+    return this.serializeRunCommand(runId, async () => {
       const active = await this.requireActiveRun(runId, { allowCompleted: true });
+      const receipt = await this.beginReceipt(active.agentId, 'follow_up', request.idempotencyKey, {
+        command: 'follow_up',
+        message: request.message,
+        runId,
+      });
+      if (receipt.result) {
+        return {
+          ...ManagedAgentRunResponseSchema.parse(receipt.result),
+          acknowledgementId: receipt.id,
+        };
+      }
       try {
         if (active.session.isStreaming) {
-          await active.session.followUp(request.message);
+          await active.session.followUp(request.message, toPiImages(request.attachments));
         } else {
-          await this.markRunRunning(runId);
+          const generation = ++active.generation;
+          const transitioned = await this.markRunRunning(runId);
+          if (!transitioned || active.generation !== generation) {
+            throw new ManagedAgentBusyError(active.agentId, `Run ${runId} is no longer available`);
+          }
           active.settled = false;
-          this.launchOperation(active, active.session.prompt(request.message));
+          this.launchOperation(
+            active,
+            promptSession(active.session, request.message, request.attachments),
+            generation,
+          );
         }
+        await this.enqueueCustomEvent(active.agentId, runId, 'supervisor.follow_up_accepted', {
+          message: request.message,
+        });
+        const result = await this.requireRun(runId);
+        if (receipt.id) {
+          await this.completeReceipt(receipt.id, result);
+          return { ...result, acknowledgementId: receipt.id };
+        }
+        return result;
       } catch (error) {
+        if (receipt.id) await this.failReceipt(receipt.id, error);
+        if (error instanceof ManagedAgentBusyError) throw error;
         throw commandError(active.agentId, error);
       }
-      await this.enqueueCustomEvent(active.agentId, runId, 'supervisor.follow_up_accepted', {
-        message: request.message,
-      });
-      return this.requireRun(runId);
     });
   }
 
@@ -469,14 +802,33 @@ export class ManagedAgentService {
     agentId: string,
     options: ManagedAgentEventsQuery,
   ): Promise<ManagedAgentEvent[]> {
-    const rows = await this.db
+    return (await this.listEventsPage(agentId, options)).events;
+  }
+
+  async listEventsPage(
+    agentId: string,
+    options: ManagedAgentEventsQuery,
+    runId?: string,
+  ): Promise<{ events: ManagedAgentEvent[]; nextSequence: number | null; hasMore: boolean }> {
+    await this.waitForEvents(agentId);
+    const limit = Math.min(500, Math.max(1, options.limit ?? 100));
+    let query = this.db
       .selectFrom('supervisor_agent_events')
       .selectAll()
       .where('agent_id', '=', agentId)
-      .where('sequence', '>', options.afterSequence)
+      .where('sequence', '>', options.afterSequence);
+    if (runId) query = query.where('run_id', '=', runId);
+    const rows = await query
       .orderBy('sequence', 'asc')
+      .limit(limit + 1)
       .execute();
-    return rows.map(toEvent);
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    return {
+      events: page.map(toEvent),
+      nextSequence: hasMore ? (page.at(-1)?.sequence ?? null) : null,
+      hasMore,
+    };
   }
 
   async listRunEvents(
@@ -485,14 +837,16 @@ export class ManagedAgentService {
   ): Promise<ManagedAgentEvent[]> {
     const row = await this.getRunRow(runId);
     if (!row) throw new ManagedAgentRunNotFoundError(runId);
-    const rows = await this.db
-      .selectFrom('supervisor_agent_events')
-      .selectAll()
-      .where('run_id', '=', runId)
-      .where('sequence', '>', options.afterSequence)
-      .orderBy('sequence', 'asc')
-      .execute();
-    return rows.map(toEvent);
+    return (await this.listEventsPage(row.agent_id, options, runId)).events;
+  }
+
+  async listRunEventsPage(
+    runId: string,
+    options: ManagedAgentEventsQuery,
+  ): Promise<{ events: ManagedAgentEvent[]; nextSequence: number | null; hasMore: boolean }> {
+    const row = await this.getRunRow(runId);
+    if (!row) throw new ManagedAgentRunNotFoundError(runId);
+    return this.listEventsPage(row.agent_id, options, runId);
   }
 
   subscribe(agentId: string, listener: (event: ManagedAgentEvent) => void): () => void {
@@ -539,12 +893,17 @@ export class ManagedAgentService {
     });
 
     try {
-      const events = await this.listEvents(agentId, { afterSequence });
-      for (const event of events) {
-        if (!include(event) || event.sequence <= lastSequence) continue;
-        lastSequence = event.sequence;
-        send(event);
-      }
+      let cursor = afterSequence;
+      let page: { events: ManagedAgentEvent[]; nextSequence: number | null; hasMore: boolean };
+      do {
+        page = await this.listEventsPage(agentId, { afterSequence: cursor, limit: 100 });
+        for (const event of page.events) {
+          if (!include(event) || event.sequence <= lastSequence) continue;
+          lastSequence = event.sequence;
+          send(event);
+        }
+        if (page.hasMore && page.nextSequence !== null) cursor = page.nextSequence;
+      } while (page.hasMore);
       replaying = false;
       buffered.sort((left, right) => left.sequence - right.sequence);
       for (const event of buffered) {
@@ -564,16 +923,20 @@ export class ManagedAgentService {
     runId: string,
     prompt: string,
     sessionOptions: CreatePiSessionOptions,
+    attachments?: AgentImageAttachment[],
   ): Promise<void> {
     let session: ManagedPiSession;
     try {
       session = await this.sessionFactory.create(sessionOptions);
     } catch (error) {
-      await this.failRun(runId, 'agent_start_failed', 'The Pi agent could not be created');
-      await this.enqueueCustomEvent(agent.id, runId, 'supervisor.run_failed', {
-        code: 'agent_start_failed',
-        message: 'The Pi agent could not be created',
-      });
+      if (this.closed) return;
+      await this.finalizeRunWithoutSession(
+        agent.id,
+        runId,
+        'failed',
+        { code: 'agent_start_failed', message: 'The Pi agent could not be created' },
+        'supervisor.run_failed',
+      );
       this.logger.error('Pi session creation failed', {
         agentId: agent.id,
         runId,
@@ -582,12 +945,32 @@ export class ManagedAgentService {
       return;
     }
 
+    if (this.closed || this.stoppingAgents.has(agent.id)) {
+      try {
+        await session.abort();
+      } catch {
+        // Shutdown/deletion is already authoritative; disposal is still best effort.
+      }
+      await this.withTimeout(session.dispose(), this.shutdownTimeoutMs, `dispose session ${runId}`);
+      if (this.closed) return;
+      await this.finalizeRunWithoutSession(
+        agent.id,
+        runId,
+        'failed',
+        { code: 'agent_deleted', message: 'The agent was deleted before the run started' },
+        'supervisor.run_failed',
+      );
+      return;
+    }
+
     const active: ActiveRun = {
       runId,
       agentId: agent.id,
       session,
       operations: new Set(),
+      generation: 1,
       settled: false,
+      unsubscribed: false,
       unsubscribe: () => undefined,
     };
     active.unsubscribe = session.subscribe((event) => {
@@ -603,8 +986,14 @@ export class ManagedAgentService {
     const runAcceptance = new Promise<boolean>((resolveResult) => {
       resolveRunAcceptance = resolveResult;
     });
-    const operation = session.prompt(prompt, { preflightResult: resolvePreflight });
-    this.launchOperation(active, operation, runAcceptance);
+    const generation = active.generation;
+    let operation: Promise<void>;
+    try {
+      operation = promptSession(session, prompt, attachments, resolvePreflight);
+    } catch (error) {
+      operation = Promise.reject(error);
+    }
+    this.launchOperation(active, operation, generation, runAcceptance);
     const accepted = await Promise.race([
       preflight,
       operation.then(
@@ -613,51 +1002,64 @@ export class ManagedAgentService {
       ),
     ]);
 
-    if (accepted) {
-      await this.db
+    if (accepted && active.generation === generation) {
+      const result = await this.db
         .updateTable('supervisor_agent_runs')
         .set({ status: 'running', started_at: this.now() })
         .where('id', '=', runId)
         .where('status', '=', 'queued')
-        .execute();
-      resolveRunAcceptance(true);
-      await this.enqueueCustomEvent(agent.id, runId, 'supervisor.prompt_accepted', {});
-      return;
+        .executeTakeFirst();
+      if (Number(result.numUpdatedRows) > 0) {
+        resolveRunAcceptance(true);
+        await this.enqueueCustomEvent(agent.id, runId, 'supervisor.prompt_accepted', {});
+        return;
+      }
     }
 
-    await this.failRun(
-      runId,
-      'prompt_rejected',
-      'The Pi agent rejected the prompt before execution',
-    );
     resolveRunAcceptance(false);
-    await this.enqueueCustomEvent(agent.id, runId, 'supervisor.prompt_rejected', {});
+    if (accepted) return;
+    await this.finalizeRun(
+      agent.id,
+      runId,
+      'failed',
+      { code: 'prompt_rejected', message: 'The Pi agent rejected the prompt before execution' },
+      'supervisor.prompt_rejected',
+    );
+    await this.disposeActiveRun(active);
   }
 
   private launchOperation(
     active: ActiveRun,
     operation: Promise<void>,
+    generation: number,
     runAcceptance?: Promise<boolean>,
   ): void {
     const tracked = operation
       .then(async () => {
         if (runAcceptance && !(await runAcceptance)) return;
-        await this.completeRun(active.runId);
-        active.settled = true;
+        if (active.generation !== generation) return;
+        const won = await this.completeRun(active, generation);
+        if (won) active.settled = true;
       })
       .catch(async (error: unknown) => {
-        await this.failRun(active.runId, 'agent_operation_failed', 'The Pi agent operation failed');
+        if (runAcceptance && !(await runAcceptance)) return;
+        if (active.generation !== generation) return;
+        const won = await this.finalizeRun(
+          active.agentId,
+          active.runId,
+          'failed',
+          { code: 'agent_operation_failed', message: 'The Pi agent operation failed' },
+          'supervisor.run_failed',
+        );
         this.logger.error('Pi agent operation failed', {
           agentId: active.agentId,
           runId: active.runId,
           error: sanitizeError(error),
         });
-        await this.enqueueCustomEvent(active.agentId, active.runId, 'supervisor.run_failed', {
-          code: 'agent_operation_failed',
-          message: 'The Pi agent operation failed',
-        });
-        active.settled = true;
-        await this.disposeActiveRun(active);
+        if (won) {
+          active.settled = true;
+          await this.disposeActiveRun(active);
+        }
       })
       .finally(async () => {
         if (runAcceptance && !(await runAcceptance)) await this.disposeActiveRun(active);
@@ -676,8 +1078,19 @@ export class ManagedAgentService {
 
   private enqueueSessionEvent(agentId: string, runId: string, rawEvent: unknown): void {
     void this.enqueueEventWork(agentId, async () => {
-      const event = normalizeSessionEvent(rawEvent);
-      await this.persistEvent(agentId, runId, event.type, event.payload);
+      const event = normalizeSessionEvent(rawEvent, this.eventPayloadLimits);
+      await this.persistEvent(
+        agentId,
+        runId,
+        event.truncated ? 'supervisor.event_truncated' : event.type,
+        event.truncated
+          ? {
+              originalType: event.type,
+              reason: event.truncated,
+              maxBytes: this.eventPayloadLimits.maxBytes,
+            }
+          : event.payload,
+      );
     });
   }
 
@@ -692,7 +1105,7 @@ export class ManagedAgentService {
     });
   }
 
-  private enqueueEventWork(agentId: string, work: () => Promise<void>): Promise<void> {
+  private enqueueEventWork<T>(agentId: string, work: () => Promise<T>): Promise<T> {
     const previous = this.eventTails.get(agentId) ?? Promise.resolve();
     const next = previous
       .catch(() => undefined)
@@ -705,7 +1118,11 @@ export class ManagedAgentService {
         throw error;
       });
     this.eventTails.set(agentId, next);
-    void next.catch(() => undefined);
+    void next
+      .finally(() => {
+        if (this.eventTails.get(agentId) === next) this.eventTails.delete(agentId);
+      })
+      .catch(() => undefined);
     return next;
   }
 
@@ -727,36 +1144,146 @@ export class ManagedAgentService {
           .where('id', '=', agentId)
           .executeTakeFirst();
         if (!row) throw new ManagedAgentNotFoundError(agentId);
-        const sequenceRow = await transaction
-          .selectFrom('supervisor_agent_events')
-          .select('sequence')
-          .where('agent_id', '=', agentId)
-          .orderBy('sequence', 'desc')
-          .limit(1)
-          .executeTakeFirst();
-        const event: ManagedAgentEvent = {
-          agentId,
-          runId,
-          sequence: (sequenceRow?.sequence ?? 0) + 1,
-          type: eventType,
-          payload,
-          createdAt: this.now(),
-        };
-        await transaction
-          .insertInto('supervisor_agent_events')
-          .values({
-            agent_id: agentId,
-            run_id: runId,
-            sequence: event.sequence,
-            event_type: event.type,
-            payload_json: encodeJson(event.payload),
-            created_at: event.createdAt,
-          })
-          .execute();
-        return event;
+        if (runId !== null) {
+          const run = await transaction
+            .selectFrom('supervisor_agent_runs')
+            .select('id')
+            .where('id', '=', runId)
+            .where('agent_id', '=', agentId)
+            .executeTakeFirst();
+          if (!run) throw new ManagedAgentRunNotFoundError(runId);
+        }
+        return this.insertEvent(transaction, agentId, runId, eventType, payload);
       }),
     );
     this.events.publish(persisted);
+  }
+
+  private async insertEvent(
+    transaction: Transaction<SupervisorDatabase>,
+    agentId: string,
+    runId: string | null,
+    eventType: string,
+    payload: JsonValue,
+  ): Promise<ManagedAgentEvent> {
+    const sequenceRow = await transaction
+      .selectFrom('supervisor_agent_events')
+      .select('sequence')
+      .where('agent_id', '=', agentId)
+      .orderBy('sequence', 'desc')
+      .limit(1)
+      .executeTakeFirst();
+    const event: ManagedAgentEvent = {
+      agentId,
+      runId,
+      sequence: (sequenceRow?.sequence ?? 0) + 1,
+      type: eventType,
+      payload,
+      createdAt: this.now(),
+    };
+    await transaction
+      .insertInto('supervisor_agent_events')
+      .values({
+        agent_id: agentId,
+        run_id: runId,
+        sequence: event.sequence,
+        event_type: event.type,
+        payload_json: encodeJson(event.payload),
+        created_at: event.createdAt,
+      })
+      .execute();
+    return event;
+  }
+
+  private async beginReceipt(
+    agentId: string,
+    commandType: 'create' | 'prompt' | 'abort' | 'run_create' | 'steer' | 'follow_up' | 'cancel',
+    idempotencyKey: string | undefined,
+    request: unknown,
+  ): Promise<{ id?: string; result?: unknown }> {
+    if (!idempotencyKey) return {};
+    const digest = requestDigest(request);
+    const id = this.idFactory();
+    const now = this.now();
+    try {
+      await this.db
+        .insertInto('supervisor_agent_command_receipts')
+        .values({
+          id,
+          idempotency_key: idempotencyKey,
+          agent_id: agentId,
+          command_type: commandType,
+          request_digest: digest,
+          status: 'pending',
+          result_json: null,
+          error_code: null,
+          error_message: null,
+          http_status: null,
+          created_at: now,
+          updated_at: now,
+          completed_at: null,
+        })
+        .execute();
+      return { id };
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) throw error;
+      const existing = await this.db
+        .selectFrom('supervisor_agent_command_receipts')
+        .selectAll()
+        .where('idempotency_key', '=', idempotencyKey)
+        .executeTakeFirst();
+      if (!existing || existing.request_digest !== digest) {
+        throw new ManagedAgentIdempotencyConflictError(idempotencyKey);
+      }
+      if (existing.status === 'pending') {
+        throw new ManagedAgentCommandInProgressError(idempotencyKey);
+      }
+      if (existing.status === 'succeeded' && existing.result_json) {
+        return { id: existing.id, result: decodeJson(existing.result_json) };
+      }
+      throw new ManagedAgentCommandReplayError(
+        existing.error_code ?? 'internal_error',
+        existing.error_message ?? 'The original command failed',
+      );
+    }
+  }
+
+  private async completeReceipt(receiptId: string, result: ManagedAgentRunResponse): Promise<void> {
+    const now = this.now();
+    await this.db
+      .updateTable('supervisor_agent_command_receipts')
+      .set({
+        status: 'succeeded',
+        result_json: encodeJson(JSON.parse(JSON.stringify(result)) as JsonValue),
+        updated_at: now,
+        completed_at: now,
+        http_status: 200,
+        error_code: null,
+        error_message: null,
+      })
+      .where('id', '=', receiptId)
+      .where('status', '=', 'pending')
+      .execute();
+  }
+
+  private async failReceipt(receiptId: string, error: unknown): Promise<void> {
+    const code = error instanceof Error && 'code' in error ? String(error.code) : 'internal_error';
+    const message = error instanceof Error ? error.message : 'The command failed';
+    const now = this.now();
+    await this.db
+      .updateTable('supervisor_agent_command_receipts')
+      .set({
+        status: 'failed',
+        result_json: null,
+        error_code: code,
+        error_message: message,
+        updated_at: now,
+        completed_at: now,
+        http_status: code === 'not_found' ? 404 : code === 'agent_busy' ? 409 : 500,
+      })
+      .where('id', '=', receiptId)
+      .where('status', '=', 'pending')
+      .execute();
   }
 
   private async requireActiveRun(
@@ -775,8 +1302,8 @@ export class ManagedAgentService {
     return active;
   }
 
-  private async markRunRunning(runId: string): Promise<void> {
-    await this.db
+  private async markRunRunning(runId: string): Promise<boolean> {
+    const result = await this.db
       .updateTable('supervisor_agent_runs')
       .set({
         status: 'running',
@@ -787,52 +1314,153 @@ export class ManagedAgentService {
       })
       .where('id', '=', runId)
       .where('status', '=', 'completed')
-      .execute();
+      .executeTakeFirst();
+    return Number(result.numUpdatedRows) > 0;
   }
 
   private async disposeActiveRun(active: ActiveRun): Promise<void> {
-    if (this.activeRuns.get(active.runId) !== active) return;
-    active.unsubscribe();
-    this.activeRuns.delete(active.runId);
-    await active.session.dispose();
+    if (active.disposePromise) return active.disposePromise;
+    active.disposePromise = (async () => {
+      if (this.activeRuns.get(active.runId) === active) {
+        if (!active.unsubscribed) {
+          active.unsubscribed = true;
+          active.unsubscribe();
+        }
+        this.activeRuns.delete(active.runId);
+      }
+      await this.withTimeout(
+        active.session.dispose(),
+        this.shutdownTimeoutMs,
+        `dispose session ${active.runId}`,
+      );
+    })();
+    return active.disposePromise;
   }
 
-  private findActiveRun(agentId: string): ActiveRun | undefined {
-    return [...this.activeRuns.values()].find(
-      (active) => active.agentId === agentId && !active.settled,
+  private async completeRun(active: ActiveRun, generation: number): Promise<boolean> {
+    if (active.generation !== generation) return false;
+    await this.waitForEvents(active.agentId);
+    return this.finalizeRun(
+      active.agentId,
+      active.runId,
+      'completed',
+      undefined,
+      'supervisor.run_completed',
     );
   }
 
-  private async completeRun(runId: string): Promise<void> {
-    await this.db
-      .updateTable('supervisor_agent_runs')
-      .set({ status: 'completed', completed_at: this.now() })
-      .where('id', '=', runId)
-      .where('status', 'in', ['queued', 'running'])
-      .execute();
-  }
-
-  private async failRun(runId: string, code: string, message: string): Promise<void> {
-    await this.markRunTerminal(runId, 'failed', { code, message });
-  }
-
-  private async markRunTerminal(
+  private async finalizeRunWithoutSession(
+    agentId: string,
     runId: string,
     status: Extract<ManagedAgentRunStatus, 'failed' | 'cancelled'>,
     error: { code: string; message: string },
+    eventType: string,
   ): Promise<boolean> {
-    const result = await this.db
-      .updateTable('supervisor_agent_runs')
-      .set({
-        status,
-        error_code: error.code,
-        error_message: error.message,
-        completed_at: this.now(),
-      })
-      .where('id', '=', runId)
-      .where('status', 'in', ['queued', 'running'])
-      .executeTakeFirst();
-    return Number(result.numUpdatedRows) > 0;
+    return this.finalizeRun(agentId, runId, status, error, eventType);
+  }
+
+  /**
+   * Compare-and-set the row and append the authoritative terminal event in
+   * one transaction. Callers must drain the session event tail first.
+   */
+  private async finalizeRun(
+    agentId: string,
+    runId: string,
+    status: Extract<ManagedAgentRunStatus, 'completed' | 'failed' | 'cancelled'>,
+    error: { code: string; message: string } | undefined,
+    eventType: string,
+  ): Promise<boolean> {
+    // Put the terminal transaction at the end of the same per-agent event
+    // fence. This makes observing the last SDK event a safe point: once the
+    // event tail is drained, status and the authoritative terminal event have
+    // committed together.
+    return this.enqueueEventWork(agentId, async () => {
+      const persisted = await withBusyRetry(() =>
+        this.db.transaction().execute(async (transaction) => {
+          const result = await transaction
+            .updateTable('supervisor_agent_runs')
+            .set({
+              status,
+              error_code: error?.code ?? null,
+              error_message: error?.message ?? null,
+              completed_at: this.now(),
+            })
+            .where('id', '=', runId)
+            .where('agent_id', '=', agentId)
+            .where('status', 'in', ['queued', 'running'])
+            .executeTakeFirst();
+          if (Number(result.numUpdatedRows) === 0) return undefined;
+          return this.insertEvent(
+            transaction,
+            agentId,
+            runId,
+            eventType,
+            error ? { code: error.code, message: error.message } : {},
+          );
+        }),
+      );
+      if (persisted) this.events.publish(persisted);
+      return persisted !== undefined;
+    });
+  }
+
+  private assertMutable(): void {
+    if (this.closed) throw new Error('managed_agent_service_closed');
+  }
+
+  private async tryAbort(active: ActiveRun, reason: string): Promise<void> {
+    try {
+      await this.withTimeout(
+        active.session.abort(),
+        this.operationTimeoutMs,
+        `abort ${active.runId}`,
+      );
+    } catch (error) {
+      this.logger.warn('Pi session did not abort cleanly', {
+        agentId: active.agentId,
+        runId: active.runId,
+        reason,
+        error: sanitizeError(error),
+      });
+    }
+  }
+
+  private async waitForOperations(active: ActiveRun, reason: string): Promise<void> {
+    try {
+      await this.withTimeout(
+        Promise.allSettled([...active.operations]).then(() => undefined),
+        this.operationTimeoutMs,
+        `operations for ${active.runId}`,
+      );
+    } catch (error) {
+      this.logger.warn('Pi session operations did not stop cleanly', {
+        agentId: active.agentId,
+        runId: active.runId,
+        reason,
+        error: sanitizeError(error),
+      });
+    }
+  }
+
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    description: string,
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`timeout waiting for ${description}`)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private async requireRun(runId: string): Promise<ManagedAgentRunResponse> {
@@ -847,6 +1475,14 @@ export class ManagedAgentService {
       .selectAll()
       .where('id', '=', runId)
       .executeTakeFirst();
+  }
+
+  private toRunAttachment(row: AgentRunAttachmentRow): AgentImageAttachment {
+    return AgentImageAttachmentSchema.parse({
+      name: row.name,
+      mimeType: row.mime_type,
+      data: row.data,
+    });
   }
 
   private toRunResponse(row: AgentRunRow): ManagedAgentRunResponse {
@@ -882,6 +1518,7 @@ export class ManagedAgentService {
       .selectFrom('supervisor_agents')
       .selectAll()
       .where('id', '=', agentId)
+      .where('deleted_at', 'is', null)
       .executeTakeFirst();
   }
 
@@ -909,6 +1546,12 @@ export class ManagedAgentService {
     return this.legacyAgentStatusColumn;
   }
 
+  private async serializeRunCommand<T>(runId: string, command: () => Promise<T>): Promise<T> {
+    const row = await this.getRunRow(runId);
+    if (!row) throw new ManagedAgentRunNotFoundError(runId);
+    return this.serializeCommand(`agent:${row.agent_id}`, command);
+  }
+
   private async serializeCommand<T>(key: string, command: () => Promise<T>): Promise<T> {
     const previous = this.commandTails.get(key) ?? Promise.resolve();
     let release: () => void = () => undefined;
@@ -925,6 +1568,29 @@ export class ManagedAgentService {
       if (this.commandTails.get(key) === current) this.commandTails.delete(key);
     }
   }
+}
+
+function toPiImages(attachments: AgentImageAttachment[] | undefined): PiImageContent[] | undefined {
+  if (!attachments || attachments.length === 0) return undefined;
+  return attachments.map((attachment) => ({
+    type: 'image' as const,
+    data: attachment.data,
+    mimeType: attachment.mimeType,
+  }));
+}
+
+function promptSession(
+  session: ManagedPiSession,
+  message: string,
+  attachments?: AgentImageAttachment[],
+  preflightResult?: (success: boolean) => void,
+): Promise<void> {
+  const options: Parameters<ManagedPiSession['prompt']>[1] = {
+    ...(preflightResult ? { preflightResult } : {}),
+  };
+  const images = toPiImages(attachments);
+  if (images) options.images = images;
+  return session.prompt(message, options);
 }
 
 function createSessionOptions(
@@ -976,21 +1642,57 @@ function decodeTools(value: string | null): AgentToolName[] | null {
   return decodeJson(value) as AgentToolName[];
 }
 
-function normalizeSessionEvent(rawEvent: unknown): { type: string; payload: JsonValue } {
+function normalizeSessionEvent(
+  rawEvent: unknown,
+  limits: EventPayloadLimits,
+): { type: string; payload: JsonValue; truncated?: string } {
+  const state: PayloadState = { items: 0, truncated: undefined };
   if (typeof rawEvent !== 'object' || rawEvent === null || Array.isArray(rawEvent)) {
-    return { type: 'unknown', payload: toJsonValue(rawEvent) };
+    const payload = toJsonValue(rawEvent, state, limits, new WeakSet<object>(), 0);
+    return {
+      type: 'unknown',
+      payload,
+      ...(state.truncated ? { truncated: state.truncated } : {}),
+    };
   }
   const record = rawEvent as Record<string, unknown>;
   const type = typeof record.type === 'string' && record.type.length > 0 ? record.type : 'unknown';
   const payload: Record<string, JsonValue> = {};
   for (const [key, value] of Object.entries(record)) {
-    if (key !== 'type') payload[key] = toJsonValue(value);
+    if (key !== 'type') payload[key] = toJsonValue(value, state, limits, new WeakSet<object>(), 0);
   }
-  return { type, payload };
+  const encoded = JSON.stringify(payload);
+  if (Buffer.byteLength(encoded, 'utf8') > limits.maxBytes) state.truncated ??= 'payload_bytes';
+  return { type, payload, ...(state.truncated ? { truncated: state.truncated } : {}) };
 }
 
-function toJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+interface PayloadState {
+  items: number;
+  truncated: string | undefined;
+}
+
+function toJsonValue(
+  value: unknown,
+  state: PayloadState,
+  limits: EventPayloadLimits,
+  seen: WeakSet<object>,
+  depth: number,
+): JsonValue {
+  if (state.items >= limits.maxItems) {
+    state.truncated ??= 'payload_items';
+    return '[truncated]';
+  }
+  state.items += 1;
+  if (depth > limits.maxDepth) {
+    state.truncated ??= 'payload_depth';
+    return '[truncated]';
+  }
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (Buffer.byteLength(value, 'utf8') <= limits.maxBytes) return value;
+    state.truncated ??= 'payload_bytes';
+    return `${value.slice(0, Math.max(0, limits.maxBytes / 4))}…[truncated]`;
+  }
   if (typeof value === 'number') return Number.isFinite(value) ? value : String(value);
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'undefined' || typeof value === 'function' || typeof value === 'symbol') {
@@ -1000,15 +1702,43 @@ function toJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue {
   if (value instanceof Error) return sanitizeError(value);
   if (seen.has(value)) return '[Circular]';
   seen.add(value);
-  if (Array.isArray(value)) return value.map((entry) => toJsonValue(entry, seen));
+  if (Array.isArray(value)) {
+    return value.map((entry) => toJsonValue(entry, state, limits, seen, depth + 1));
+  }
   const result: Record<string, JsonValue> = {};
-  for (const [key, entry] of Object.entries(value)) result[key] = toJsonValue(entry, seen);
+  for (const [key, entry] of Object.entries(value)) {
+    result[key] = toJsonValue(entry, state, limits, seen, depth + 1);
+  }
   return result;
 }
 
 function sanitizeError(error: unknown): { name: string; message: string } {
   if (error instanceof Error) return { name: error.name, message: error.message.slice(0, 500) };
   return { name: 'UnknownError', message: 'Unknown error' };
+}
+
+function requestDigest(request: unknown): string {
+  return createHash('sha256').update(stableJson(request)).digest('hex');
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(',')}}`;
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    (typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      String((error as { code?: unknown }).code).startsWith('SQLITE_CONSTRAINT')) ||
+    (error instanceof Error && /unique constraint|UNIQUE constraint/i.test(error.message))
+  );
 }
 
 function commandError(agentId: string, error: unknown): ManagedAgentNotAvailableError {

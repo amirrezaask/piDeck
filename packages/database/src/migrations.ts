@@ -9,6 +9,9 @@ import { supervisorAgentRunsMigration } from '../migrations/006_supervisor_agent
 import { supervisorAgentDefinitionRuntimeSplitMigration } from '../migrations/007_supervisor_agent_definition_runtime_split';
 import { supervisorRunConfigurationMigration } from '../migrations/008_supervisor_run_configuration';
 import { supervisorProjectsMigration } from '../migrations/009_supervisor_projects';
+import { supervisorRunAdmissionAndProfilesMigration } from '../migrations/010_supervisor_run_admission_and_profiles';
+import { supervisorCommandReceiptTypesMigration } from '../migrations/011_supervisor_command_receipt_types';
+import { supervisorAgentRunAttachmentsMigration } from '../migrations/012_supervisor_agent_run_attachments';
 import type { MigrationDatabase } from './schema';
 
 const migrations: Record<string, Migration> = {
@@ -21,6 +24,9 @@ const migrations: Record<string, Migration> = {
   '007_supervisor_agent_definition_runtime_split': supervisorAgentDefinitionRuntimeSplitMigration,
   '008_supervisor_run_configuration': supervisorRunConfigurationMigration,
   '009_supervisor_projects': supervisorProjectsMigration,
+  '010_supervisor_run_admission_and_profiles': supervisorRunAdmissionAndProfilesMigration,
+  '011_supervisor_command_receipt_types': supervisorCommandReceiptTypesMigration,
+  '012_supervisor_agent_run_attachments': supervisorAgentRunAttachmentsMigration,
 };
 
 const provider: MigrationProvider = {

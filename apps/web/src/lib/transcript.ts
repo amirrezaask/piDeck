@@ -13,6 +13,7 @@ export type TranscriptEvent =
       shimmer?: boolean;
       toolCall?: boolean;
       toolArguments?: JsonValue;
+      filePath?: string;
       createdAt: string;
       sequence: number;
     }
@@ -67,6 +68,24 @@ export function mapPiEvents(events: readonly ManagedAgentEvent[]): TranscriptIte
   const ordered = [...new Map(events.map((event) => [event.sequence, event])).values()].sort(
     (left, right) => left.sequence - right.sequence,
   );
+  const completedToolStarts = new Set<number>();
+  const activeToolStarts = new Map<string, number[]>();
+  for (const event of ordered) {
+    const payload = asRecord(event.payload);
+    const toolName = typeof payload.toolName === 'string' ? payload.toolName : 'tool';
+    if (event.type === 'tool_execution_start') {
+      const starts = activeToolStarts.get(toolName) ?? [];
+      starts.push(event.sequence);
+      activeToolStarts.set(toolName, starts);
+      continue;
+    }
+    if (event.type !== 'tool_execution_end') continue;
+
+    const startSequence = activeToolStarts.get(toolName)?.shift();
+    if (startSequence !== undefined && payload.isError !== true) {
+      completedToolStarts.add(startSequence);
+    }
+  }
 
   for (const event of ordered) {
     const payload = asRecord(event.payload);
@@ -92,7 +111,7 @@ export function mapPiEvents(events: readonly ManagedAgentEvent[]): TranscriptIte
       continue;
     }
 
-    const mapped = mapEvent(event, payload);
+    const mapped = mapEvent(event, payload, completedToolStarts.has(event.sequence));
     if (mapped) items.push(mapped);
   }
 
@@ -104,8 +123,7 @@ function groupConsecutiveEvents(items: readonly TranscriptItem[]): TranscriptIte
   let pending: TranscriptEvent[] = [];
 
   const flush = () => {
-    if (pending.length === 1) grouped.push(pending[0]);
-    else if (pending.length > 1) {
+    if (pending.length > 0) {
       grouped.push({
         kind: 'event-group',
         id: `event-group-${pending[0].sequence}`,
@@ -158,6 +176,7 @@ function thinkingMarker(base: {
 function mapEvent(
   event: ManagedAgentEvent,
   payload: Record<string, JsonValue>,
+  toolCompleted = false,
 ):
   | TranscriptEvent
   | { kind: 'user'; id: string; content: string; createdAt: string; sequence: number }
@@ -193,24 +212,28 @@ function mapEvent(
 
   if (event.type === 'tool_execution_start') {
     const toolArguments = payload.args !== undefined ? payload.args : payload.arguments;
+    const filePath = extractFilePath(toolName, toolArguments);
 
     return {
       ...base,
       kind: 'marker',
-      label: `Running ${toolName ?? 'tool'}`,
-      tone: 'active',
-      variant: 'default',
-      shimmer: true,
+      label: toolCompleted ? `Ran ${toolName ?? 'tool'}` : `Running ${toolName ?? 'tool'}`,
+      tone: toolCompleted ? 'success' : 'active',
+      variant: toolCompleted ? 'border' : 'default',
+      shimmer: !toolCompleted,
       toolCall: true,
       toolArguments,
+      ...(filePath ? { filePath } : {}),
     };
   }
   if (event.type === 'tool_execution_end') {
+    if (payload.isError !== true) return undefined;
+
     return {
       ...base,
       kind: 'marker',
-      label: `${toolName ?? 'Tool'} ${payload.isError === true ? 'failed' : 'finished'}`,
-      tone: payload.isError === true ? 'neutral' : 'success',
+      label: `${toolName ?? 'Tool'} failed`,
+      tone: 'neutral',
       variant: 'border',
     };
   }
@@ -224,6 +247,9 @@ function mapEvent(
     };
   }
 
+  // The run status already communicates successful completion; avoid duplicating it in the transcript.
+  if (event.type === 'supervisor.run_completed') return undefined;
+
   return {
     ...base,
     kind: 'marker',
@@ -232,6 +258,21 @@ function mapEvent(
     tone: 'neutral',
     variant: 'default',
   };
+}
+
+function extractFilePath(
+  toolName: string | undefined,
+  value: JsonValue | undefined,
+): string | undefined {
+  if (!toolName || !['read', 'edit', 'write'].includes(toolName)) return undefined;
+
+  const argumentsRecord = asRecord(value);
+  for (const key of ['path', 'filePath', 'fileName', 'filename', 'file']) {
+    const candidate = argumentsRecord[key];
+    if (typeof candidate === 'string' && candidate.trim()) return candidate;
+  }
+
+  return undefined;
 }
 
 function asRecord(value: JsonValue | undefined): Record<string, JsonValue> {

@@ -14,6 +14,12 @@ import type {
 } from '@nextflow/contracts';
 import { resolveWorkingDirectory } from './working-directory.js';
 
+export interface PiImageContent {
+  readonly type: 'image';
+  readonly data: string;
+  readonly mimeType: string;
+}
+
 export interface ManagedPiSession {
   readonly sessionId: string;
   readonly sessionFile: string | undefined;
@@ -27,10 +33,11 @@ export interface ManagedPiSession {
     options?: {
       streamingBehavior?: 'steer' | 'followUp';
       preflightResult?: (success: boolean) => void;
+      images?: PiImageContent[];
     },
   ): Promise<void>;
-  steer(message: string): Promise<void>;
-  followUp(message: string): Promise<void>;
+  steer(message: string, images?: PiImageContent[]): Promise<void>;
+  followUp(message: string, images?: PiImageContent[]): Promise<void>;
   abort(): Promise<void>;
   subscribe(listener: (event: unknown) => void): () => void;
   dispose(): Promise<void>;
@@ -91,17 +98,18 @@ class SdkManagedPiSession implements ManagedPiSession {
     options?: {
       streamingBehavior?: 'steer' | 'followUp';
       preflightResult?: (success: boolean) => void;
+      images?: PiImageContent[];
     },
   ): Promise<void> {
     await this.session.prompt(prompt, options);
   }
 
-  async steer(message: string): Promise<void> {
-    await this.session.steer(message);
+  async steer(message: string, images?: PiImageContent[]): Promise<void> {
+    await this.session.steer(message, images);
   }
 
-  async followUp(message: string): Promise<void> {
-    await this.session.followUp(message);
+  async followUp(message: string, images?: PiImageContent[]): Promise<void> {
+    await this.session.followUp(message, images);
   }
 
   async abort(): Promise<void> {

@@ -1,5 +1,9 @@
 export {
+  type EventPayloadLimits,
   ManagedAgentBusyError,
+  ManagedAgentCommandInProgressError,
+  ManagedAgentCommandReplayError,
+  ManagedAgentIdempotencyConflictError,
   ManagedAgentNotAvailableError,
   ManagedAgentNotFoundError,
   ManagedAgentRunNotCancellableError,
@@ -13,8 +17,17 @@ export {
   type SupervisorAppOptions,
 } from './app.js';
 export {
+  type PiExtensionCatalog,
+  PiExtensionNotConfiguredError,
+  type PiExtensionPackageManager,
+  type PiExtensionPackageUpdate,
+  PiExtensionService,
+  type PiExtensionServiceOptions,
+} from './extensions.js';
+export {
   type CreatePiSessionOptions,
   type ManagedPiSession,
+  type PiImageContent,
   type PiSessionFactory,
   SdkPiSessionFactory,
   type SdkPiSessionFactoryOptions,

@@ -27,9 +27,9 @@ The product connects to local or remote PI supervisors. A developer may have man
 - Connect to and anticipate multiple remote supervisors as well as local operation.
 - Stream live agent and run events.
 - Present large fleets and nested agentic workflows without assuming a single-chat layout.
-- First-class interventions include approving or denying requests, pausing or resuming execution, and cancellation.
+- Current first-class interventions are cancellation, immediate steering while a run streams, and queued follow-up for a completed run. Approval and pause/resume are not implemented controls and must be represented as unavailable rather than simulated.
 - The current stack is React, TypeScript, Vite, Tailwind CSS, and shadcn/ui.
-- Current supervisor APIs expose managed agents and runs, event streams, cancellation, steering, and follow-up. Approval and pause/resume are confirmed product requirements even where backend support remains to be completed.
+- Current supervisor APIs expose managed agents and runs, bounded event history, authenticated resumable event streams, cancellation, steering, and follow-up. Image attachments are sent through Pi’s image input; unsupported arbitrary files are rejected before submission.
 - Authentication, collaboration, mobile operation, and deployment topology remain open decisions.
 
 ## Brand Commitments
@@ -49,6 +49,7 @@ The product name is piDeck. Product language should be direct, technical, and op
 - Attention is prioritized; raw activity is available on demand.
 - Every intervention shows its target, consequence, and acknowledgement.
 - Live state must remain trustworthy under reconnects, delayed events, and partial supervisor failure.
+- Durable run/event history is authoritative over a chat view; the next architecture direction remains fleet state before an individual conversation.
 - Dense information should support expert scanning without becoming decorative telemetry.
 
 ## Accessibility & Inclusion

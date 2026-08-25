@@ -6,6 +6,8 @@ import {
   type ManagedProjectListQuery,
   type ManagedProjectResponse,
   ManagedProjectResponseSchema,
+  type UpdateManagedProjectRequest,
+  UpdateManagedProjectRequestSchema,
 } from '@nextflow/contracts';
 import {
   createId,
@@ -25,15 +27,31 @@ export interface ProjectServiceOptions {
 type ProjectRow = Selectable<SupervisorProjectsTable>;
 
 /** Persists the operator's reusable working directories independently of agents. */
+export class ProjectPathConflictError extends Error {
+  readonly path: string;
+
+  constructor(path: string) {
+    super(`A project is already saved for ${path}`);
+    this.name = 'ProjectPathConflictError';
+    this.path = path;
+  }
+}
+
 export class ProjectService {
   private readonly db: Kysely<SupervisorDatabase>;
   private readonly now: () => string;
   private readonly idFactory: () => string;
+  private legacyImport?: Promise<void>;
 
   constructor(options: ProjectServiceOptions) {
     this.db = options.db;
     this.now = options.now ?? nowIso;
     this.idFactory = options.idFactory ?? createId;
+  }
+
+  async initialize(): Promise<void> {
+    this.legacyImport ??= this.importLegacyPaths();
+    await this.legacyImport;
   }
 
   async createProject(input: CreateManagedProjectRequest): Promise<ManagedProjectResponse> {
@@ -47,6 +65,48 @@ export class ProjectService {
     const normalizedPath = normalizePath(path);
     await assertWorkingDirectory(normalizedPath);
     return this.upsertProject(normalizedPath);
+  }
+
+  async updateProject(
+    projectId: string,
+    input: UpdateManagedProjectRequest,
+  ): Promise<ManagedProjectResponse | null> {
+    const request = UpdateManagedProjectRequestSchema.parse(input);
+    const existing = await this.db
+      .selectFrom('supervisor_projects')
+      .selectAll()
+      .where('id', '=', projectId)
+      .executeTakeFirst();
+    if (!existing) return null;
+
+    const path = request.path === undefined ? existing.path : normalizePath(request.path);
+    if (request.path !== undefined) await assertWorkingDirectory(path);
+
+    const conflicting = await this.db
+      .selectFrom('supervisor_projects')
+      .select('id')
+      .where('path', '=', path)
+      .where('id', '!=', projectId)
+      .executeTakeFirst();
+    if (conflicting) throw new ProjectPathConflictError(path);
+
+    await this.db
+      .updateTable('supervisor_projects')
+      .set({
+        ...(request.name === undefined ? {} : { name: request.name }),
+        ...(request.path === undefined ? {} : { path }),
+        updated_at: this.now(),
+      })
+      .where('id', '=', projectId)
+      .execute();
+
+    const updated = await this.db
+      .selectFrom('supervisor_projects')
+      .selectAll()
+      .where('id', '=', projectId)
+      .executeTakeFirst();
+    if (!updated) throw new Error('project_update_missing');
+    return this.toResponse(updated);
   }
 
   async deleteProject(projectId: string): Promise<ManagedProjectResponse | null> {
@@ -65,8 +125,6 @@ export class ProjectService {
     projects: ManagedProjectResponse[];
     nextCursor: string | null;
   }> {
-    await this.importLegacyPaths();
-
     let query = this.db.selectFrom('supervisor_projects').selectAll();
     if (options.cursor) {
       const cursor = decodeCursor(options.cursor);
@@ -103,26 +161,7 @@ export class ProjectService {
     path: string,
     requestedName?: string,
   ): Promise<ManagedProjectResponse> {
-    const existing = await this.db
-      .selectFrom('supervisor_projects')
-      .selectAll()
-      .where('path', '=', path)
-      .executeTakeFirst();
     const now = this.now();
-
-    if (existing) {
-      await this.db
-        .updateTable('supervisor_projects')
-        .set({
-          ...(requestedName ? { name: requestedName } : {}),
-          updated_at: now,
-          last_used_at: now,
-        })
-        .where('id', '=', existing.id)
-        .execute();
-      return this.requireProject(existing.id);
-    }
-
     const id = this.idFactory();
     await this.db
       .insertInto('supervisor_projects')
@@ -134,48 +173,48 @@ export class ProjectService {
         updated_at: now,
         last_used_at: now,
       })
+      .onConflict((conflict) =>
+        conflict.column('path').doUpdateSet({
+          ...(requestedName ? { name: requestedName } : {}),
+          updated_at: now,
+          last_used_at: now,
+        }),
+      )
       .execute();
-    return this.requireProject(id);
+
+    const project = await this.db
+      .selectFrom('supervisor_projects')
+      .selectAll()
+      .where('path', '=', path)
+      .executeTakeFirst();
+    if (!project) throw new Error('project_insert_missing');
+    return this.toResponse(project);
   }
 
   /** Keep projects created before this table existed visible after upgrading. */
   private async importLegacyPaths(): Promise<void> {
-    const [agents, runs] = await Promise.all([
-      this.db.selectFrom('supervisor_agents').select('cwd').execute(),
-      this.db.selectFrom('supervisor_agent_runs').select('cwd').execute(),
-    ]);
-    const paths = new Set([...agents, ...runs].map((row) => normalizePath(row.cwd)));
-    for (const path of paths) {
-      const existing = await this.db
-        .selectFrom('supervisor_projects')
-        .select('id')
-        .where('path', '=', path)
-        .executeTakeFirst();
-      if (existing) continue;
-
+    await this.db.transaction().execute(async (transaction) => {
+      const [agents, runs] = await Promise.all([
+        transaction.selectFrom('supervisor_agents').select('cwd').execute(),
+        transaction.selectFrom('supervisor_agent_runs').select('cwd').execute(),
+      ]);
+      const paths = new Set([...agents, ...runs].map((row) => normalizePath(row.cwd)));
       const now = this.now();
-      await this.db
-        .insertInto('supervisor_projects')
-        .values({
-          id: this.idFactory(),
-          name: projectName(path),
-          path,
-          created_at: now,
-          updated_at: now,
-          last_used_at: now,
-        })
-        .execute();
-    }
-  }
-
-  private async requireProject(id: string): Promise<ManagedProjectResponse> {
-    const row = await this.db
-      .selectFrom('supervisor_projects')
-      .selectAll()
-      .where('id', '=', id)
-      .executeTakeFirst();
-    if (!row) throw new Error('project_insert_missing');
-    return this.toResponse(row);
+      for (const path of paths) {
+        await transaction
+          .insertInto('supervisor_projects')
+          .values({
+            id: this.idFactory(),
+            name: projectName(path),
+            path,
+            created_at: now,
+            updated_at: now,
+            last_used_at: now,
+          })
+          .onConflict((conflict) => conflict.column('path').doNothing())
+          .execute();
+      }
+    });
   }
 
   private toResponse(row: ProjectRow): ManagedProjectResponse {

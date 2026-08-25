@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildSupervisorApp } from '../src/app';
+import { buildSupervisorApp } from '../app';
 
 describe('Supervisor shell', () => {
   it('exposes a health endpoint without owning workflow tables', async () => {

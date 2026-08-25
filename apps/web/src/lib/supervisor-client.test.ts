@@ -40,7 +40,7 @@ class FakeWebSocket {
         data: JSON.stringify({
           agentId,
           runId: null,
-          sequence: 1,
+          sequence: 8,
           type: 'agent_start',
           payload: {},
           createdAt: timestamp,
@@ -54,8 +54,50 @@ class FakeWebSocket {
   }
 }
 
+class ScriptedWebSocket {
+  static scripts: Array<(socket: ScriptedWebSocket) => void> = [];
+  static created = 0;
+  readonly url: string;
+  readonly readyState = 1;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+
+  constructor(url: string) {
+    this.url = url;
+    const script = ScriptedWebSocket.scripts[ScriptedWebSocket.created++];
+    queueMicrotask(() => {
+      this.onopen?.();
+      script?.(this);
+    });
+  }
+
+  emit(sequence: number): void {
+    this.onmessage?.({
+      data: JSON.stringify({
+        agentId,
+        runId: null,
+        sequence,
+        type: 'agent_start',
+        payload: {},
+        createdAt: timestamp,
+      }),
+    });
+  }
+
+  close(): void {
+    this.onclose?.();
+  }
+}
+
 describe('SupervisorClient', () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    ScriptedWebSocket.scripts = [];
+    ScriptedWebSocket.created = 0;
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
 
   it('uses the configured model name when an agent inherits the default', () => {
     const models = {
@@ -126,6 +168,47 @@ describe('SupervisorClient', () => {
     ]);
   });
 
+  it('loads persisted run attachments', async () => {
+    const response = {
+      attachments: [
+        {
+          name: 'screen.png',
+          mimeType: 'image/png',
+          data: 'aW1hZ2UgYnl0ZXM=',
+        },
+      ],
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(response));
+    const client = new SupervisorClient({ baseUrl: '/supervisor-api', fetcher });
+
+    await expect(client.listRunAttachments('run-123')).resolves.toEqual(response);
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/supervisor-api/v1/runs/run-123/attachments');
+  });
+
+  it('updates a project by id', async () => {
+    const project = {
+      id: '018bcfe4-7a4b-7000-8000-000000000333',
+      name: 'Renamed workspace',
+      path: '/workspace-renamed',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastUsedAt: timestamp,
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(project));
+    const client = new SupervisorClient({ baseUrl: '/supervisor-api', fetcher });
+
+    await expect(
+      client.updateProject(project.id, { name: project.name, path: project.path }),
+    ).resolves.toEqual(project);
+    expect(fetcher).toHaveBeenCalledWith(
+      `/supervisor-api/v1/projects/${project.id}`,
+      expect.objectContaining({
+        method: 'PATCH',
+        body: JSON.stringify({ name: project.name, path: project.path }),
+      }),
+    );
+  });
+
   it('deletes a project by id', async () => {
     const project = {
       id: '018bcfe4-7a4b-7000-8000-000000000333',
@@ -158,6 +241,46 @@ describe('SupervisorClient', () => {
     expect(fetcher.mock.calls[0]?.[1]).toEqual(
       expect.objectContaining({
         headers: expect.objectContaining({ Accept: 'application/json' }),
+      }),
+    );
+  });
+
+  it('lists extensions and updates one configured package', async () => {
+    const response = {
+      extensions: [
+        {
+          id: 'npm:pi-tools:/pi-tools/index.ts',
+          name: 'pi-tools',
+          description: 'Useful Pi tools.',
+          path: '/pi-tools/index.ts',
+          relativePath: 'index.ts',
+          source: 'npm:pi-tools',
+          packageName: 'pi-tools',
+          scope: 'user',
+          origin: 'package',
+          enabled: true,
+          version: '1.0.0',
+          status: 'up_to_date',
+        },
+      ],
+      cwd: '/workspace',
+      checkedAt: timestamp,
+      updateCheckError: null,
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(response))
+      .mockResolvedValueOnce(jsonResponse(response));
+    const client = new SupervisorClient({ baseUrl: '/supervisor-api', fetcher });
+
+    await expect(client.listExtensions()).resolves.toEqual(response);
+    await expect(client.updateExtensions('npm:pi-tools')).resolves.toEqual(response);
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/supervisor-api/v1/extensions');
+    expect(fetcher.mock.calls[1]?.[0]).toBe('/supervisor-api/v1/extensions/update');
+    expect(fetcher.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ source: 'npm:pi-tools' }),
       }),
     );
   });
@@ -269,6 +392,62 @@ describe('SupervisorClient', () => {
     await expect(client.getAgent(agentId)).rejects.toThrow();
   });
 
+  it('reconnects, deduplicates replay, and resumes from the last delivered sequence', async () => {
+    ScriptedWebSocket.scripts = [
+      (socket) => {
+        socket.emit(1);
+        socket.onclose?.();
+      },
+      (socket) => {
+        socket.emit(1);
+        socket.emit(2);
+      },
+    ];
+    const states: string[] = [];
+    const events: number[] = [];
+    const controller = new AbortController();
+    const client = new SupervisorClient({
+      webSocketFactory: ScriptedWebSocket as unknown as typeof WebSocket,
+    });
+    for await (const event of client.streamEvents(agentId, {
+      signal: controller.signal,
+      onConnectionState: (state) => states.push(state),
+    })) {
+      events.push(event.sequence);
+      if (events.length === 2) controller.abort();
+    }
+    expect(events).toEqual([1, 2]);
+    expect(states).toContain('reconnecting');
+    expect(states).toContain('connected');
+  });
+
+  it('surfaces missing sequences instead of hiding a replay gap', async () => {
+    ScriptedWebSocket.scripts = [
+      (socket) => {
+        socket.emit(1);
+        socket.emit(3);
+      },
+    ];
+    const client = new SupervisorClient({
+      webSocketFactory: ScriptedWebSocket as unknown as typeof WebSocket,
+    });
+    const consume = async () => {
+      for await (const _event of client.streamEvents(agentId, { maxReconnectAttempts: 0 })) {
+        // The second frame must reject the stream.
+      }
+    };
+    await expect(consume()).rejects.toThrow(/sequence gap/);
+  });
+
+  it('fails after capped reconnect attempts and supports cancellation while backing off', async () => {
+    ScriptedWebSocket.scripts = [(socket) => socket.onclose?.(), (socket) => socket.onclose?.()];
+    const client = new SupervisorClient({
+      webSocketFactory: ScriptedWebSocket as unknown as typeof WebSocket,
+    });
+    const iterator = client.streamEvents(agentId, { maxReconnectAttempts: 1 });
+    await expect(iterator.next()).rejects.toThrow(/reconnect limit/);
+  });
+
   it('streams JSON event frames over WebSocket after the requested sequence', async () => {
     const client = new SupervisorClient({
       baseUrl: '/supervisor-api',
@@ -276,12 +455,17 @@ describe('SupervisorClient', () => {
     });
 
     const events = [];
-    for await (const event of client.streamEvents(agentId, { afterSequence: 7 })) {
+    const controller = new AbortController();
+    for await (const event of client.streamEvents(agentId, {
+      afterSequence: 7,
+      reconnect: false,
+      signal: controller.signal,
+    })) {
       events.push(event);
-      FakeWebSocket.last?.onclose?.();
+      controller.abort();
     }
 
-    expect(events.map((event) => [event.sequence, event.type])).toEqual([[1, 'agent_start']]);
+    expect(events.map((event) => [event.sequence, event.type])).toEqual([[8, 'agent_start']]);
     expect(FakeWebSocket.last?.url).toBe(
       `ws://localhost:3000/supervisor-api/v1/agents/${agentId}/stream?afterSequence=7`,
     );

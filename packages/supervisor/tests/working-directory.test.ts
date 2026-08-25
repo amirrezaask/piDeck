@@ -7,7 +7,7 @@ import {
   assertWorkingDirectory,
   type InvalidWorkingDirectoryError,
   resolveWorkingDirectory,
-} from '../src/working-directory';
+} from '../working-directory';
 
 describe('working-directory helpers', () => {
   it('expands home-relative paths before resolving them', () => {

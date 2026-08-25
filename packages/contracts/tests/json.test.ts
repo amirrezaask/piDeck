@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { decodeJson, encodeJson } from '../src/json';
+import { decodeJson, encodeJson } from '../index';
 
 describe('JSON contracts', () => {
   it('round-trips validated JSON values', () => {

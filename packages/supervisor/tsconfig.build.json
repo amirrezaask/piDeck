@@ -1,8 +1,18 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "rootDir": "src",
+    "rootDir": ".",
     "outDir": "dist"
   },
-  "include": ["src"]
+  "include": [
+    "index.ts",
+    "app.ts",
+    "agent-service.ts",
+    "extensions.ts",
+    "pi-session.ts",
+    "project-service.ts",
+    "service.ts",
+    "working-directory.ts",
+    "src"
+  ]
 }

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { ManagedAgentResponse } from '@nextflow/contracts';
 import { createMigrationDatabase, migrateToLatest } from '@nextflow/database';
 import { describe, expect, it } from 'vitest';
-import { buildSupervisorApp } from '../src/app';
+import { buildSupervisorApp } from '../app';
 import { FakePiSessionFactory } from './fake-pi-session';
 
 async function withAgentApp<T>(
@@ -25,6 +25,7 @@ async function withAgentApp<T>(
   const app = buildSupervisorApp({
     databasePath: filename,
     ...options,
+    ...(options.serviceToken ? {} : { allowUnauthenticatedLoopback: true }),
     piSessionFactory: factory,
   });
   try {
@@ -143,12 +144,37 @@ describe('Supervisor managed-agent HTTP API', () => {
       const runResponse = await server.inject({
         method: 'POST',
         url: '/v1/runs',
-        payload: { agentId: created.id, prompt: 'Review the pipeline.' },
+        payload: {
+          agentId: created.id,
+          prompt: 'Review the pipeline.',
+          attachments: [
+            {
+              name: 'pipeline.png',
+              mimeType: 'image/png',
+              data: 'aW1hZ2U=',
+            },
+          ],
+        },
       });
       expect(runResponse.statusCode).toBe(202);
       const run = runResponse.json<{ id: string; status: string }>();
       expect(run.status).toBe('running');
       expect(factory.requests).toHaveLength(1);
+
+      const attachments = await server.inject({
+        method: 'GET',
+        url: `/v1/runs/${run.id}/attachments`,
+      });
+      expect(attachments.statusCode).toBe(200);
+      expect(attachments.json()).toEqual({
+        attachments: [
+          {
+            name: 'pipeline.png',
+            mimeType: 'image/png',
+            data: 'aW1hZ2U=',
+          },
+        ],
+      });
 
       const runEvents = await server.inject({
         method: 'GET',
@@ -180,6 +206,51 @@ describe('Supervisor managed-agent HTTP API', () => {
       expect(
         (await server.inject({ method: 'GET', url: `/v1/agents/${created.id}` })).json(),
       ).not.toHaveProperty('status');
+    });
+  });
+
+  it('replays idempotent run and intervention acknowledgements without repeating work', async () => {
+    await withAgentApp(async ({ server, factory, directory }) => {
+      const created = await server.inject({
+        method: 'POST',
+        url: '/v1/agents',
+        payload: { ...createPayload, cwd: directory },
+      });
+      const agent = created.json<{ id: string }>();
+      const body = { agentId: agent.id, prompt: 'Retry safely.', idempotencyKey: 'run-retry-1' };
+      const first = await server.inject({ method: 'POST', url: '/v1/runs', payload: body });
+      const duplicate = await server.inject({ method: 'POST', url: '/v1/runs', payload: body });
+      expect(first.statusCode).toBe(202);
+      expect(duplicate.statusCode).toBe(202);
+      expect(duplicate.json()).toMatchObject({
+        id: first.json<{ id: string }>().id,
+        acknowledgementId: expect.any(String),
+      });
+      expect(factory.sessions).toHaveLength(1);
+
+      const conflict = await server.inject({
+        method: 'POST',
+        url: '/v1/runs',
+        payload: { ...body, prompt: 'Different request.' },
+      });
+      expect(conflict.statusCode).toBe(409);
+      expect(conflict.json()).toMatchObject({ error: { code: 'idempotency_conflict' } });
+
+      const runId = first.json<{ id: string }>().id;
+      const steerBody = { message: 'Steer once.', idempotencyKey: 'steer-retry-1' };
+      const steer = await server.inject({
+        method: 'POST',
+        url: `/v1/runs/${runId}/steer`,
+        payload: steerBody,
+      });
+      const steerRetry = await server.inject({
+        method: 'POST',
+        url: `/v1/runs/${runId}/steer`,
+        payload: steerBody,
+      });
+      expect(steer.statusCode).toBe(202);
+      expect(steerRetry.statusCode).toBe(202);
+      expect(factory.sessions[0]?.steering).toEqual(['Steer once.']);
     });
   });
 

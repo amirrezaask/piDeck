@@ -1,4 +1,5 @@
-import { type ReactNode, useEffect, useState } from 'react';
+import { CheckIcon, CopyIcon } from 'lucide-react';
+import { type ElementType, type ReactNode, useEffect, useRef, useState } from 'react';
 import type { HighlighterCore, LanguageInput } from 'shiki/types';
 
 import { cn } from '@/lib/utils';
@@ -74,6 +75,21 @@ const LANGUAGE_LOADERS: Record<string, LanguageLoader> = {
   yaml: () => import('@shikijs/langs/yaml').then((module) => module.default),
 };
 
+type ListItem = {
+  content: string;
+  extraLines: string[];
+  checked?: boolean;
+};
+
+type ListMarker = {
+  indent: number;
+  ordered: boolean;
+  start?: number;
+  content: string;
+};
+
+type TableAlignment = 'left' | 'center' | 'right';
+
 export function MarkdownContent({
   content,
   className,
@@ -85,7 +101,7 @@ export function MarkdownContent({
       className={cn(
         'min-w-0 text-sm',
         variant === 'conversation'
-          ? 'space-y-2 leading-5 [&>p:first-child]:mt-0 [&>p:last-child]:mb-0'
+          ? 'leading-6 [&>p:first-child]:mt-0 [&>p:last-child]:mb-0'
           : 'text-foreground',
         className,
       )}
@@ -96,7 +112,7 @@ export function MarkdownContent({
 }
 
 function renderMarkdownBlocks(content: string, variant: MarkdownVariant): ReactNode[] {
-  const lines = content.split('\n');
+  const lines = content.replace(/\r\n?/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
   let index = 0;
 
@@ -127,84 +143,106 @@ function renderMarkdownBlocks(content: string, variant: MarkdownVariant): ReactN
       continue;
     }
 
-    if (line.startsWith('- ') || line.startsWith('* ')) {
-      const items: string[] = [];
+    const heading = /^(?: {0,3})(#{1,6})(?:\s+|$)(.*?)\s*#*\s*$/.exec(line);
+    if (heading) {
+      blocks.push(renderHeading(heading[1].length, heading[2], variant, `heading-${index}`));
+      index += 1;
+      continue;
+    }
+
+    if (isThematicBreak(line)) {
+      blocks.push(
+        <hr
+          key={`rule-${index}`}
+          className={cn(
+            'border-0 border-t border-border/70',
+            variant === 'conversation' ? 'my-4' : 'my-6',
+          )}
+        />,
+      );
+      index += 1;
+      continue;
+    }
+
+    if (isBlockquoteLine(line)) {
+      const quoteLines: string[] = [];
       while (index < lines.length) {
-        const listLine = lines[index] ?? '';
-        if (!listLine.startsWith('- ') && !listLine.startsWith('* ')) break;
-        items.push(listLine.slice(2));
-        index += 1;
+        const quoteLine = lines[index] ?? '';
+        const match = /^(?: {0,3})> ?(.*)$/.exec(quoteLine);
+        if (match) {
+          quoteLines.push(match[1]);
+          index += 1;
+          continue;
+        }
+        if (!quoteLine.trim() && /^(?: {0,3})>/.test(lines[index + 1] ?? '')) {
+          quoteLines.push('');
+          index += 1;
+          continue;
+        }
+        break;
       }
       blocks.push(
-        <ul
-          key={`list-${index}`}
+        <blockquote
+          key={`quote-${index}`}
           className={cn(
-            'list-disc pl-5',
-            variant === 'conversation' ? 'my-3 space-y-1' : 'my-4 space-y-2 leading-6',
+            'my-3 border-s border-border/80 ps-4 text-muted-foreground [&_[data-slot=markdown-content]]:my-0',
+            variant === 'preview' && 'my-5',
           )}
         >
-          {items.map((item) => (
-            <li key={item}>{renderMarkdownInline(item)}</li>
-          ))}
-        </ul>,
+          {renderMarkdownBlocks(quoteLines.join('\n'), variant)}
+        </blockquote>,
       );
       continue;
     }
 
-    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
-    if (heading) {
-      const Heading = heading[1].length === 1 ? 'h1' : heading[1].length === 2 ? 'h2' : 'h3';
+    const list = parseListMarker(line);
+    if (list) {
+      const parsed = parseList(lines, index, list);
+      blocks.push(renderList(parsed.items, parsed.ordered, parsed.start, variant, `list-${index}`));
+      index = parsed.nextIndex;
+      continue;
+    }
+
+    if (isTableStart(lines, index)) {
+      const table = parseTable(lines, index);
       blocks.push(
-        <Heading
-          key={`heading-${index}`}
-          className={cn(
-            'font-semibold tracking-tight',
-            variant === 'conversation'
-              ? Heading === 'h1'
-                ? 'mt-2 mb-2 text-lg'
-                : Heading === 'h2'
-                  ? 'mt-4 mb-1 text-base'
-                  : 'mt-3 mb-1 text-sm'
-              : Heading === 'h1'
-                ? 'mb-4 text-2xl'
-                : Heading === 'h2'
-                  ? 'mt-8 mb-3 text-lg'
-                  : 'mt-6 mb-2 text-base',
-          )}
-        >
-          {renderMarkdownInline(heading[2])}
-        </Heading>,
+        renderTable(table.headers, table.alignments, table.rows, variant, `table-${index}`),
       );
-      index += 1;
+      index = table.nextIndex;
       continue;
     }
 
     const paragraph: string[] = [];
     while (index < lines.length) {
       const paragraphLine = lines[index] ?? '';
+      if (!paragraphLine.trim()) break;
       if (
-        !paragraphLine.trim() ||
-        parseFenceStart(paragraphLine.trimEnd()) ||
-        /^(#{1,3})\s+/.test(paragraphLine) ||
-        paragraphLine.startsWith('- ') ||
-        paragraphLine.startsWith('* ')
+        paragraph.length > 0 &&
+        (parseFenceStart(paragraphLine.trimEnd()) ||
+          /^(?: {0,3})(#{1,6})(?:\s+|$)/.test(paragraphLine) ||
+          isThematicBreak(paragraphLine) ||
+          isBlockquoteLine(paragraphLine) ||
+          parseListMarker(paragraphLine) ||
+          isTableStart(lines, index))
       ) {
         break;
       }
-      paragraph.push(paragraphLine);
+      paragraph.push(paragraphLine.trimEnd());
       index += 1;
     }
 
+    // A soft Markdown line break is whitespace in a paragraph. Explicit hard
+    // breaks (two spaces or a trailing slash) remain visible to chat readers.
     blocks.push(
       <p
         key={`paragraph-${index}`}
         className={cn(
           variant === 'conversation'
-            ? 'm-0 whitespace-pre-wrap text-current'
+            ? 'mb-3 max-w-[75ch] whitespace-pre-wrap text-current'
             : 'my-4 max-w-2xl leading-7 text-muted-foreground',
         )}
       >
-        {renderMarkdownInline(paragraph.join(' '))}
+        {renderMarkdownInline(paragraph.join('\n'))}
       </p>,
     );
   }
@@ -212,8 +250,317 @@ function renderMarkdownBlocks(content: string, variant: MarkdownVariant): ReactN
   return blocks;
 }
 
+function renderHeading(
+  level: number,
+  content: string,
+  variant: MarkdownVariant,
+  key: string,
+): ReactNode {
+  const headingClasses =
+    variant === 'conversation'
+      ? level === 1
+        ? 'mt-3 mb-2 text-xl'
+        : level === 2
+          ? 'mt-4 mb-1.5 text-lg'
+          : level === 3
+            ? 'mt-3 mb-1 text-base'
+            : 'mt-3 mb-1 text-sm'
+      : level === 1
+        ? 'mb-5 text-3xl'
+        : level === 2
+          ? 'mt-9 mb-3 text-xl'
+          : level === 3
+            ? 'mt-7 mb-2 text-lg'
+            : 'mt-5 mb-1 text-base';
+  const Heading = `h${Math.min(level, 6)}` as ElementType;
+
+  return (
+    <Heading
+      key={key}
+      className={cn('font-semibold tracking-tight text-foreground', headingClasses)}
+    >
+      {renderMarkdownInline(content)}
+    </Heading>
+  );
+}
+
+function parseList(
+  lines: string[],
+  startIndex: number,
+  first: ListMarker,
+): { items: ListItem[]; ordered: boolean; start?: number; nextIndex: number } {
+  const items: ListItem[] = [];
+  let index = startIndex;
+  let current: ListItem | undefined;
+
+  while (index < lines.length) {
+    const line = lines[index] ?? '';
+    const marker = parseListMarker(line);
+
+    if (marker && marker.indent === first.indent && marker.ordered === first.ordered) {
+      const task = /^\[([ xX])\]\s+(.+)$/.exec(marker.content);
+      current = {
+        content: task?.[2] ?? marker.content,
+        extraLines: [],
+        ...(task ? { checked: task[1].toLowerCase() === 'x' } : {}),
+      };
+      items.push(current);
+      index += 1;
+      continue;
+    }
+
+    if (!current) break;
+    if (!line.trim()) {
+      const next = parseListMarker(lines[index + 1] ?? '');
+      if (next && next.indent === first.indent && next.ordered === first.ordered) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+
+    const indentation = line.length - line.trimStart().length;
+    if (indentation > first.indent) {
+      const strip = Math.min(line.length, first.indent + 2);
+      current.extraLines.push(line.slice(strip).trimEnd());
+      index += 1;
+      continue;
+    }
+    break;
+  }
+
+  return {
+    items,
+    ordered: first.ordered,
+    start: first.start,
+    nextIndex: index,
+  };
+}
+
+function renderList(
+  items: ListItem[],
+  ordered: boolean,
+  start: number | undefined,
+  variant: MarkdownVariant,
+  key: string,
+): ReactNode {
+  const List = ordered ? 'ol' : 'ul';
+  return (
+    <List
+      key={key}
+      start={ordered ? start : undefined}
+      className={cn(
+        ordered ? 'list-decimal' : 'list-disc',
+        'my-3 space-y-1 ps-5 marker:text-muted-foreground',
+        variant === 'preview' && 'my-5 space-y-2 leading-6',
+      )}
+    >
+      {(() => {
+        const itemKeys = stableKeys(
+          items,
+          `${key}-item`,
+          (item) => `${item.content}\u0000${item.extraLines.join('\n')}`,
+        );
+        return items.map((item) => {
+          const itemKey = itemKeys.shift() ?? `${key}-item`;
+          return (
+            <li key={itemKey} className="ps-1">
+              {item.checked !== undefined ? (
+                <span className="inline-flex items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={item.checked}
+                    readOnly
+                    tabIndex={-1}
+                    aria-label={item.checked ? 'Completed task' : 'Incomplete task'}
+                    className="mt-1 size-3.5 accent-primary"
+                  />
+                  <span>{renderMarkdownInline(item.content)}</span>
+                </span>
+              ) : (
+                renderMarkdownInline(item.content)
+              )}
+              {item.extraLines.length > 0 ? (
+                <div className="mt-2">
+                  {renderMarkdownBlocks(item.extraLines.join('\n'), variant)}
+                </div>
+              ) : null}
+            </li>
+          );
+        });
+      })()}
+    </List>
+  );
+}
+
+function renderTable(
+  headers: string[],
+  alignments: TableAlignment[],
+  rows: string[][],
+  variant: MarkdownVariant,
+  key: string,
+): ReactNode {
+  return (
+    <div
+      key={key}
+      className={cn(
+        'my-4 max-w-full overflow-x-auto rounded-lg border border-border/70',
+        variant === 'preview' && 'my-6',
+      )}
+    >
+      <table className="w-full min-w-max border-collapse text-left text-sm">
+        <thead className="bg-muted/50">
+          <tr>
+            {stableKeys(headers, `${key}-header`, (header) => header).map((headerKey, index) => (
+              <th
+                key={headerKey}
+                scope="col"
+                className={cn(
+                  'border-b border-border/70 px-3 py-2 font-semibold text-foreground',
+                  tableAlignmentClass(alignments[index]),
+                )}
+              >
+                {renderMarkdownInline(headers[index] ?? '')}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {(() => {
+            const rowKeys = stableKeys(rows, `${key}-row`, (row) => row.join('\u0000'));
+            return rows.map((row) => {
+              const rowKey = rowKeys.shift() ?? `${key}-row`;
+              const cellKeys = stableKeys(row, `${rowKey}-cell`, (cell) => cell);
+              return (
+                <tr key={rowKey} className="even:bg-muted/20">
+                  {headers.map((_, cellIndex) => (
+                    <td
+                      key={cellKeys[cellIndex] ?? `${rowKey}-cell`}
+                      className={cn(
+                        'border-b border-border/50 px-3 py-2 align-top last:border-b-0',
+                        tableAlignmentClass(alignments[cellIndex]),
+                      )}
+                    >
+                      {renderMarkdownInline(row[cellIndex] ?? '')}
+                    </td>
+                  ))}
+                </tr>
+              );
+            });
+          })()}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function parseTable(
+  lines: string[],
+  startIndex: number,
+): {
+  headers: string[];
+  alignments: TableAlignment[];
+  rows: string[][];
+  nextIndex: number;
+} {
+  const headers = splitTableCells(lines[startIndex] ?? '');
+  const separators = splitTableCells(lines[startIndex + 1] ?? '');
+  const alignments = headers.map((_, index) => {
+    const separator = separators[index] ?? '';
+    if (separator.startsWith(':') && separator.endsWith(':')) return 'center';
+    if (separator.endsWith(':')) return 'right';
+    return 'left';
+  });
+  const rows: string[][] = [];
+  let index = startIndex + 2;
+
+  while (index < lines.length && lines[index]?.trim() && lines[index]?.includes('|')) {
+    rows.push(splitTableCells(lines[index] ?? ''));
+    index += 1;
+  }
+
+  return { headers, alignments, rows, nextIndex: index };
+}
+
+function stableKeys<T>(
+  values: readonly T[],
+  prefix: string,
+  keyValue: (value: T) => string,
+): string[] {
+  const occurrences = new Map<string, number>();
+  return values.map((value) => {
+    const base = keyValue(value) || 'item';
+    const occurrence = occurrences.get(base) ?? 0;
+    occurrences.set(base, occurrence + 1);
+    return `${prefix}-${base}-${occurrence}`;
+  });
+}
+
+function tableAlignmentClass(alignment: TableAlignment | undefined): string {
+  return alignment === 'center'
+    ? 'text-center'
+    : alignment === 'right'
+      ? 'text-right'
+      : 'text-left';
+}
+
+function isTableStart(lines: string[], index: number): boolean {
+  if (!lines[index]?.includes('|') || !lines[index + 1]?.includes('|')) return false;
+  const separators = splitTableCells(lines[index + 1] ?? '');
+  return separators.length > 0 && separators.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function splitTableCells(line: string): string[] {
+  const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells: string[] = [];
+  let current = '';
+  let escaped = false;
+
+  for (const character of trimmed) {
+    if (character === '|' && !escaped) {
+      cells.push(current.trim());
+      current = '';
+      continue;
+    }
+    if (character === '\\' && !escaped) {
+      escaped = true;
+      current += character;
+      continue;
+    }
+    escaped = false;
+    current += character;
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+function parseListMarker(line: string): ListMarker | undefined {
+  const match = /^(\s{0,})([-+*]|(\d+)[.)])\s+(.+)$/.exec(line);
+  if (!match) return undefined;
+  return {
+    indent: match[1].length,
+    ordered: Boolean(match[3]),
+    ...(match[3] ? { start: Number(match[3]) } : {}),
+    content: match[4],
+  };
+}
+
+function isThematicBreak(line: string): boolean {
+  return /^(?: {0,3})(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/.test(line);
+}
+
+function isBlockquoteLine(line: string): boolean {
+  return /^(?: {0,3})>/.test(line);
+}
+
 function MarkdownCodeBlock({ code, language }: CodeBlockProps) {
   const [highlightedHtml, setHighlightedHtml] = useState<string>();
+  const [copied, setCopied] = useState(false);
+  const copyResetTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  useEffect(() => {
+    return () => clearTimeout(copyResetTimer.current);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -237,16 +584,36 @@ function MarkdownCodeBlock({ code, language }: CodeBlockProps) {
     };
   }, [code, language]);
 
+  async function copyCode() {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      clearTimeout(copyResetTimer.current);
+      copyResetTimer.current = setTimeout(() => setCopied(false), 1_600);
+    } catch {
+      setCopied(false);
+    }
+  }
+
   return (
     <div
       data-slot="code-block"
       data-language={language || 'text'}
-      className="my-3 min-w-0 max-w-full overflow-hidden rounded-lg border border-border/70 bg-background/80 shadow-xs"
+      className="my-4 min-w-0 max-w-full overflow-hidden rounded-lg border border-border/80 bg-[var(--code-surface)] shadow-sm"
     >
-      <div className="flex items-center border-b border-border/60 bg-muted/45 px-3 py-1.5">
-        <span className="font-mono text-[10px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+      <div className="flex h-8 items-center justify-between border-b border-border/60 bg-[var(--code-header)] px-3">
+        <span className="font-mono text-[10px] font-medium uppercase tracking-[0.1em] text-muted-foreground">
           {language || 'code'}
         </span>
+        <button
+          type="button"
+          className="flex h-6 items-center gap-1 rounded px-1.5 text-[10px] font-medium text-muted-foreground outline-none transition-colors hover:bg-background/70 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50"
+          onClick={() => void copyCode()}
+          aria-label={copied ? 'Code copied' : 'Copy code'}
+        >
+          {copied ? <CheckIcon className="size-3" /> : <CopyIcon className="size-3" />}
+          <span aria-live="polite">{copied ? 'Copied' : 'Copy'}</span>
+        </button>
       </div>
       <div className="min-w-0 max-w-full overflow-x-auto">
         {highlightedHtml ? (
@@ -295,8 +662,8 @@ async function highlightCodeWithShiki(code: string, language: string): Promise<s
     return highlighter.codeToHtml(code, {
       lang: loadedLanguage,
       themes: {
-        light: 'github-light',
-        dark: 'github-dark',
+        light: 'vitesse-light',
+        dark: 'vitesse-dark',
       },
       defaultColor: false,
       rootStyle: false,
@@ -306,8 +673,8 @@ async function highlightCodeWithShiki(code: string, language: string): Promise<s
     return highlighter.codeToHtml(code, {
       lang: 'text',
       themes: {
-        light: 'github-light',
-        dark: 'github-dark',
+        light: 'vitesse-light',
+        dark: 'vitesse-dark',
       },
       defaultColor: false,
       rootStyle: false,
@@ -320,12 +687,12 @@ function getHighlighter(): Promise<HighlighterCore> {
   highlighterPromise ??= Promise.all([
     import('@shikijs/engine-javascript'),
     import('shiki/core'),
-    import('@shikijs/themes/github-dark'),
-    import('@shikijs/themes/github-light'),
-  ]).then(([engine, core, githubDark, githubLight]) =>
+    import('@shikijs/themes/vitesse-dark'),
+    import('@shikijs/themes/vitesse-light'),
+  ]).then(([engine, core, vitesseDark, vitesseLight]) =>
     core.createHighlighterCore({
       engine: engine.createJavaScriptRegexEngine(),
-      themes: [githubLight.default, githubDark.default],
+      themes: [vitesseLight.default, vitesseDark.default],
       warnings: false,
     }),
   );
@@ -378,21 +745,201 @@ function normalizeLanguage(language: string): string {
 }
 
 function renderMarkdownInline(value: string): ReactNode[] {
-  const occurrences = new Map<string, number>();
-  return value.split(/(`[^`]+`)/g).map((part) => {
-    const occurrence = occurrences.get(part) ?? 0;
-    occurrences.set(part, occurrence + 1);
-    const key = `${part}-${occurrence}`;
+  const nodes: ReactNode[] = [];
+  let index = 0;
+  let textStart = 0;
 
-    return part.startsWith('`') && part.endsWith('`') ? (
-      <code
-        key={key}
-        className="rounded bg-muted px-1.5 py-0.5 font-mono text-[0.85em] text-current"
-      >
-        {part.slice(1, -1)}
-      </code>
-    ) : (
-      part
-    );
-  });
+  const pushText = (end: number) => {
+    if (end > textStart) nodes.push(value.slice(textStart, end));
+  };
+  const pushToken = (node: ReactNode, end: number) => {
+    pushText(index);
+    nodes.push(node);
+    index = end;
+    textStart = index;
+  };
+
+  while (index < value.length) {
+    const character = value[index];
+
+    if (character === '\\' && isMarkdownPunctuation(value[index + 1])) {
+      pushText(index);
+      nodes.push(value[index + 1]);
+      index += 2;
+      textStart = index;
+      continue;
+    }
+
+    if (character === '\n') {
+      const hardBreak = / {2,}$/.test(value.slice(textStart, index));
+      pushText(
+        hardBreak
+          ? index - (value.slice(textStart, index).match(/ {2,}$/)?.[0].length ?? 0)
+          : index,
+      );
+      nodes.push(<br key={`break-${index}`} />);
+      index += 1;
+      textStart = index;
+      continue;
+    }
+
+    if (character === '`') {
+      const delimiter = value.slice(index).match(/^`+/)?.[0] ?? '`';
+      const close = value.indexOf(delimiter, index + delimiter.length);
+      if (close > index + delimiter.length) {
+        const code = value
+          .slice(index + delimiter.length, close)
+          .replace(/\n/g, ' ')
+          .trim();
+        pushToken(
+          <code
+            key={`code-${index}`}
+            className="rounded-md border border-border/60 bg-muted/80 px-1.5 py-0.5 font-mono text-[0.85em] text-current"
+          >
+            {code}
+          </code>,
+          close + delimiter.length,
+        );
+        continue;
+      }
+    }
+
+    const link = parseInlineLink(value, index);
+    if (link) {
+      const safeHref = safeLinkHref(link.href);
+      pushToken(
+        safeHref ? (
+          <a
+            key={`link-${index}`}
+            href={safeHref}
+            target={safeHref.startsWith('http') ? '_blank' : undefined}
+            rel={safeHref.startsWith('http') ? 'noreferrer' : undefined}
+            className="font-medium text-primary underline decoration-primary/35 underline-offset-2 transition-colors hover:decoration-primary"
+          >
+            {renderMarkdownInline(link.label)}
+          </a>
+        ) : (
+          <span key={`link-${index}`}>{renderMarkdownInline(link.label)}</span>
+        ),
+        link.end,
+      );
+      continue;
+    }
+
+    const autolink = /^<(https?:\/\/[^\s>]+|mailto:[^\s>]+)>/.exec(value.slice(index));
+    if (autolink) {
+      const href = autolink[1];
+      pushToken(
+        <a
+          key={`autolink-${index}`}
+          href={href}
+          target={href.startsWith('http') ? '_blank' : undefined}
+          rel={href.startsWith('http') ? 'noreferrer' : undefined}
+          className="font-medium text-primary underline decoration-primary/35 underline-offset-2 transition-colors hover:decoration-primary"
+        >
+          {href.replace(/^mailto:/, '')}
+        </a>,
+        index + autolink[0].length,
+      );
+      continue;
+    }
+
+    const strong = findInlineDelimiter(value, index, '**', '__');
+    if (strong) {
+      pushToken(
+        <strong key={`strong-${index}`} className="font-semibold text-foreground">
+          {renderMarkdownInline(value.slice(index + 2, strong.close))}
+        </strong>,
+        strong.close + 2,
+      );
+      continue;
+    }
+
+    const strike = findInlineDelimiter(value, index, '~~');
+    if (strike) {
+      pushToken(
+        <del
+          key={`strike-${index}`}
+          className="text-muted-foreground line-through decoration-muted-foreground/70"
+        >
+          {renderMarkdownInline(value.slice(index + 2, strike.close))}
+        </del>,
+        strike.close + 2,
+      );
+      continue;
+    }
+
+    const emphasis = findEmphasisDelimiter(value, index);
+    if (emphasis) {
+      pushToken(
+        <em key={`emphasis-${index}`} className="italic">
+          {renderMarkdownInline(value.slice(index + 1, emphasis.close))}
+        </em>,
+        emphasis.close + 1,
+      );
+      continue;
+    }
+
+    index += 1;
+  }
+
+  pushText(value.length);
+  return nodes;
+}
+
+type InlineLink = { label: string; href: string; end: number };
+
+function parseInlineLink(value: string, index: number): InlineLink | undefined {
+  if (value[index] !== '[') return undefined;
+  const labelEnd = value.indexOf('](', index + 1);
+  if (labelEnd < 0) return undefined;
+  const close = value.indexOf(')', labelEnd + 2);
+  if (close < 0) return undefined;
+  const destination = value.slice(labelEnd + 2, close).trim();
+  const match = /^(\S+?)(?:\s+["'].*["'])?$/.exec(destination);
+  if (!match) return undefined;
+  return { label: value.slice(index + 1, labelEnd), href: match[1], end: close + 1 };
+}
+
+function safeLinkHref(href: string): string | undefined {
+  const normalized = href.trim();
+  if (/^(?:https?:|mailto:|tel:|\/|#|\.\/|\.\.\/)/i.test(normalized)) return normalized;
+  return undefined;
+}
+
+function findInlineDelimiter(
+  value: string,
+  index: number,
+  ...delimiters: string[]
+): { close: number } | undefined {
+  const delimiter = delimiters.find((candidate) => value.startsWith(candidate, index));
+  if (!delimiter) return undefined;
+  const close = value.indexOf(delimiter, index + delimiter.length);
+  if (close <= index + delimiter.length) return undefined;
+  return { close };
+}
+
+function findEmphasisDelimiter(value: string, index: number): { close: number } | undefined {
+  const delimiter = value[index];
+  if (delimiter !== '*' && delimiter !== '_') return undefined;
+  if (value.startsWith(`${delimiter}${delimiter}`, index)) return undefined;
+  if (delimiter === '_' && isWordCharacter(value[index - 1]) && isWordCharacter(value[index + 1])) {
+    return undefined;
+  }
+  const close = value.indexOf(delimiter, index + 1);
+  if (
+    close <= index + 1 ||
+    (delimiter === '_' && isWordCharacter(value[close - 1]) && isWordCharacter(value[close + 1]))
+  ) {
+    return undefined;
+  }
+  return { close };
+}
+
+function isMarkdownPunctuation(value: string | undefined): value is string {
+  return value !== undefined && /[\\`*_[\]{}()#+.!~<>-]/.test(value);
+}
+
+function isWordCharacter(value: string | undefined): boolean {
+  return value !== undefined && /[\p{L}\p{N}_]/u.test(value);
 }

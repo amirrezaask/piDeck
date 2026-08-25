@@ -25,7 +25,14 @@ export class ManagedAgentEventHub {
     }
 
     for (const listener of listeners) {
-      listener(event);
+      try {
+        listener(event);
+      } catch (error) {
+        // Persistence has already committed at this point. A consumer is not
+        // allowed to turn a committed event into a failed command or starve
+        // the remaining consumers.
+        void error;
+      }
     }
   }
 }

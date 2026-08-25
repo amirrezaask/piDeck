@@ -56,13 +56,48 @@ describe('mapPiEvents', () => {
           { kind: 'marker', label: 'Thinking...', tone: 'active' },
           {
             kind: 'marker',
-            label: 'Running bash',
-            tone: 'active',
+            label: 'Ran bash',
+            tone: 'success',
             toolCall: true,
             toolArguments: { command: 'pwd' },
           },
-          { kind: 'marker', label: 'bash finished', tone: 'success' },
           { kind: 'marker', label: 'Thinking...', tone: 'active' },
+        ],
+      },
+    ]);
+  });
+
+  it('hides successful tool completion markers but keeps failures visible', () => {
+    expect(
+      mapPiEvents([event(1, 'tool_execution_end', { toolName: 'read', isError: false })]),
+    ).toEqual([]);
+    expect(
+      mapPiEvents([event(2, 'tool_execution_end', { toolName: 'read', isError: true })]),
+    ).toMatchObject([
+      {
+        kind: 'event-group',
+        events: [{ kind: 'marker', label: 'read failed' }],
+      },
+    ]);
+  });
+
+  it('extracts file paths from file tool calls', () => {
+    expect(
+      mapPiEvents([
+        event(1, 'tool_execution_start', {
+          toolName: 'read',
+          args: { path: '/workspace/src/App.tsx' },
+        }),
+      ]),
+    ).toMatchObject([
+      {
+        kind: 'event-group',
+        events: [
+          {
+            kind: 'marker',
+            label: 'Running read',
+            filePath: '/workspace/src/App.tsx',
+          },
         ],
       },
     ]);
@@ -127,6 +162,10 @@ describe('mapPiEvents', () => {
     expect(
       mapPiEvents([event(1, 'supervisor.follow_up_accepted', { message: 'Keep going.' })]),
     ).toMatchObject([{ kind: 'user', content: 'Keep going.' }]);
+  });
+
+  it('omits the redundant successful supervisor completion marker', () => {
+    expect(mapPiEvents([event(1, 'supervisor.run_completed')])).toEqual([]);
   });
 
   it('does not render non-text message update noise', () => {

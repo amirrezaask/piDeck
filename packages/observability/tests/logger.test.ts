@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { createLogger } from '../src';
+import { createLogger } from '../index';
 
 describe('observability', () => {
   it('creates a structured logger', () => {

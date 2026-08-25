@@ -4,20 +4,31 @@ import { join } from 'node:path';
 import { createMigrationDatabase, migrateToLatest } from '@nextflow/database';
 import { describe, expect, it } from 'vitest';
 
-import { buildSupervisorApp } from '../src/app';
-import type { PiSessionFactory } from '../src/pi-session';
+import { buildSupervisorApp } from '../app';
+import type { PiExtensionCatalog } from '../extensions';
+import type { PiSessionFactory } from '../pi-session';
 import { FakePiSessionFactory } from './fake-pi-session';
 
 async function withApp<T>(
   callback: (app: ReturnType<typeof buildSupervisorApp>['server']) => Promise<T>,
-  options: { serviceToken?: string; piSessionFactory?: PiSessionFactory } = {},
+  options: {
+    serviceToken?: string;
+    piSessionFactory?: PiSessionFactory;
+    piExtensionService?: PiExtensionCatalog;
+    enableLegacyExecutions?: boolean;
+  } = {},
 ): Promise<T> {
   const directory = mkdtempSync(join(tmpdir(), 'nextflow-supervisor-http-'));
   const filename = join(directory, 'test.sqlite');
   const migration = createMigrationDatabase(filename);
   await migrateToLatest(migration.db);
   await migration.close();
-  const app = buildSupervisorApp({ databasePath: filename, ...options });
+  const app = buildSupervisorApp({
+    databasePath: filename,
+    ...options,
+    ...(options.serviceToken ? {} : { allowUnauthenticatedLoopback: true }),
+    enableLegacyExecutions: options.enableLegacyExecutions ?? true,
+  });
   try {
     return await callback(app.server);
   } finally {
@@ -58,6 +69,49 @@ describe('Supervisor HTTP API', () => {
         expect(authorized.statusCode).toBe(200);
       },
       { serviceToken: 'service-secret' },
+    );
+  });
+
+  it('does not register the legacy execution API by default', async () => {
+    await withApp(
+      async (app) => {
+        const response = await app.inject({ method: 'GET', url: '/v1/executions' });
+        expect(response.statusCode).toBe(404);
+      },
+      { enableLegacyExecutions: false },
+    );
+  });
+
+  it('lists and updates Pi extensions through the HTTP API', async () => {
+    const extensionResponse = {
+      extensions: [],
+      cwd: '/workspace',
+      checkedAt: '2026-08-23T20:00:00.000Z',
+      updateCheckError: null,
+    };
+    const extensionService: PiExtensionCatalog = {
+      list: async () => extensionResponse,
+      update: async (source) => {
+        expect(source).toBe('npm:pi-tools');
+        return extensionResponse;
+      },
+    };
+
+    await withApp(
+      async (app) => {
+        const listed = await app.inject({ method: 'GET', url: '/v1/extensions' });
+        const updated = await app.inject({
+          method: 'POST',
+          url: '/v1/extensions/update',
+          payload: { source: 'npm:pi-tools' },
+        });
+
+        expect(listed.statusCode).toBe(200);
+        expect(listed.json()).toEqual(extensionResponse);
+        expect(updated.statusCode).toBe(200);
+        expect(updated.json()).toEqual(extensionResponse);
+      },
+      { piExtensionService: extensionService },
     );
   });
 

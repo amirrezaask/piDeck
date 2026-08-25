@@ -1,7 +1,7 @@
 import type { AgentExecutionRequest } from '@nextflow/agent-runtime';
 import { describe, expect, it } from 'vitest';
 
-import { createTestAgentFactory, EchoAgent, FailingAgent } from '../src';
+import { createTestAgentFactory, EchoAgent, FailingAgent } from '../index';
 
 const request: AgentExecutionRequest = {
   executionId: '018bcfe4-7a4b-7000-8000-000000000001',

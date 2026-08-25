@@ -1,5 +1,6 @@
 import type {
   ManagedAgentEvent,
+  ManagedAgentExtensionsResponse,
   ManagedAgentResponse,
   ManagedAgentRunResponse,
   ManagedProjectResponse,
@@ -53,6 +54,8 @@ afterEach(() => {
   document.documentElement.style.colorScheme = '';
   window.localStorage.removeItem('pideck-theme');
   window.localStorage.removeItem('pideck-sidebar-collapsed');
+  window.localStorage.removeItem('pideck-archived-runs');
+  window.history.replaceState({}, '', '/');
 });
 
 function createClient(overrides: Partial<SupervisorClientApi> = {}): SupervisorClientApi {
@@ -62,8 +65,64 @@ function createClient(overrides: Partial<SupervisorClientApi> = {}): SupervisorC
       models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
       defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
     }),
+    listExtensions: vi.fn().mockResolvedValue({
+      extensions: [
+        {
+          id: 'npm:pi-tools:/pi-tools/index.ts',
+          name: 'pi-tools',
+          description: 'Useful Pi tools.',
+          path: '/pi-tools/index.ts',
+          relativePath: 'index.ts',
+          source: 'npm:pi-tools',
+          packageName: 'pi-tools',
+          scope: 'user',
+          origin: 'package',
+          enabled: true,
+          version: '1.0.0',
+          status: 'up_to_date',
+        },
+        {
+          id: 'npm:pi-stale:/pi-stale/index.ts',
+          name: 'pi-stale',
+          description: 'Needs an update.',
+          path: '/pi-stale/index.ts',
+          relativePath: 'index.ts',
+          source: 'npm:pi-stale',
+          packageName: 'pi-stale',
+          scope: 'user',
+          origin: 'package',
+          enabled: true,
+          version: '1.0.0',
+          status: 'update_available',
+        },
+        {
+          id: 'auto:/extensions/local.ts',
+          name: 'local',
+          description: 'Local Pi extension',
+          path: '/extensions/local.ts',
+          relativePath: 'local.ts',
+          source: 'auto',
+          packageName: null,
+          scope: 'user',
+          origin: 'top-level',
+          enabled: true,
+          version: null,
+          status: 'local',
+        },
+      ],
+      cwd: '/workspace',
+      checkedAt: timestamp,
+      updateCheckError: null,
+    } satisfies ManagedAgentExtensionsResponse),
+    updateExtensions: vi.fn().mockResolvedValue({
+      extensions: [],
+      cwd: '/workspace',
+      checkedAt: timestamp,
+      updateCheckError: null,
+    } satisfies ManagedAgentExtensionsResponse),
     listRuns: vi.fn().mockResolvedValue({ runs: [], nextCursor: null }),
     listProjects: vi.fn().mockResolvedValue({ projects: [project], nextCursor: null }),
+    listRunAttachments: vi.fn().mockResolvedValue({ attachments: [] }),
     listRunEvents: vi.fn().mockResolvedValue({ events: [] }),
     streamRunEvents: vi.fn().mockImplementation(emptyStream),
     getRun: vi.fn().mockResolvedValue(run),
@@ -72,8 +131,10 @@ function createClient(overrides: Partial<SupervisorClientApi> = {}): SupervisorC
     deleteAgent: vi.fn().mockResolvedValue(agent),
     createRun: vi.fn().mockResolvedValue({ ...run, status: 'running', completedAt: null }),
     createProject: vi.fn().mockResolvedValue(project),
+    updateProject: vi.fn().mockResolvedValue(project),
     deleteProject: vi.fn().mockResolvedValue(project),
     cancelRun: vi.fn().mockResolvedValue({ ...run, status: 'cancelled' }),
+    steerRun: vi.fn().mockResolvedValue({ ...run, status: 'running', completedAt: null }),
     followUpRun: vi.fn().mockResolvedValue({ ...run, status: 'running', completedAt: null }),
     ...overrides,
   };
@@ -98,7 +159,7 @@ describe('App', () => {
     );
   });
 
-  it('shows available skills and installed extension update status in settings', async () => {
+  it('shows searchable skills and extension update status in settings', async () => {
     const user = userEvent.setup();
     render(<App client={createClient()} />);
 
@@ -108,6 +169,7 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: /^Skills/ }));
     expect(screen.getByRole('heading', { name: 'Skills' })).toBeVisible();
     expect(screen.getByRole('list', { name: 'Available skills' })).toBeVisible();
+    expect(screen.getByRole('textbox', { name: 'Filter skills' })).toBeVisible();
     expect(screen.getByText('Web app verification')).toBeVisible();
     await user.click(screen.getByRole('button', { name: /Code review/ }));
     const skillDialog = screen.getByRole('dialog', { name: 'Code review' });
@@ -123,8 +185,84 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: /^Extensions/ }));
     expect(screen.getByRole('heading', { name: 'Extensions' })).toBeVisible();
     expect(screen.getByRole('list', { name: 'Installed extensions' })).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Update' }));
-    expect(screen.getAllByText('Up to date')).toHaveLength(3);
+    expect(screen.getByText('pi-tools')).toBeVisible();
+    expect(screen.getByText('Up to date')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Update pi-stale' })).toBeVisible();
+    expect(screen.getAllByText('Local').at(-1)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Update pi-stale' }));
+    await waitFor(() => expect(screen.getByText('No extensions found')).toBeVisible());
+  });
+
+  it('manages known projects from the settings page', async () => {
+    const user = userEvent.setup();
+    const updatedProject = { ...project, name: 'Renamed workspace', path: '/renamed-workspace' };
+    const client = createClient({
+      updateProject: vi.fn().mockResolvedValue(updatedProject),
+    });
+    render(<App client={client} />);
+
+    expect(await screen.findByText('Create an agent profile first')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Open agent settings' }));
+    await user.click(screen.getByRole('button', { name: /^Projects/ }));
+
+    expect(screen.getByRole('heading', { name: 'Known projects' })).toBeVisible();
+    expect(screen.getByText('/workspace')).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Add project' }));
+    const editor = screen.getByRole('dialog', { name: 'Add known project' });
+    await user.type(within(editor).getByLabelText('Display name'), 'PiDeck workspace');
+    await user.type(within(editor).getByLabelText('Working directory'), '/workspace');
+    await user.click(within(editor).getByRole('button', { name: 'Add project' }));
+    await waitFor(() =>
+      expect(client.createProject).toHaveBeenCalledWith({
+        name: 'PiDeck workspace',
+        path: '/workspace',
+      }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Edit project workspace' }));
+    const editDialog = screen.getByRole('dialog', { name: 'Edit known project' });
+    await user.clear(within(editDialog).getByLabelText('Display name'));
+    await user.type(within(editDialog).getByLabelText('Display name'), 'Renamed workspace');
+    await user.click(within(editDialog).getByRole('button', { name: 'Save changes' }));
+    await waitFor(() =>
+      expect(client.updateProject).toHaveBeenCalledWith(project.id, {
+        name: 'Renamed workspace',
+        path: '/workspace',
+      }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Delete project Renamed workspace' }));
+    const confirmation = screen.getByRole('dialog', { name: 'Remove known project?' });
+    await user.click(within(confirmation).getByRole('button', { name: 'Remove project' }));
+    await waitFor(() => expect(client.deleteProject).toHaveBeenCalledWith(project.id));
+    expect(screen.queryByText('Renamed workspace')).not.toBeInTheDocument();
+  });
+
+  it('autocompletes known project paths in the composer and settings', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Choose project' }));
+    const picker = screen.getByRole('dialog', { name: 'Choose project' });
+    await user.click(within(picker).getByRole('button', { name: 'New project' }));
+    const composerPath = within(picker).getByLabelText('Working directory');
+    await user.type(composerPath, '/work');
+    await user.click(screen.getByRole('option', { name: /workspace\/workspace/ }));
+    expect(composerPath).toHaveValue('/workspace');
+    await user.click(within(picker).getByRole('button', { name: 'Cancel' }));
+
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: /^Projects/ }));
+    await user.click(screen.getByRole('button', { name: 'Add project' }));
+    const settingsDialog = screen.getByRole('dialog', { name: 'Add known project' });
+    const settingsPath = within(settingsDialog).getByLabelText('Working directory');
+    await user.type(settingsPath, '/work');
+    await user.click(screen.getByRole('option', { name: /workspace\/workspace/ }));
+    expect(settingsPath).toHaveValue('/workspace');
   });
 
   it('switches to dark mode and persists the preference', async () => {
@@ -150,7 +288,11 @@ describe('App', () => {
     render(<App client={createClient()} />);
 
     const collapseButton = await screen.findByRole('button', { name: 'Collapse sidebar' });
+    const newSessionButton = screen.getByRole('button', { name: 'New session' });
     expect(collapseButton).toHaveAttribute('aria-expanded', 'true');
+    expect(newSessionButton).toHaveAttribute('data-size', 'icon');
+    expect(newSessionButton).toHaveAttribute('title', 'New session');
+    expect(newSessionButton.querySelector('svg')).not.toBeNull();
 
     await user.click(collapseButton);
 
@@ -167,7 +309,81 @@ describe('App', () => {
     expect(window.localStorage.getItem('pideck-sidebar-collapsed')).toBe('false');
   });
 
-  it('renders the prompt, coalesced PI response, and lifecycle markers', async () => {
+  it('updates the URL when selecting a session', async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, '', '/new');
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+    });
+
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole('button', { name: /Review the changes\./ }));
+    expect(window.location.pathname).toBe(`/sessions/${run.id}`);
+  });
+
+  it('restores the session selected by the URL', async () => {
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+    });
+
+    render(<App client={client} />);
+
+    expect(await screen.findByRole('heading', { name: 'Review the changes.' })).toBeVisible();
+    expect(window.location.pathname).toBe(`/sessions/${run.id}`);
+    expect(
+      within(screen.getByRole('navigation', { name: 'Sessions' })).getByRole('button', {
+        name: /Review the changes\./,
+      }),
+    ).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('archives a session from its context menu', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+    });
+
+    render(<App client={client} />);
+
+    const sessionButton = await screen.findByRole('button', {
+      name: /Review the changes\./,
+    });
+    fireEvent.contextMenu(sessionButton);
+
+    await user.click(await screen.findByRole('menuitem', { name: 'Archive' }));
+
+    expect(screen.queryByRole('button', { name: /Review the changes\./ })).not.toBeInTheDocument();
+    expect(window.location.pathname).toBe('/new');
+    expect(window.localStorage.getItem('pideck-archived-runs')).toContain(run.id);
+  });
+
+  it('archives a session from the hover action', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+    });
+
+    render(<App client={client} />);
+
+    const sessionButton = await screen.findByRole('button', {
+      name: /Review the changes\./,
+    });
+    await user.hover(sessionButton);
+    await user.click(screen.getByRole('button', { name: 'Archive session' }));
+
+    expect(screen.queryByRole('button', { name: /Review the changes\./ })).not.toBeInTheDocument();
+    expect(window.location.pathname).toBe('/new');
+    expect(window.localStorage.getItem('pideck-archived-runs')).toContain(run.id);
+  });
+
+  it('renders the prompt, model avatar, and lifecycle markers', async () => {
+    const user = userEvent.setup();
     const events: ManagedAgentEvent[] = [
       {
         agentId: agent.id,
@@ -202,9 +418,21 @@ describe('App', () => {
     render(<App client={client} />);
 
     expect(await screen.findByRole('heading', { name: 'Review the changes.' })).toBeVisible();
-    expect(
-      within(screen.getByRole('navigation', { name: 'Sessions' })).getByText('Fake model'),
-    ).toBeVisible();
+    const sessionButton = within(screen.getByRole('navigation', { name: 'Sessions' })).getByRole(
+      'button',
+      { name: /Review the changes\./ },
+    );
+    expect(sessionButton).toHaveAttribute(
+      'title',
+      'Review the changes. · workspace · working tree · Fake model · Medium thinking · Completed',
+    );
+    expect(sessionButton).toHaveTextContent('workspace');
+    expect(sessionButton).not.toHaveTextContent('/workspace');
+    expect(sessionButton).toHaveTextContent('working tree');
+    expect(sessionButton.querySelector('[data-slot="avatar"]')).not.toBeNull();
+    await user.hover(sessionButton);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('Fake model');
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Medium thinking');
     const thinkingMarker = await screen.findByText('Thinking...');
     expect(thinkingMarker).toBeVisible();
     expect(thinkingMarker).toHaveClass('shimmer');
@@ -239,12 +467,35 @@ describe('App', () => {
     });
     render(<App client={client} />);
 
-    await user.click(await screen.findByRole('button', { name: /2 events/ }));
+    await user.click(await screen.findByRole('button', { name: /Running bash/ }));
     const toolCall = screen.getByRole('button', { name: 'Running bash' });
     expect(toolCall).toHaveAttribute('aria-expanded', 'false');
     await user.click(toolCall);
 
     expect(screen.getByLabelText('Tool call arguments')).toHaveTextContent('"command": "pwd"');
+  });
+
+  it('renders file tool arguments as shadcn badges in events', async () => {
+    const events: ManagedAgentEvent[] = [
+      {
+        agentId: agent.id,
+        runId: run.id,
+        sequence: 1,
+        type: 'tool_execution_start',
+        payload: { toolName: 'read', args: { path: '/workspace/src/App.tsx' } },
+        createdAt: timestamp,
+      },
+    ];
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+      listRunEvents: vi.fn().mockResolvedValue({ events }),
+    });
+    render(<App client={client} />);
+
+    const fileBadge = await screen.findByText('App.tsx');
+    expect(fileBadge).toHaveAttribute('data-slot', 'badge');
+    expect(fileBadge).toHaveAttribute('title', '/workspace/src/App.tsx');
   });
 
   it('merges WebSocket events that arrive before persisted event replay completes', async () => {
@@ -303,6 +554,78 @@ describe('App', () => {
     await waitFor(() =>
       expect(client.followUpRun).toHaveBeenCalledWith(run.id, { message: 'Keep going.' }),
     );
+  });
+
+  it('loads persisted prompt attachments when reopening a run', async () => {
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+      listRunAttachments: vi.fn().mockResolvedValue({
+        attachments: [
+          {
+            name: 'screen.png',
+            mimeType: 'image/png',
+            data: 'aW1hZ2UgYnl0ZXM=',
+          },
+        ],
+      }),
+    });
+    render(<App client={client} />);
+
+    expect(await screen.findByRole('group', { name: 'Prompt attachments' })).toBeVisible();
+    expect(screen.getByAltText('screen.png')).toBeVisible();
+    expect(client.listRunAttachments).toHaveBeenCalledWith(run.id);
+  });
+
+  it('accepts dropped images in the initial composer and sends them with the run', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [], nextCursor: null }),
+    });
+    render(<App client={client} />);
+
+    const composer = await screen.findByRole('form', { name: 'New session composer' });
+    const image = new File(['image bytes'], 'screen.png', { type: 'image/png' });
+
+    fireEvent.dragOver(composer, {
+      dataTransfer: { types: ['Files'], files: [image], dropEffect: 'none' },
+    });
+    expect(screen.getByText('Drop files to attach')).toBeVisible();
+
+    fireEvent.drop(composer, {
+      dataTransfer: { types: ['Files'], files: [image], dropEffect: 'copy' },
+    });
+
+    expect(await screen.findByText('screen.png')).toBeVisible();
+    await user.type(screen.getByRole('textbox', { name: 'Session task' }), 'Inspect this image.');
+    await user.click(screen.getByRole('button', { name: 'Start session' }));
+
+    await waitFor(() =>
+      expect(client.createRun).toHaveBeenCalledWith({
+        agentId: agent.id,
+        prompt: 'Inspect this image.',
+        model: { provider: 'fake', id: 'fake-model' },
+        thinkingLevel: 'medium',
+        cwd: '/workspace',
+        attachments: [
+          {
+            name: 'screen.png',
+            mimeType: 'image/png',
+            data: 'aW1hZ2UgYnl0ZXM=',
+          },
+        ],
+      }),
+    );
+    expect(await screen.findByRole('group', { name: 'Prompt attachments' })).toBeVisible();
+    expect(screen.getByAltText('screen.png')).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Open screen.png' }));
+    const preview = screen.getByRole('dialog', { name: 'screen.png' });
+    expect(preview).toBeVisible();
+    expect(within(preview).getByAltText('screen.png')).toBeVisible();
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'screen.png' })).not.toBeInTheDocument();
   });
 
   it('accepts dropped images and other files above the composer', async () => {

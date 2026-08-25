@@ -9,10 +9,18 @@ import {
 } from '@nextflow/database';
 import { describe, expect, it } from 'vitest';
 
-import { ManagedAgentBusyError, ManagedAgentService } from '../src/agent-service';
-import { FakePiSessionFactory } from './fake-pi-session';
+import { ManagedAgentBusyError, ManagedAgentService } from '../agent-service';
+import { Deferred, FakePiSessionFactory } from './fake-pi-session';
 
-async function createService(options: { preflightAccepted?: boolean; createError?: Error } = {}) {
+async function createService(
+  options: {
+    preflightAccepted?: boolean;
+    createError?: Error;
+    createDeferred?: Deferred<void>;
+    abortMode?: 'resolve' | 'reject' | 'hang';
+    shutdownTimeoutMs?: number;
+  } = {},
+) {
   const directory = mkdtempSync(join(tmpdir(), 'nextflow-managed-agent-'));
   const filename = join(directory, 'test.sqlite');
   const migration = createMigrationDatabase(filename);
@@ -24,6 +32,12 @@ async function createService(options: { preflightAccepted?: boolean; createError
     db: connection.db,
     sessionFactory: factory,
     defaultCwd: directory,
+    ...(options.shutdownTimeoutMs === undefined
+      ? {}
+      : {
+          shutdownTimeoutMs: options.shutdownTimeoutMs,
+          operationTimeoutMs: options.shutdownTimeoutMs,
+        }),
   });
   await service.start();
   return {
@@ -31,6 +45,7 @@ async function createService(options: { preflightAccepted?: boolean; createError
     factory,
     connection,
     directory,
+    filename,
     async close() {
       await service.close();
       await connection.close();
@@ -111,6 +126,69 @@ describe('ManagedAgentService', () => {
       ]);
     } finally {
       await context.close();
+    }
+  });
+
+  it('passes bounded image attachments to the Pi adapter', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Inspect images.' });
+      await context.service.createRun({
+        agentId: agent.id,
+        prompt: 'Inspect this screenshot.',
+        attachments: [{ name: 'screen.png', mimeType: 'image/png', data: 'aW1hZ2U=' }],
+      });
+      expect(context.factory.sessions[0]?.promptImages).toEqual([
+        [{ type: 'image', mimeType: 'image/png', data: 'aW1hZ2U=' }],
+      ]);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('persists image attachments across service restarts', async () => {
+    const context = await createService();
+    const attachment = {
+      name: 'screen.png',
+      mimeType: 'image/png' as const,
+      data: 'aW1hZ2U=',
+    };
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Inspect images.' });
+      const run = await context.service.createRun({
+        agentId: agent.id,
+        prompt: 'Inspect this screenshot.',
+        attachments: [attachment],
+      });
+      const session = context.factory.sessions[0];
+      if (!session) throw new Error('Fake session was not created');
+      session.settle();
+      await waitForEvent(context.service, agent.id, 'agent_settled');
+
+      expect(await context.service.listRunAttachments(run.id)).toEqual({
+        attachments: [attachment],
+      });
+
+      await context.service.close();
+      await context.connection.close();
+
+      const restartedConnection = createSupervisorDatabase(context.filename);
+      const restartedService = new ManagedAgentService({
+        db: restartedConnection.db,
+        sessionFactory: new FakePiSessionFactory(),
+        defaultCwd: context.directory,
+      });
+      await restartedService.start();
+      try {
+        expect(await restartedService.listRunAttachments(run.id)).toEqual({
+          attachments: [attachment],
+        });
+      } finally {
+        await restartedService.close();
+        await restartedConnection.close();
+      }
+    } finally {
+      rmSync(context.directory, { recursive: true, force: true });
     }
   });
 
@@ -206,6 +284,86 @@ describe('ManagedAgentService', () => {
       const run = await context.service.createRun({ agentId: agent.id, prompt: 'Start.' });
       expect(run).toMatchObject({ status: 'failed', error: { code: 'prompt_rejected' } });
       expect(await context.service.getAgent(agent.id)).not.toHaveProperty('status');
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('admits exactly one run when createRun calls race', async () => {
+    const creation = new Deferred<void>();
+    const context = await createService({ createDeferred: creation });
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      const first = context.service.createRun({ agentId: agent.id, prompt: 'First.' });
+      await Promise.resolve();
+      const second = context.service.createRun({ agentId: agent.id, prompt: 'Second.' });
+      creation.resolve();
+      const results = await Promise.allSettled([first, second]);
+      expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+      expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+      expect(results.find((result) => result.status === 'rejected')).toMatchObject({
+        reason: expect.any(ManagedAgentBusyError),
+      });
+      expect(context.factory.sessions).toHaveLength(1);
+      const activeRuns = await context.connection.db
+        .selectFrom('supervisor_agent_runs')
+        .select(['id', 'status'])
+        .where('agent_id', '=', agent.id)
+        .where('status', 'in', ['queued', 'running'])
+        .execute();
+      expect(activeRuns).toHaveLength(1);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('keeps cancellation authoritative when the SDK abort rejects', async () => {
+    const context = await createService({ abortMode: 'reject', shutdownTimeoutMs: 10 });
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Start.' });
+      const cancelled = await context.service.cancelRun(run.id);
+      expect(cancelled.status).toBe('cancelled');
+      const events = await context.service.listRunEvents(run.id, { afterSequence: 0 });
+      expect(events.map((event) => event.type)).toContain('supervisor.run_cancelled');
+      expect(events.map((event) => event.type)).not.toContain('supervisor.run_failed');
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('bounds shutdown with a hanging SDK abort and disposes once', async () => {
+    const context = await createService({ abortMode: 'hang', shutdownTimeoutMs: 10 });
+    const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+    await context.service.createRun({ agentId: agent.id, prompt: 'Start.' });
+    const session = context.factory.sessions[0];
+    if (!session) throw new Error('Fake session was not created');
+    await context.service.close();
+    await context.service.close();
+    expect(session.abortCount).toBe(1);
+    expect(session.disposeCount).toBe(1);
+    expect(session.unsubscribeCount).toBe(1);
+    await context.connection.close();
+    rmSync(context.directory, { recursive: true, force: true });
+  });
+
+  it('soft deletes a profile while retaining and terminalizing its run history', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Keep history.' });
+      const deleted = await context.service.deleteAgent(agent.id);
+      expect(deleted.id).toBe(agent.id);
+      expect(await context.service.getAgent(agent.id)).toBeNull();
+      expect(await context.service.getRun(run.id)).toMatchObject({
+        status: 'cancelled',
+        error: { code: 'agent_deleted' },
+      });
+      expect(await context.service.listRunEvents(run.id, { afterSequence: 0 })).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'supervisor.run_cancelled', runId: run.id }),
+        ]),
+      );
     } finally {
       await context.close();
     }

@@ -13,6 +13,8 @@ import {
   ManagedAgentEventSchema,
   type ManagedAgentEventsResponse,
   ManagedAgentEventsResponseSchema,
+  type ManagedAgentExtensionsResponse,
+  ManagedAgentExtensionsResponseSchema,
   type ManagedAgentListQuery,
   type ManagedAgentListResponse,
   ManagedAgentListResponseSchema,
@@ -20,6 +22,8 @@ import {
   ManagedAgentModelsResponseSchema,
   type ManagedAgentResponse,
   ManagedAgentResponseSchema,
+  type ManagedAgentRunAttachmentsResponse,
+  ManagedAgentRunAttachmentsResponseSchema,
   type ManagedAgentRunListQuery,
   type ManagedAgentRunListResponse,
   ManagedAgentRunListResponseSchema,
@@ -32,12 +36,34 @@ import {
   ManagedProjectResponseSchema,
   type UpdateManagedAgentRequest,
   UpdateManagedAgentRequestSchema,
+  UpdateManagedExtensionsRequestSchema,
+  type UpdateManagedProjectRequest,
+  UpdateManagedProjectRequestSchema,
 } from '@nextflow/contracts';
 import { ApiError } from './api-error';
 
 interface RuntimeSchema<T> {
   parse(value: unknown): T;
 }
+
+interface WebSocketTicket {
+  readonly ticket: string;
+  readonly expiresAt: string;
+}
+
+const WebSocketTicketSchema: RuntimeSchema<WebSocketTicket> = {
+  parse(value: unknown): WebSocketTicket {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      typeof (value as { ticket?: unknown }).ticket !== 'string' ||
+      typeof (value as { expiresAt?: unknown }).expiresAt !== 'string'
+    ) {
+      throw new Error('Invalid Supervisor WebSocket ticket');
+    }
+    return value as WebSocketTicket;
+  },
+};
 
 export interface SupervisorClientOptions {
   readonly baseUrl?: string;
@@ -46,9 +72,15 @@ export interface SupervisorClientOptions {
   readonly webSocketFactory?: typeof WebSocket;
 }
 
+export type StreamConnectionState = 'connected' | 'reconnecting' | 'stale' | 'failed';
+
 export interface StreamAgentEventsOptions {
   readonly afterSequence?: number;
   readonly signal?: AbortSignal;
+  readonly reconnect?: boolean;
+  readonly maxReconnectAttempts?: number;
+  readonly detectGaps?: boolean;
+  readonly onConnectionState?: (state: StreamConnectionState) => void;
 }
 
 export class SupervisorClient {
@@ -75,6 +107,18 @@ export class SupervisorClient {
     return this.request('/v1/models', ManagedAgentModelsResponseSchema);
   }
 
+  listExtensions(): Promise<ManagedAgentExtensionsResponse> {
+    return this.request('/v1/extensions', ManagedAgentExtensionsResponseSchema);
+  }
+
+  updateExtensions(source?: string): Promise<ManagedAgentExtensionsResponse> {
+    const body = UpdateManagedExtensionsRequestSchema.parse(source ? { source } : {});
+    return this.request('/v1/extensions/update', ManagedAgentExtensionsResponseSchema, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  }
+
   createRun(request: CreateManagedAgentRunRequest): Promise<ManagedAgentRunResponse> {
     return this.request('/v1/runs', ManagedAgentRunResponseSchema, {
       method: 'POST',
@@ -87,6 +131,20 @@ export class SupervisorClient {
       method: 'POST',
       body: JSON.stringify(CreateManagedProjectRequestSchema.parse(request)),
     });
+  }
+
+  updateProject(
+    projectId: string,
+    request: UpdateManagedProjectRequest,
+  ): Promise<ManagedProjectResponse> {
+    return this.request(
+      `/v1/projects/${encodeURIComponent(projectId)}`,
+      ManagedProjectResponseSchema,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(UpdateManagedProjectRequestSchema.parse(request)),
+      },
+    );
   }
 
   deleteProject(projectId: string): Promise<ManagedProjectResponse> {
@@ -115,11 +173,14 @@ export class SupervisorClient {
     return this.request(`/v1/runs/${encodeURIComponent(runId)}`, ManagedAgentRunResponseSchema);
   }
 
-  cancelRun(runId: string): Promise<ManagedAgentRunResponse> {
+  cancelRun(runId: string, idempotencyKey?: string): Promise<ManagedAgentRunResponse> {
     return this.request(
       `/v1/runs/${encodeURIComponent(runId)}/cancel`,
       ManagedAgentRunResponseSchema,
-      { method: 'POST' },
+      {
+        method: 'POST',
+        ...(idempotencyKey ? { body: JSON.stringify({ idempotencyKey }) } : {}),
+      },
     );
   }
 
@@ -131,12 +192,29 @@ export class SupervisorClient {
     return this.runCommand(runId, 'follow-up', AgentMessageRequestSchema.parse(request));
   }
 
-  listRunEvents(runId: string, afterSequence = 0): Promise<ManagedAgentEventsResponse> {
-    const params = new URLSearchParams({ afterSequence: String(afterSequence) });
+  listRunAttachments(runId: string): Promise<ManagedAgentRunAttachmentsResponse> {
     return this.request(
-      `/v1/runs/${encodeURIComponent(runId)}/events?${params.toString()}`,
-      ManagedAgentEventsResponseSchema,
+      `/v1/runs/${encodeURIComponent(runId)}/attachments`,
+      ManagedAgentRunAttachmentsResponseSchema,
     );
+  }
+
+  async listRunEvents(runId: string, afterSequence = 0): Promise<ManagedAgentEventsResponse> {
+    const events: ManagedAgentEvent[] = [];
+    let cursor = afterSequence;
+    let page: ManagedAgentEventsResponse;
+    let hasMore = true;
+    while (hasMore) {
+      const params = new URLSearchParams({ afterSequence: String(cursor) });
+      page = await this.request(
+        `/v1/runs/${encodeURIComponent(runId)}/events?${params.toString()}`,
+        ManagedAgentEventsResponseSchema,
+      );
+      events.push(...page.events);
+      hasMore = page.hasMore === true && page.nextSequence != null;
+      if (hasMore) cursor = page.nextSequence as number;
+    }
+    return { events };
   }
 
   listAgents(query: Partial<ManagedAgentListQuery> = {}): Promise<ManagedAgentListResponse> {
@@ -162,19 +240,34 @@ export class SupervisorClient {
     });
   }
 
-  listEvents(agentId: string, afterSequence = 0): Promise<ManagedAgentEventsResponse> {
-    const params = new URLSearchParams({ afterSequence: String(afterSequence) });
-    return this.request(
-      `/v1/agents/${encodeURIComponent(agentId)}/events?${params.toString()}`,
-      ManagedAgentEventsResponseSchema,
-    );
+  async listEvents(agentId: string, afterSequence = 0): Promise<ManagedAgentEventsResponse> {
+    const events: ManagedAgentEvent[] = [];
+    let cursor = afterSequence;
+    let hasMore = true;
+    while (hasMore) {
+      const params = new URLSearchParams({ afterSequence: String(cursor) });
+      const page = await this.request(
+        `/v1/agents/${encodeURIComponent(agentId)}/events?${params.toString()}`,
+        ManagedAgentEventsResponseSchema,
+      );
+      events.push(...page.events);
+      hasMore = page.hasMore === true && page.nextSequence != null;
+      if (hasMore) cursor = page.nextSequence as number;
+    }
+    return { events };
   }
 
   streamRunEvents(
     runId: string,
     options: StreamAgentEventsOptions = {},
   ): AsyncGenerator<ManagedAgentEvent> {
-    return this.streamResourceEvents(`/v1/runs/${encodeURIComponent(runId)}/stream`, options);
+    return this.streamResourceEvents(`/v1/runs/${encodeURIComponent(runId)}/stream`, {
+      ...options,
+      // A run stream intentionally filters agent-level events, so global
+      // sequence numbers may have legitimate gaps. Agent streams can enforce
+      // contiguous replay and detect a missing page.
+      detectGaps: false,
+    });
   }
 
   async *streamEvents(
@@ -190,49 +283,116 @@ export class SupervisorClient {
   ): AsyncGenerator<ManagedAgentEvent> {
     if (!this.webSocketFactory) throw new Error('WebSocket is not available in this environment');
 
-    const params = new URLSearchParams({
-      afterSequence: String(options.afterSequence ?? 0),
-    });
-    const socketUrl = this.websocketUrl(path, params);
-    const socket = new this.webSocketFactory(socketUrl);
-    const queue = new AsyncEventQueue<ManagedAgentEvent>();
-    const abort = () => {
-      queue.end();
-      socket.close();
-    };
+    let lastSequence = options.afterSequence ?? 0;
+    let reconnectAttempt = 0;
+    const reconnect = options.reconnect ?? true;
+    const maxAttempts = options.maxReconnectAttempts ?? 8;
+    const signal = options.signal;
 
-    socket.onmessage = (event) => {
+    while (!signal?.aborted) {
+      options.onConnectionState?.(reconnectAttempt === 0 ? 'stale' : 'reconnecting');
+      const params = new URLSearchParams({ afterSequence: String(lastSequence) });
+      const ticket = await this.websocketTicket();
+      const socket = new this.webSocketFactory(this.websocketUrl(path, params, ticket));
+      const queue = new AsyncEventQueue<ManagedAgentEvent>();
+      let closedUnexpectedly = false;
+      const abort = () => {
+        queue.end();
+        socket.close();
+      };
+      const onOpen = () => {
+        options.onConnectionState?.('connected');
+      };
+      socket.onopen = onOpen;
+      socket.onmessage = (event) => {
+        try {
+          const payload = ManagedAgentEventSchema.parse(
+            JSON.parse(typeof event.data === 'string' ? event.data : String(event.data)) as unknown,
+          );
+          if (payload.sequence <= lastSequence) return;
+          if (options.detectGaps !== false && payload.sequence > lastSequence + 1) {
+            queue.fail(
+              new Error(
+                `Supervisor event sequence gap: expected ${lastSequence + 1}, received ${payload.sequence}`,
+              ),
+            );
+            socket.close();
+            return;
+          }
+          lastSequence = payload.sequence;
+          queue.push(payload);
+        } catch (reason) {
+          queue.fail(reason instanceof Error ? reason : new Error('Invalid Supervisor event'));
+          socket.close();
+        }
+      };
+      socket.onerror = () => queue.fail(new Error('Supervisor event WebSocket failed'));
+      socket.onclose = () => {
+        closedUnexpectedly = !signal?.aborted;
+        queue.end();
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+
+      let failure: Error | undefined;
       try {
-        const payload = typeof event.data === 'string' ? event.data : String(event.data);
-        queue.push(ManagedAgentEventSchema.parse(JSON.parse(payload) as unknown));
-      } catch (reason) {
-        queue.fail(reason instanceof Error ? reason : new Error('Invalid Supervisor event'));
+        let reading = true;
+        while (reading) {
+          const result = await queue.next();
+          if (result.done) {
+            reading = false;
+          } else {
+            yield result.value;
+          }
+        }
+      } catch (error) {
+        failure = error instanceof Error ? error : new Error('Supervisor event stream failed');
+      } finally {
+        signal?.removeEventListener('abort', abort);
         socket.close();
       }
-    };
-    socket.onerror = () => queue.fail(new Error('Supervisor event WebSocket failed'));
-    socket.onclose = () => queue.end();
-    options.signal?.addEventListener('abort', abort, { once: true });
-
-    try {
-      while (true) {
-        const result = await queue.next();
-        if (result.done) return;
-        yield result.value;
+      if (signal?.aborted) return;
+      if (!reconnect) {
+        options.onConnectionState?.('failed');
+        throw failure ?? new Error('Supervisor event WebSocket closed unexpectedly');
       }
-    } finally {
-      options.signal?.removeEventListener('abort', abort);
-      socket.close();
+      if (failure?.message.includes('sequence gap')) {
+        options.onConnectionState?.('failed');
+        throw failure;
+      }
+      if (!closedUnexpectedly && !failure) {
+        // A mock or browser implementation may end without a close callback;
+        // it is still an unexpected disconnect from the caller's perspective.
+      }
+      reconnectAttempt += 1;
+      if (reconnectAttempt > maxAttempts) {
+        options.onConnectionState?.('failed');
+        throw failure ?? new Error('Supervisor event WebSocket reconnect limit exceeded');
+      }
+      options.onConnectionState?.('reconnecting');
+      await delayWithSignal(reconnectDelay(reconnectAttempt), signal);
     }
   }
 
-  private websocketUrl(path: string, params: URLSearchParams): string {
+  private websocketUrl(path: string, params: URLSearchParams, ticket?: string): string {
     const origin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
     const url = new URL(`${this.baseUrl}${path}`, origin);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    params.forEach((value, key) => url.searchParams.set(key, value));
-    if (this.serviceToken) url.searchParams.set('token', this.serviceToken);
+    params.forEach((value, key) => {
+      url.searchParams.set(key, value);
+    });
+    if (ticket) url.searchParams.set('ticket', ticket);
     return url.toString();
+  }
+
+  private async websocketTicket(): Promise<string | undefined> {
+    // Unit-test WebSocket doubles cannot make the ticket HTTP request. Real
+    // browser sockets always use a short-lived ticket; service tokens never
+    // enter the URL.
+    if (this.webSocketFactory !== globalThis.WebSocket && !this.serviceToken) return undefined;
+    const response = await this.request('/v1/ws-tickets', WebSocketTicketSchema, {
+      method: 'POST',
+    });
+    return response.ticket;
   }
 
   private runCommand(
@@ -306,6 +466,26 @@ class AsyncEventQueue<T> {
     if (this.ended) return Promise.resolve({ done: true, value: undefined });
     return new Promise((resolve) => this.waiters.push(resolve));
   }
+}
+
+function reconnectDelay(attempt: number): number {
+  const capped = Math.min(10_000, 250 * 2 ** Math.max(0, attempt - 1));
+  return Math.round(capped * (0.75 + Math.random() * 0.5));
+}
+
+function delayWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 }
 
 async function responseError(response: Response): Promise<ApiError> {

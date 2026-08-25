@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createMigrationDatabase, migrateToLatest } from '@nextflow/database';
 import WebSocket from 'ws';
 import { afterEach, describe, expect, it } from 'vitest';
-import { buildSupervisorApp } from '../src/app';
+import { buildSupervisorApp } from '../app';
 import { FakePiSessionFactory } from './fake-pi-session';
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -71,6 +71,24 @@ describe('Supervisor agent event WebSocket', () => {
 
     await expect(
       openSocket(`${baseUrl.replace('http:', 'ws:')}/v1/runs/${run.id}/stream`),
+    ).rejects.toThrow();
+
+    const ticketResponse = await fetch(`${baseUrl}/v1/ws-tickets`, {
+      method: 'POST',
+      headers,
+      body: '{}',
+    });
+    expect(ticketResponse.status).toBe(200);
+    const ticket = (await ticketResponse.json()) as { ticket: string; expiresAt: string };
+    expect(ticket.ticket).not.toContain('ws-secret');
+    const ticketSocket = await openSocket(
+      `${baseUrl.replace('http:', 'ws:')}/v1/runs/${run.id}/stream?ticket=${encodeURIComponent(ticket.ticket)}`,
+    );
+    ticketSocket.close();
+    await expect(
+      openSocket(
+        `${baseUrl.replace('http:', 'ws:')}/v1/runs/${run.id}/stream?ticket=${encodeURIComponent(ticket.ticket)}`,
+      ),
     ).rejects.toThrow();
 
     const events: Array<{ sequence: number; type: string }> = [];
