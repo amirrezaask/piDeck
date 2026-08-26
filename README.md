@@ -1,68 +1,121 @@
 # piDeck
 
-An Electron client for running and supervising PI coding agents across multiple servers.
+**A desktop control plane for Pi coding agents.**
 
-## Workspace
+Run Pi on one machine or scatter it across a small fleet. piDeck gives you one desktop app for starting sessions, watching tool calls, sending follow-ups, and returning to old transcripts without living in a pile of terminals.
 
-- `apps/client` — the Electron desktop binary and its secure preload bridge.
-- `apps/web` — the React 19 renderer built with Vite, Tailwind CSS, and shadcn/ui.
-- `apps/server` — the `pideck-server` binary that consumes `@pideck/supervisor`.
-- `packages/supervisor` — reusable PI process manager extracted from NextFlow.
-- `packages/{agent-runtime,contracts,database,observability,test-agents}` — the supervisor's required NextFlow package graph.
+```text
+┌──────────────────── piDeck desktop ────────────────────┐
+│  sessions · prompts · profiles · projects · settings   │
+└───────────────┬───────────────────────┬─────────────────┘
+                │ HTTP(S) / WebSocket   │
+        ┌───────▼────────┐      ┌───────▼────────┐
+        │ Pi supervisor  │      │ Pi supervisor  │
+        │ workstation    │      │ home server    │
+        └───────┬────────┘      └───────┬────────┘
+                │                       │
+             Pi agents               Pi agents
+```
 
-The client loads sessions from every configured server into one sidebar; right-click a session to archive it locally. Multi-server session routes use `/servers/<server-id>/sessions/<run-id>`, while `/new` opens a fresh composer. Settings → Servers stores server names, addresses, and access tokens. The composer includes a server picker, then shows that server’s agents, models, and projects. The Settings dialog also manages reusable agent profiles, skills available to Pi, installed extensions, projects, and Appearance preferences. Select a skill to browse every file in its directory and preview its Markdown contents. The Extensions page resolves Pi’s global and project extension locations, shows local and package-backed extensions with their versions and scope, checks configured npm/git packages for updates, and can update a package directly. Use the sidebar theme button or Appearance settings to switch between light and dark mode; the choice is persisted in the browser. A profile is a focused instruction block appended to Pi’s maintained default system prompt. Each new session chooses its profile, model, thinking level, and project before starting. Projects are persisted in SQLite, appear in a searchable composer picker, and can be managed from Settings → Projects: add, rename, change their working directory, or remove them without touching files on disk. Agent profile deletion is a soft delete: runs, events, and transcripts remain durable. A new working directory is saved when its session starts. Working-directory paths are normalized server-side; absolute paths and `~/...` paths are supported, and invalid directories are rejected before Pi starts. In either composer, type `/` for Pi command completion or `@` for working-directory file and folder references; completion is keyboard navigable and works against the active Supervisor. The UI fetches initial event history over bounded HTTP pages, then resumes authenticated live events over WebSocket with sequence deduplication and reconnect state. Text deltas are coalesced into assistant messages; Markdown content and fenced code blocks are rendered inline, with code highlighted by Shiki. Consecutive lifecycle, tool, and failure events are grouped behind a collapsible activity row. Completed runs stay available for follow-up chat while their supervisor process remains alive. The composer sends bounded PNG, JPEG, GIF, and WebP attachments through Pi’s image input; unsupported files are rejected before submission rather than represented as sent. Image attachments are stored with their run and reloaded into conversation history after browser or Supervisor restarts.
+## What you get
 
-Run admission is protected by a SQLite partial unique index: each agent can have at most one queued or running run across supervisor processes. Create-run, steer, follow-up, and cancel accept an `Idempotency-Key` header (or request field) and persist command receipts. WebSocket URLs never contain the service bearer token. Browsers obtain a short-lived, single-use ticket over authenticated HTTP; standalone deployments require `NEXTFLOW_SUPERVISOR_TOKEN` and should remain loopback-only unless TLS terminates in front of the service. The legacy `/v1/executions` API is disabled by default and is only registered with the explicit `enableLegacyExecutions` option. Approval and pause/resume controls are not claimed by the current backend; they remain future requirements.
+- **One inbox for every server.** Sessions from all configured supervisors land in the same sidebar.
+- **A proper launch panel.** Pick a server, project, agent profile, model, and thinking level before the first prompt.
+- **Live agent telemetry.** Read streamed Markdown, highlighted code, tool activity, lifecycle events, failures, and reconnect state as they happen.
+- **Durable conversations.** Runs, events, attachments, and transcripts survive app and supervisor restarts. Finished runs remain open for follow-up chat while their supervisor process is alive.
+- **Keyboard-native prompting.** Type `/` for Pi commands and `@` to reference files or directories from the active project.
+- **Image input.** Attach PNG, JPEG, GIF, or WebP files directly to a prompt.
+- **Fleet-aware settings.** Manage servers, projects, agent profiles, Pi skills, extensions, package updates, and appearance from the app.
+- **Local archiving.** Hide stale sessions without deleting their remote history.
 
-## Setup
+## How it works
+
+piDeck has two moving parts:
+
+1. **`pideck-server`** runs beside Pi on each machine where you want agents. It owns process lifecycle, SQLite persistence, event history, and the authenticated HTTP/WebSocket API.
+2. **The piDeck desktop app** connects to one or more servers and turns that API into a multi-session workspace.
+
+The Electron renderer never stores server tokens. The main process encrypts them with Electron `safeStorage`, checks requests against configured server origins, and trades authenticated HTTP requests for short-lived, single-use WebSocket tickets. Run admission uses a SQLite partial unique index, so one agent cannot accidentally pick up two queued or running jobs across supervisor processes.
+
+## Run it from source
+
+You need:
+
+- Node.js 22.19+
+- pnpm 9.15
+
+Install the workspace and prepare the local database:
 
 ```sh
+git clone https://github.com/amirrezaask/piDeck.git pideck
+cd pideck
 pnpm install
 cp .env.example .env
 pnpm db:migrate
 ```
 
-Node 22.19 or newer is required. Start `pideck-server` on each machine that runs agents, then add each server origin and its `NEXTFLOW_SUPERVISOR_TOKEN` under Settings → Servers in the Electron client.
-
-## Development
-
-Run the server and Electron client separately:
+Start the supervisor and desktop app in separate terminals:
 
 ```sh
 pnpm dev:server
+```
+
+```sh
 pnpm dev:client
 ```
 
-For browser-only renderer development, use `pnpm dev:web`. Vite proxies `/supervisor/*` to `http://127.0.0.1:4101` and adds the development credential. The Electron client does not put server tokens in renderer storage. Its main process encrypts tokens with Electron `safeStorage`, validates requests against configured server origins, and returns short-lived WebSocket tickets to the renderer.
+The development supervisor listens at `http://127.0.0.1:4101`. In piDeck, open **Settings → Servers**, add that address, and use the token from `NEXTFLOW_SUPERVISOR_TOKEN` in `.env`.
 
-- Renderer development URL: `http://127.0.0.1:5173`
-- Default server URL: `http://127.0.0.1:4101`
-- Health endpoint: `GET /v1/health`
+To run Pi on another machine, start `pideck-server` there and add its origin and token to the same settings page. Keep the service on loopback unless another host needs access. For network deployments, terminate TLS and enforce host authentication in front of it.
 
-Build the two binaries with:
+## Development
 
-```sh
-pnpm build:binary               # dist/pideck standalone server executable (requires Bun)
-pnpm --filter @pideck/client make
+The repository is a pnpm/Turborepo monorepo:
+
+```text
+apps/client          Electron main process and secure preload bridge
+apps/web             React 19 renderer, Vite, Tailwind CSS, shadcn/ui
+apps/server          pideck-server executable
+packages/supervisor  Pi process manager and server API
+packages/*           contracts, runtime, database, observability, test agents
 ```
 
-Set `NEXTFLOW_SUPERVISOR_HOST=0.0.0.0` only when another machine must reach the server. Put TLS and host authentication in front of any non-loopback deployment.
-
-## Verification
+Useful commands:
 
 ```sh
+pnpm dev:web          # renderer only at http://127.0.0.1:5173
+pnpm dev:server       # supervisor at http://127.0.0.1:4101
+pnpm dev:client       # build and open the Electron app
+
 pnpm build
 pnpm typecheck
-pnpm test             # 40+ unit/integration tests across the workspace
-pnpm test:coverage    # enforced coverage thresholds for client/event mapping
-pnpm test:e2e         # desktop and mobile Chromium flows
+pnpm test
+pnpm test:coverage
+pnpm test:e2e
 pnpm lint
 pnpm format:check
 ```
 
-The Playwright config uses the locally installed Google Chrome channel. In CI, install Chrome or change the project channel to a bundled Playwright browser.
+Vite proxies `/supervisor/*` to the local development server and supplies the development credential. Playwright uses the locally installed Google Chrome channel; install Chrome in CI or switch the project to a bundled Playwright browser.
 
-## Supervisor package
+## Build artifacts
+
+Build a standalone supervisor executable with Bun installed:
+
+```sh
+pnpm build:binary
+# output: dist/pideck
+```
+
+Package the desktop app with Electron Forge:
+
+```sh
+pnpm --filter @pideck/client make
+```
+
+## Embed the supervisor
+
+`@pideck/supervisor` is also a reusable package:
 
 ```ts
 import { buildSupervisorApp } from '@pideck/supervisor';
@@ -76,4 +129,6 @@ const { server } = buildSupervisorApp({
 await server.listen({ host: '127.0.0.1', port: 4101 });
 ```
 
-Call `server.close()` during shutdown. The package owns SQLite migrations, PI sessions, run lifecycle, event persistence, HTTP event history, and bounded WebSocket replay/live delivery. Event payloads default to 256 KiB, depth 16, and 10,000 items; configure stricter limits with the app options. Optional `eventRetentionDays` compacts older events, so enable it only with an explicit transcript-retention policy. Prompts, tool inputs, and output may contain sensitive information and should be protected accordingly.
+Call `server.close()` during shutdown. The package handles migrations, Pi sessions, run lifecycle, event persistence, paged HTTP history, and bounded WebSocket replay. Event payloads default to 256 KiB, 16 levels of nesting, and 10,000 items. You can set tighter limits through the app options.
+
+Prompts, tool inputs, and model output may contain source code, credentials, or other sensitive data. Treat the SQLite database and Pi session directory like the repositories your agents can access.
