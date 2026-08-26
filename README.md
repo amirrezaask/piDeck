@@ -4,6 +4,8 @@
 
 Run Pi on one machine or scatter it across a small fleet. piDeck gives you one desktop app for starting sessions, watching tool calls, sending follow-ups, and returning to old transcripts without living in a pile of terminals.
 
+![piDeck desktop app](assets/pideck.png)
+
 ```text
 ┌──────────────────── piDeck desktop ────────────────────┐
 │  sessions · prompts · profiles · projects · settings   │
