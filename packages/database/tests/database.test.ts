@@ -21,7 +21,14 @@ describe('database foundation', () => {
       const tables = connection.sqlite
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'kysely_%'")
         .all() as Array<{ name: string }>;
-      expect(tables).toHaveLength(22);
+      expect(tables).toHaveLength(25);
+      expect(tables.map((table) => table.name)).toEqual(
+        expect.arrayContaining([
+          'supervisor_worktrees',
+          'supervisor_terminal_sessions',
+          'supervisor_inbox_items',
+        ]),
+      );
     } finally {
       await connection.close();
     }

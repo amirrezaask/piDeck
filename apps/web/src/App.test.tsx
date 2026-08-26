@@ -44,6 +44,9 @@ const run: ManagedAgentRunResponse = {
   model: { provider: 'fake', id: 'fake-model' },
   thinkingLevel: 'medium',
   cwd: '/workspace',
+  executionMode: 'local',
+  worktreeId: null,
+  parentRunId: null,
   status: 'completed',
   error: null,
   createdAt: timestamp,
@@ -59,6 +62,7 @@ afterEach(() => {
   document.documentElement.classList.remove('dark');
   document.documentElement.style.colorScheme = '';
   window.localStorage.removeItem('pideck-theme');
+  window.localStorage.removeItem('pideck-layout');
   window.localStorage.removeItem('pideck-sidebar-collapsed');
   window.localStorage.removeItem('pideck-archived-runs');
   window.history.replaceState({}, '', '/');
@@ -143,6 +147,39 @@ function createClient(overrides: Partial<SupervisorClientApi> = {}): SupervisorC
     cancelRun: vi.fn().mockResolvedValue({ ...run, status: 'cancelled' }),
     steerRun: vi.fn().mockResolvedValue({ ...run, status: 'running', completedAt: null }),
     followUpRun: vi.fn().mockResolvedValue({ ...run, status: 'running', completedAt: null }),
+    getFleet: vi.fn().mockResolvedValue({
+      health: {
+        status: 'healthy',
+        database: 'connected',
+        runtime: 'ready',
+        checkedAt: timestamp,
+      },
+      runs: [],
+      counts: { active: 0, attention: 0, total: 0 },
+      complete: true,
+    }),
+    getRunChanges: vi.fn().mockResolvedValue({
+      runId: run.id,
+      scope: 'working_tree',
+      available: true,
+      unavailableReason: null,
+      baseRef: null,
+      files: [],
+      patch: '',
+      truncated: false,
+    }),
+    createWorktree: vi.fn(),
+    listWorktrees: vi.fn().mockResolvedValue({ worktrees: [] }),
+    releaseWorktree: vi.fn(),
+    createTerminalSession: vi.fn(),
+    listTerminalSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+    getTerminalSession: vi.fn(),
+    writeTerminalSession: vi.fn(),
+    cancelTerminalSession: vi.fn(),
+    listInbox: vi.fn().mockResolvedValue({ items: [] }),
+    resolveInbox: vi.fn(),
+    cancelInbox: vi.fn(),
+    searchSessions: vi.fn().mockResolvedValue({ results: [] }),
     ...overrides,
   };
 }
@@ -336,6 +373,34 @@ describe('App', () => {
     expect(document.documentElement).toHaveClass('dark');
     expect(window.localStorage.getItem('pideck-theme')).toBe('dark');
     expect(screen.getByRole('radio', { name: /Dark/ })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('switches to the tab workspace layout and persists the preference', async () => {
+    const user = userEvent.setup();
+    const secondRun = {
+      ...run,
+      id: '018bcfe4-7a4b-7000-8000-000000000777',
+      prompt: 'Fix the failing tests.',
+    };
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run, secondRun], nextCursor: null }),
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Appearance' }));
+    await user.click(screen.getByRole('radio', { name: /Tabs/ }));
+    await user.keyboard('{Escape}');
+
+    expect(window.localStorage.getItem('pideck-layout')).toBe('tabs');
+    const firstTab = screen.getByRole('tab', { name: /Review the changes\./ });
+    expect(firstTab).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Collapse sidebar' })).not.toBeInTheDocument();
+
+    firstTab.focus();
+    await user.keyboard('{ArrowRight}');
+    expect(window.location.pathname).toBe(`/sessions/${secondRun.id}`);
   });
 
   it('collapses the sidebar and remembers the preference', async () => {
@@ -632,6 +697,21 @@ describe('App', () => {
     expect(client.listRunAttachments).toHaveBeenCalledWith(run.id);
   });
 
+  it('starts a new task from a focused coding prompt', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [], nextCursor: null }),
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Review current changes' }));
+
+    expect(screen.getByRole('textbox', { name: 'Session task' })).toHaveValue(
+      'Review the current changes for correctness, regressions, and missing tests. Report findings before editing.',
+    );
+  });
+
   it('accepts dropped images in the initial composer and sends them with the run', async () => {
     const user = userEvent.setup();
     const client = createClient({
@@ -854,6 +934,68 @@ describe('App', () => {
     expect(screen.getByRole('combobox', { name: 'Agent profile' })).toHaveTextContent(
       'Remote agent',
     );
+  });
+
+  it('opens API-backed changes and terminal inspectors for a session', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Open changes' }));
+    expect(await screen.findByRole('dialog', { name: 'Workspace changes' })).toBeVisible();
+    expect(await screen.findByText('No changes in this scope.')).toBeVisible();
+    await user.keyboard('{Escape}');
+
+    await user.click(screen.getByRole('button', { name: 'Open terminal' }));
+    expect(await screen.findByRole('dialog', { name: 'Terminal session' })).toBeVisible();
+    expect(screen.getByRole('textbox', { name: 'Terminal command' })).toBeVisible();
+  });
+
+  it('hides workspace navigation while keeping fleet and inbox in the command palette', async () => {
+    const user = userEvent.setup();
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+      getFleet: vi.fn().mockResolvedValue({
+        health: {
+          status: 'healthy',
+          database: 'connected',
+          runtime: 'ready',
+          checkedAt: timestamp,
+        },
+        runs: [
+          {
+            ...run,
+            parentRunId: null,
+            executionMode: 'local',
+            worktreeId: null,
+            agentName: agent.name,
+            children: [],
+          },
+        ],
+        counts: { active: 0, attention: 0, total: 1 },
+        complete: true,
+      }),
+    });
+    render(<App client={client} />);
+
+    expect(screen.queryByRole('button', { name: 'Fleet' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Inbox' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Worktrees' })).not.toBeInTheDocument();
+
+    await user.keyboard('{Control>}k{/Control}');
+    expect(await screen.findByRole('dialog', { name: 'Command palette' })).toBeVisible();
+    await user.click(screen.getByRole('option', { name: 'Fleet' }));
+    expect(await screen.findByRole('heading', { name: 'Fleet overview' })).toBeVisible();
+    expect(window.location.pathname).toBe('/fleet');
+
+    await user.keyboard('{Control>}k{/Control}');
+    await user.click(screen.getByRole('option', { name: 'Inbox' }));
+    expect(await screen.findByRole('heading', { name: 'Inbox' })).toBeVisible();
+    expect(window.location.pathname).toBe('/inbox');
   });
 
   it('shows actionable supervisor failures', async () => {

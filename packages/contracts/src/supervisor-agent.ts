@@ -8,6 +8,7 @@ import {
   PaginationQuerySchema,
 } from './common';
 import { JsonValueSchema } from './json';
+import { ExecutionModeSchema } from './workspace';
 
 export const AgentThinkingLevelSchema = z.enum([
   'off',
@@ -185,6 +186,9 @@ export const CreateManagedAgentRunRequestSchema = z.object({
   cwd: z.string().trim().min(1).max(4096).optional(),
   idempotencyKey: IdempotencyKeySchema.optional(),
   attachments: z.array(AgentImageAttachmentSchema).max(4).optional(),
+  executionMode: ExecutionModeSchema.optional(),
+  worktreeId: IdSchema.optional(),
+  parentRunId: IdSchema.optional(),
 });
 export type CreateManagedAgentRunRequest = z.infer<typeof CreateManagedAgentRunRequestSchema>;
 
@@ -202,6 +206,9 @@ export const ManagedAgentRunResponseSchema = z.object({
   model: AgentModelSchema.nullable(),
   thinkingLevel: AgentThinkingLevelSchema.nullable(),
   cwd: z.string().min(1),
+  executionMode: ExecutionModeSchema.optional(),
+  worktreeId: IdSchema.nullable().optional(),
+  parentRunId: IdSchema.nullable().optional(),
   status: ManagedAgentRunStatusSchema,
   error: ManagedAgentRunErrorSchema.nullable(),
   createdAt: IsoTimestampSchema,

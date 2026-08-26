@@ -129,13 +129,54 @@
   }
   body {
     @apply bg-background text-foreground;
+    min-width: 20rem;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
   }
   html {
     @apply font-sans;
+    scrollbar-color: color-mix(in oklch, var(--foreground) 22%, transparent) transparent;
+    scrollbar-width: thin;
+  }
+  button,
+  input,
+  textarea,
+  [contenteditable="true"] {
+    caret-color: var(--foreground);
   }
   ::selection {
     background: color-mix(in oklch, var(--primary) 24%, transparent);
     color: var(--foreground);
+  }
+  ::-webkit-scrollbar {
+    width: 0.65rem;
+    height: 0.65rem;
+  }
+  ::-webkit-scrollbar-thumb {
+    border: 0.2rem solid transparent;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--foreground) 22%, transparent);
+    background-clip: padding-box;
+  }
+}
+
+.shimmer {
+  background: linear-gradient(
+    100deg,
+    currentColor 30%,
+    color-mix(in oklch, currentColor 35%, transparent) 48%,
+    currentColor 66%
+  );
+  background-size: 240% 100%;
+  background-clip: text;
+  color: transparent;
+  animation: pideck-shimmer 1.8s ease-in-out infinite;
+}
+
+@keyframes pideck-shimmer {
+  to {
+    background-position: -240% 0;
   }
 }
 
@@ -185,5 +226,10 @@
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;
+  }
+  .shimmer {
+    animation: none;
+    background: none;
+    color: currentColor;
   }
 }

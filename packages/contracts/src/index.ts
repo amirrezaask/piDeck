@@ -90,3 +90,4 @@ export {
   UpdateManagedExtensionsRequestSchema,
 } from './supervisor-agent';
 export * from './workflow';
+export * from './workspace';

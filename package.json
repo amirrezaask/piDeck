@@ -7,8 +7,8 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "build": "turbo run build",
-    "build:binary": "pnpm build && node scripts/build-binary.mjs",
+    "build": "pnpm build:binary && pnpm --filter @pideck/client make && node scripts/verify-build.mjs",
+    "build:binary": "turbo run build && node scripts/build-binary.mjs",
     "dev": "turbo run dev",
     "dev:web": "pnpm --filter @pideck/web dev",
     "dev:client": "pnpm --filter @pideck/client dev",

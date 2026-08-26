@@ -1,9 +1,14 @@
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 
 module.exports = {
+  outDir: '../../dist/electron',
   packagerConfig: {
     asar: true,
     name: 'piDeck',
+    // The Electron main bundle contains the Supervisor and its dependencies.
+    // Keep pnpm's workspace tree out of the archive entirely.
+    prune: false,
+    ignore: /(?:^|[\\/])(?:node_modules|out|\.turbo)(?:[\\/]|$)/,
   },
   makers: [{ name: '@electron-forge/maker-zip', platforms: ['darwin', 'win32', 'linux'] }],
   plugins: [

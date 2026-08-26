@@ -32,10 +32,10 @@ Run Pi on one machine or scatter it across a small fleet. piDeck gives you one d
 
 ## How it works
 
-piDeck has two moving parts:
+piDeck has two deployment options:
 
 1. **`pideck-server`** runs beside Pi on each machine where you want agents. It owns process lifecycle, SQLite persistence, event history, and the authenticated HTTP/WebSocket API.
-2. **The piDeck desktop app** connects to one or more servers and turns that API into a multi-session workspace.
+2. **The piDeck desktop app** starts the same Supervisor API inside Electron's main process, then connects to it automatically. The desktop app needs no separately launched local server. It can also connect to additional remote servers.
 
 The Electron renderer never stores server tokens. The main process encrypts them with Electron `safeStorage`, checks requests against configured server origins, and trades authenticated HTTP requests for short-lived, single-use WebSocket tickets. Run admission uses a SQLite partial unique index, so one agent cannot accidentally pick up two queued or running jobs across supervisor processes.
 
@@ -56,17 +56,13 @@ cp .env.example .env
 pnpm db:migrate
 ```
 
-Start the supervisor and desktop app in separate terminals:
-
-```sh
-pnpm dev:server
-```
+Start the desktop app:
 
 ```sh
 pnpm dev:client
 ```
 
-The development supervisor listens at `http://127.0.0.1:4101`. In piDeck, open **Settings → Servers**, add that address, and use the token from `NEXTFLOW_SUPERVISOR_TOKEN` in `.env`.
+The desktop app starts its built-in Supervisor on a loopback port. To run a standalone development server for another client or machine, use `pnpm dev:server`; it listens at `http://127.0.0.1:4101`. In piDeck, open **Settings → Servers**, add that address, and use the token from `NEXTFLOW_SUPERVISOR_TOKEN` in `.env`.
 
 To run Pi on another machine, start `pideck-server` there and add its origin and token to the same settings page. Keep the service on loopback unless another host needs access. For network deployments, terminate TLS and enforce host authentication in front of it.
 
@@ -102,18 +98,19 @@ Vite proxies `/supervisor/*` to the local development server and supplies the de
 
 ## Build artifacts
 
-Build a standalone supervisor executable with Bun installed:
+`pnpm build` builds the workspace, then creates both release artifacts. Bun must be installed because it compiles the standalone server and bundles the Electron main process.
 
 ```sh
-pnpm build:binary
-# output: dist/pideck
+pnpm build
 ```
 
-Package the desktop app with Electron Forge:
+The outputs are:
 
-```sh
-pnpm --filter @pideck/client make
-```
+- `dist/pideck-server` (`.exe` on Windows): static standalone server binary
+- `dist/electron/<app>/<app>.app/Contents/MacOS/piDeck` (macOS): static Electron executable
+- `dist/electron/make/zip/<platform>/<arch>/`: packaged Electron artifact
+
+To build only the static server binary, run `pnpm build:binary`. To package the desktop app separately, run `pnpm --filter @pideck/client make`.
 
 ## Embed the supervisor
 

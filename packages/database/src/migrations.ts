@@ -12,6 +12,7 @@ import { supervisorProjectsMigration } from '../migrations/009_supervisor_projec
 import { supervisorRunAdmissionAndProfilesMigration } from '../migrations/010_supervisor_run_admission_and_profiles';
 import { supervisorCommandReceiptTypesMigration } from '../migrations/011_supervisor_command_receipt_types';
 import { supervisorAgentRunAttachmentsMigration } from '../migrations/012_supervisor_agent_run_attachments';
+import { workspaceCapabilitiesMigration } from '../migrations/013_workspace_capabilities';
 import type { MigrationDatabase } from './schema';
 
 const migrations: Record<string, Migration> = {
@@ -27,6 +28,7 @@ const migrations: Record<string, Migration> = {
   '010_supervisor_run_admission_and_profiles': supervisorRunAdmissionAndProfilesMigration,
   '011_supervisor_command_receipt_types': supervisorCommandReceiptTypesMigration,
   '012_supervisor_agent_run_attachments': supervisorAgentRunAttachmentsMigration,
+  '013_workspace_capabilities': workspaceCapabilitiesMigration,
 };
 
 const provider: MigrationProvider = {

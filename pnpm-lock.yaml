@@ -53,6 +53,9 @@ importers:
       '@electron/fuses':
         specifier: ^1.8.0
         version: 1.8.0
+      '@pideck/supervisor':
+        specifier: workspace:*
+        version: link:../../packages/supervisor
       electron:
         specifier: ^43.4.0
         version: 43.4.1

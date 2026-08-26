@@ -236,6 +236,54 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   });
 });
 
+test('switches between sidebar and session tabs layouts', async ({ page }, testInfo) => {
+  const errors = watchBrowserErrors(page);
+  await page.route('**/v1/agents?**', (route) =>
+    route.fulfill({ json: { agents: [agent], nextCursor: null } }),
+  );
+  await page.route('**/v1/runs?**', (route) =>
+    route.fulfill({ json: { runs: [run], nextCursor: null } }),
+  );
+  await page.route('**/v1/models', (route) =>
+    route.fulfill({
+      json: {
+        models: [{ provider: 'fake', id: 'fake-model', name: 'Fake model' }],
+        defaultModel: { provider: 'fake', id: 'fake-model', name: 'Fake model' },
+      },
+    }),
+  );
+  await page.route(`**/v1/runs/${run.id}/events?**`, (route) =>
+    route.fulfill({ json: { events: [] } }),
+  );
+  await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, () => undefined);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const settings = page.getByRole('dialog', { name: 'Settings' });
+  await settings.getByRole('button', { name: 'Appearance' }).click();
+  await settings.getByRole('radio', { name: /Tabs/ }).click();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('pideck-layout'))).toBe('tabs');
+  await page.keyboard.press('Escape');
+
+  const sessionTab = page.getByRole('tab', { name: /Review the changes\./ });
+  await expect(sessionTab).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Collapse sidebar' })).toHaveCount(0);
+  await sessionTab.focus();
+  await expect(sessionTab).toBeFocused();
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
+    .toBe(true);
+  expect(errors).toEqual([]);
+
+  mkdirSync('.impeccable/review', { recursive: true });
+  const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
+  await page.screenshot({
+    path: `.impeccable/review/tabs-layout-${viewport}.png`,
+    fullPage: true,
+  });
+});
+
 test('accepts dropped images and documents in the chat composer', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
   await page.route('**/v1/agents?**', (route) =>
@@ -554,6 +602,74 @@ test('completes Pi commands and @ file references in the new-session composer', 
   await page.keyboard.press('Enter');
   await expect(composer).toHaveValue('@src/App.tsx ');
   expect(errors).toEqual([]);
+});
+
+test('supervises the fleet and opens the global command palette', async ({ page }, testInfo) => {
+  const errors = watchBrowserErrors(page);
+  await page.route('**/v1/agents?**', (route) =>
+    route.fulfill({ json: { agents: [agent], nextCursor: null } }),
+  );
+  await page.route('**/v1/runs?**', (route) =>
+    route.fulfill({ json: { runs: [run], nextCursor: null } }),
+  );
+  await page.route('**/v1/models', (route) =>
+    route.fulfill({ json: { models: [], defaultModel: null } }),
+  );
+  await page.route('**/v1/fleet', (route) =>
+    route.fulfill({
+      json: {
+        health: {
+          status: 'healthy',
+          database: 'connected',
+          runtime: 'ready',
+          checkedAt: timestamp,
+        },
+        runs: [
+          {
+            ...run,
+            parentRunId: null,
+            executionMode: 'local',
+            worktreeId: null,
+            agentName: agent.name,
+            children: [],
+          },
+        ],
+        counts: { active: 0, attention: 0, total: 1 },
+        complete: true,
+      },
+    }),
+  );
+  await page.route('**/v1/sessions/search?**', (route) =>
+    route.fulfill({
+      json: {
+        results: [
+          {
+            runId: run.id,
+            agentId: agent.id,
+            title: run.prompt,
+            cwd: run.cwd,
+            status: run.status,
+            createdAt: run.createdAt,
+          },
+        ],
+      },
+    }),
+  );
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/fleet');
+  await expect(page.getByRole('heading', { name: 'Fleet overview' })).toBeVisible();
+  await expect(page.getByText('Workspace agent · local')).toBeVisible();
+  mkdirSync('.impeccable/review', { recursive: true });
+  const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
+  await page.screenshot({ path: `.impeccable/review/fleet-${viewport}.png`, fullPage: true });
+  await page.keyboard.press('Control+K');
+  const palette = page.getByRole('dialog', { name: 'Command palette' });
+  await expect(palette).toBeVisible();
+  await palette.getByPlaceholder('Search commands and sessions').fill('Review');
+  await expect(palette.getByRole('option', { name: /Review the changes/ })).toBeVisible();
+  expect(errors).toEqual([]);
+  await page.screenshot({ path: `.impeccable/review/palette-${viewport}.png`, fullPage: true });
 });
 
 test('creates an agent and starts a managed run', async ({ page }, testInfo) => {

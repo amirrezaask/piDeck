@@ -1,6 +1,9 @@
+import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import type { AddressInfo } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 
+import { buildSupervisorApp, type SupervisorApp } from '@pideck/supervisor';
 import {
   app,
   BrowserWindow,
@@ -33,12 +36,56 @@ interface ServerRequest {
   readonly body?: string;
 }
 
+const BUILTIN_SERVER_ID = 'builtin';
 const allowedMethods = new Set(['GET', 'POST', 'PATCH', 'DELETE']);
 let mainWindow: BrowserWindow | undefined;
 let servers: StoredServer[] = [];
+let builtinServer: StoredServer | undefined;
+let builtinSupervisor: SupervisorApp | undefined;
+let builtinServiceToken: string | undefined;
+let isQuitting = false;
 
 function configPath(): string {
   return join(app.getPath('userData'), 'servers.json');
+}
+
+async function startBuiltinServer(): Promise<StoredServer> {
+  const serviceToken = randomBytes(32).toString('base64url');
+  const supervisor = buildSupervisorApp({
+    databasePath: join(app.getPath('userData'), 'data', 'pideck.sqlite'),
+    agentDefaultCwd: app.getPath('home'),
+    serviceToken,
+  });
+  builtinServiceToken = serviceToken;
+
+  try {
+    await supervisor.server.listen({ host: '127.0.0.1', port: 0 });
+    const address = supervisor.server.server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('The built-in Supervisor did not report a listening address');
+    }
+    const addressInfo = address as AddressInfo;
+    const server: StoredServer = {
+      id: BUILTIN_SERVER_ID,
+      name: 'This computer',
+      address: `http://127.0.0.1:${addressInfo.port}`,
+    };
+    builtinSupervisor = supervisor;
+    builtinServer = server;
+    return server;
+  } catch (error) {
+    builtinServiceToken = undefined;
+    await supervisor.server.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function stopBuiltinServer(): Promise<void> {
+  const supervisor = builtinSupervisor;
+  builtinSupervisor = undefined;
+  builtinServer = undefined;
+  builtinServiceToken = undefined;
+  if (supervisor) await supervisor.server.close();
 }
 
 function normalizeAddress(address: string): string {
@@ -58,25 +105,33 @@ function publicServer(server: StoredServer) {
     name: server.name,
     address: server.address,
     hasToken: Boolean(server.encryptedToken),
+    isBuiltin: server.id === BUILTIN_SERVER_ID,
   };
 }
 
 async function loadServers(): Promise<void> {
+  let configuredServers: StoredServer[] = [];
   try {
     const value: unknown = JSON.parse(await readFile(configPath(), 'utf8'));
-    servers = Array.isArray(value) ? value.filter(isStoredServer) : [];
+    configuredServers = Array.isArray(value) ? value.filter(isStoredServer) : [];
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
       console.error('Failed to read servers', error);
-    servers = [];
   }
+  servers = [
+    ...(builtinServer ? [builtinServer] : []),
+    ...configuredServers.filter((server) => server.id !== BUILTIN_SERVER_ID),
+  ];
 }
 
 async function persistServers(): Promise<void> {
   const path = configPath();
   const temporaryPath = `${path}.tmp`;
+  const configuredServers = servers.filter((server) => server.id !== BUILTIN_SERVER_ID);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(temporaryPath, `${JSON.stringify(servers, null, 2)}\n`, { mode: 0o600 });
+  await writeFile(temporaryPath, `${JSON.stringify(configuredServers, null, 2)}\n`, {
+    mode: 0o600,
+  });
   await rename(temporaryPath, path);
 }
 
@@ -92,6 +147,7 @@ function encryptToken(token: string): string | undefined {
 }
 
 function decryptToken(server: StoredServer): string | undefined {
+  if (server.id === BUILTIN_SERVER_ID) return builtinServiceToken;
   if (!server.encryptedToken) return undefined;
   return safeStorage.decryptString(Buffer.from(server.encryptedToken, 'base64'));
 }
@@ -115,6 +171,7 @@ function registerIpc(): void {
   ipcMain.handle('servers:save', async (event, value: unknown) => {
     authorize(event);
     const input = parseServerInput(value);
+    if (input.id === BUILTIN_SERVER_ID) throw new Error('The built-in server cannot be edited');
     const id = input.id ?? crypto.randomUUID();
     const existing = servers.find((server) => server.id === id);
     const next: StoredServer = {
@@ -132,6 +189,7 @@ function registerIpc(): void {
   ipcMain.handle('servers:remove', async (event, serverId: unknown) => {
     authorize(event);
     if (typeof serverId !== 'string') throw new Error('Invalid server id');
+    if (serverId === BUILTIN_SERVER_ID) throw new Error('The built-in server cannot be removed');
     servers = servers.filter((server) => server.id !== serverId);
     await persistServers();
   });
@@ -253,15 +311,30 @@ if (!app.requestSingleInstanceLock()) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
   });
-  app.whenReady().then(async () => {
-    session.defaultSession.setPermissionCheckHandler(() => false);
-    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
-      callback(false),
-    );
-    await loadServers();
-    registerIpc();
-    createWindow();
+  app.on('before-quit', (event) => {
+    if (isQuitting || !builtinSupervisor) return;
+    event.preventDefault();
+    isQuitting = true;
+    void stopBuiltinServer()
+      .catch((error: unknown) => console.error('Failed to stop built-in Supervisor', error))
+      .finally(() => app.quit());
   });
+  void app
+    .whenReady()
+    .then(async () => {
+      session.defaultSession.setPermissionCheckHandler(() => false);
+      session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
+        callback(false),
+      );
+      await startBuiltinServer();
+      await loadServers();
+      registerIpc();
+      createWindow();
+    })
+    .catch((error: unknown) => {
+      console.error('Failed to start piDeck', error);
+      app.quit();
+    });
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

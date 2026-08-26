@@ -5,18 +5,25 @@ import type { AgentFactory } from '@nextflow/agent-runtime';
 import {
   AgentMessageRequestSchema,
   CancelExecutionResponseSchema,
+  ChangeScopeSchema,
   ComposerSuggestionsRequestSchema,
   ComposerSuggestionsResponseSchema,
   CreateExecutionRequestSchema,
+  CreateInboxItemRequestSchema,
   CreateManagedAgentRequestSchema,
   CreateManagedAgentRunRequestSchema,
   CreateManagedProjectRequestSchema,
+  CreateTerminalSessionRequestSchema,
+  CreateWorktreeRequestSchema,
   type ErrorCode,
   ErrorResponseSchema,
   ExecutionEventsQuerySchema,
   ExecutionListQuerySchema,
   ExecutionListResponseSchema,
+  FleetOverviewResponseSchema,
   HealthResponseSchema,
+  InboxItemResponseSchema,
+  InboxListResponseSchema,
   ManagedAgentEventsQuerySchema,
   ManagedAgentEventsResponseSchema,
   ManagedAgentExtensionsResponseSchema,
@@ -29,9 +36,17 @@ import {
   ManagedAgentRunResponseSchema,
   ManagedProjectListQuerySchema,
   ManagedProjectListResponseSchema,
+  ResolveInboxItemRequestSchema,
+  RunChangesResponseSchema,
+  SessionSearchQuerySchema,
+  SessionSearchResponseSchema,
+  TerminalSessionListResponseSchema,
+  TerminalSessionResponseSchema,
   UpdateManagedAgentRequestSchema,
   UpdateManagedExtensionsRequestSchema,
   UpdateManagedProjectRequestSchema,
+  WorktreeListResponseSchema,
+  WorktreeResponseSchema,
 } from '@nextflow/contracts';
 import {
   createSupervisorDatabase,
@@ -76,11 +91,13 @@ import {
   InvalidWorkingDirectoryError,
   resolveWorkingDirectory,
 } from './working-directory.js';
+import { WorkspaceCapabilityError, WorkspaceService } from './workspace-service.js';
 
 const ExecutionParamsSchema = z.object({ executionId: z.string().min(1) });
 const AgentParamsSchema = z.object({ agentId: z.string().uuid() });
 const AgentRunParamsSchema = z.object({ runId: z.string().uuid() });
 const ProjectParamsSchema = z.object({ projectId: z.string().uuid() });
+const ResourceParamsSchema = z.object({ id: z.string().uuid() });
 
 export interface SupervisorAppOptions {
   databasePath: string;
@@ -114,6 +131,7 @@ export interface SupervisorApp {
   readonly agents: ManagedAgentService;
   readonly extensions: PiExtensionCatalog;
   readonly projects: ProjectService;
+  readonly workspace: WorkspaceService;
 }
 
 export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp {
@@ -151,6 +169,7 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
   const extensionService =
     options.piExtensionService ?? new PiExtensionService({ cwd: defaultCwd });
   const composer = new ComposerCatalog({ defaultCwd });
+  const workspace = new WorkspaceService(database.db);
   const agents = new ManagedAgentService({
     db: database.db,
     sessionFactory,
@@ -482,13 +501,25 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
         typeof request.headers['idempotency-key'] === 'string'
           ? request.headers['idempotency-key']
           : undefined;
+      let requested = parsed.data;
+      if (parsed.data.executionMode === 'worktree') {
+        if (!parsed.data.worktreeId)
+          throw new WorkspaceCapabilityError(
+            'validation_failed',
+            'Worktree mode requires a worktree',
+          );
+        const worktree = await workspace.getWorktree(parsed.data.worktreeId);
+        if (worktree.status !== 'ready')
+          throw new WorkspaceCapabilityError('invalid_state_transition', 'Worktree is not ready');
+        requested = { ...parsed.data, cwd: worktree.path };
+      }
       return reply
         .code(202)
         .send(
           await agents.createRun(
-            idempotencyKey && !parsed.data.idempotencyKey
-              ? { ...parsed.data, idempotencyKey }
-              : parsed.data,
+            idempotencyKey && !requested.idempotencyKey
+              ? { ...requested, idempotencyKey }
+              : requested,
           ),
         );
     } catch (error) {
@@ -725,6 +756,111 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     );
   });
 
+  server.get('/v1/fleet', async (_request, reply) =>
+    reply.send(FleetOverviewResponseSchema.parse(await workspace.fleet())),
+  );
+
+  server.get('/v1/runs/:runId/changes', async (request, reply) => {
+    const params = AgentRunParamsSchema.parse(request.params);
+    const query = z
+      .object({
+        scope: ChangeScopeSchema.default('working_tree'),
+        baseRef: z.string().max(256).optional(),
+      })
+      .parse(request.query);
+    return reply.send(
+      RunChangesResponseSchema.parse(
+        await workspace.changes(params.runId, query.scope, query.baseRef),
+      ),
+    );
+  });
+
+  server.post('/v1/worktrees', async (request, reply) =>
+    reply
+      .code(201)
+      .send(
+        WorktreeResponseSchema.parse(
+          await workspace.createWorktree(CreateWorktreeRequestSchema.parse(request.body)),
+        ),
+      ),
+  );
+  server.get('/v1/worktrees', async (_request, reply) =>
+    reply.send(WorktreeListResponseSchema.parse({ worktrees: await workspace.listWorktrees() })),
+  );
+  server.delete('/v1/worktrees/:id', async (request, reply) =>
+    reply.send(
+      WorktreeResponseSchema.parse(
+        await workspace.releaseWorktree(ResourceParamsSchema.parse(request.params).id),
+      ),
+    ),
+  );
+
+  server.post('/v1/terminal-sessions', async (request, reply) =>
+    reply
+      .code(202)
+      .send(
+        TerminalSessionResponseSchema.parse(
+          await workspace.createTerminal(CreateTerminalSessionRequestSchema.parse(request.body)),
+        ),
+      ),
+  );
+  server.get('/v1/terminal-sessions', async (_request, reply) =>
+    reply.send(
+      TerminalSessionListResponseSchema.parse({ sessions: await workspace.listTerminals() }),
+    ),
+  );
+  server.get('/v1/terminal-sessions/:id', async (request, reply) =>
+    reply.send(
+      TerminalSessionResponseSchema.parse(
+        await workspace.getTerminal(ResourceParamsSchema.parse(request.params).id),
+      ),
+    ),
+  );
+  server.post('/v1/terminal-sessions/:id/input', async (request, reply) => {
+    const body = z.object({ data: z.string().max(65536) }).parse(request.body);
+    return reply.send(
+      await workspace.writeTerminal(ResourceParamsSchema.parse(request.params).id, body.data),
+    );
+  });
+  server.post('/v1/terminal-sessions/:id/cancel', async (request, reply) =>
+    reply.send(await workspace.cancelTerminal(ResourceParamsSchema.parse(request.params).id)),
+  );
+
+  server.post('/v1/inbox', async (request, reply) =>
+    reply
+      .code(201)
+      .send(
+        InboxItemResponseSchema.parse(
+          await workspace.createInbox(CreateInboxItemRequestSchema.parse(request.body)),
+        ),
+      ),
+  );
+  server.get('/v1/inbox', async (_request, reply) =>
+    reply.send(InboxListResponseSchema.parse({ items: await workspace.listInbox() })),
+  );
+  server.post('/v1/inbox/:id/resolve', async (request, reply) => {
+    const body = ResolveInboxItemRequestSchema.parse(request.body);
+    return reply.send(
+      InboxItemResponseSchema.parse(
+        await workspace.resolveInbox(ResourceParamsSchema.parse(request.params).id, body.response),
+      ),
+    );
+  });
+  server.post('/v1/inbox/:id/cancel', async (request, reply) =>
+    reply.send(
+      InboxItemResponseSchema.parse(
+        await workspace.cancelInbox(ResourceParamsSchema.parse(request.params).id),
+      ),
+    ),
+  );
+
+  server.get('/v1/sessions/search', async (request, reply) => {
+    const query = SessionSearchQuerySchema.parse(request.query);
+    return reply.send(
+      SessionSearchResponseSchema.parse(await workspace.search(query.q, query.limit)),
+    );
+  });
+
   if (options.enableLegacyExecutions === true) {
     server.post('/v1/executions', async (request, reply) => {
       const parsed = CreateExecutionRequestSchema.safeParse(request.body);
@@ -870,12 +1006,13 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     websocketTickets.clear();
     clearInterval(ticketCleanup);
     eventWebSocketServer.close();
+    await workspace.close();
     await agents.close();
     await service.close();
     await database.close();
   });
 
-  return { server, database, service, agents, extensions: extensionService, projects };
+  return { server, database, service, agents, extensions: extensionService, projects, workspace };
 }
 
 function isPublicErrorCode(value: string): value is ErrorCode {
@@ -968,6 +1105,11 @@ function handleError(reply: FastifyReply, error: unknown): FastifyReply {
   }
   if (error instanceof ManagedAgentRunNotCancellableError) {
     return sendError(reply, 409, 'run_not_cancellable', error.message);
+  }
+  if (error instanceof WorkspaceCapabilityError) {
+    const status =
+      error.code === 'not_found' ? 404 : error.code === 'invalid_state_transition' ? 409 : 400;
+    return sendError(reply, status, error.code, error.message);
   }
   if (error instanceof PiExtensionNotConfiguredError) {
     return sendError(reply, 400, 'validation_failed', error.message);

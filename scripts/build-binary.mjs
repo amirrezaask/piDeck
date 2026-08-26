@@ -6,7 +6,10 @@ const root = resolve(import.meta.dirname, '..');
 const webRoot = resolve(root, 'apps/web/dist');
 const buildDirectory = resolve(root, 'dist/.pideck-binary');
 const entry = resolve(buildDirectory, 'entry.ts');
-const output = resolve(root, 'dist/pideck');
+const output = resolve(
+  root,
+  process.platform === 'win32' ? 'dist/pideck-server.exe' : 'dist/pideck-server',
+);
 
 async function collectFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -59,7 +62,7 @@ async function main() {
     });
   });
 
-  console.log(`Built ${output}`);
+  console.log(`Built static server binary: ${output}`);
 }
 
 await main();

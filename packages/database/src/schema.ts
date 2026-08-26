@@ -222,6 +222,9 @@ export interface SupervisorAgentRunsTable {
   model_id: Nullable<string>;
   thinking_level: Nullable<string>;
   cwd: string;
+  execution_mode: DatabaseColumn<string>;
+  worktree_id: DatabaseColumn<Nullable<string>>;
+  parent_run_id: DatabaseColumn<Nullable<string>>;
   status: string;
   error_code: Nullable<string>;
   error_message: Nullable<string>;
@@ -264,6 +267,44 @@ export interface SupervisorProjectsTable {
   last_used_at: string;
 }
 
+export interface SupervisorWorktreesTable {
+  id: string;
+  project_id: string;
+  path: string;
+  branch: string;
+  base_ref: string;
+  status: string;
+  error: Nullable<string>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SupervisorTerminalSessionsTable {
+  id: string;
+  cwd: string;
+  command: string;
+  args_json: string;
+  status: string;
+  exit_code: Nullable<number>;
+  output: string;
+  truncated: number;
+  created_at: string;
+  completed_at: Nullable<string>;
+}
+
+export interface SupervisorInboxItemsTable {
+  id: string;
+  kind: string;
+  run_id: Nullable<string>;
+  title: string;
+  body: string;
+  options_json: string;
+  status: string;
+  response: Nullable<string>;
+  created_at: string;
+  resolved_at: Nullable<string>;
+}
+
 export interface IdentityDatabase {
   identity_users: IdentityUsersTable;
   identity_roles: IdentityRolesTable;
@@ -293,6 +334,9 @@ export interface SupervisorDatabase {
   supervisor_agent_run_attachments: SupervisorAgentRunAttachmentsTable;
   supervisor_agent_command_receipts: SupervisorAgentCommandReceiptsTable;
   supervisor_projects: SupervisorProjectsTable;
+  supervisor_worktrees: SupervisorWorktreesTable;
+  supervisor_terminal_sessions: SupervisorTerminalSessionsTable;
+  supervisor_inbox_items: SupervisorInboxItemsTable;
 }
 
 export interface MigrationDatabase extends WorkflowDatabase, SupervisorDatabase {}

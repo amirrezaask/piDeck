@@ -366,6 +366,9 @@ export class ManagedAgentService {
     if (!(await this.getAgentRow(request.agentId))) {
       throw new ManagedAgentNotFoundError(request.agentId);
     }
+    if (request.parentRunId && !(await this.getRunRow(request.parentRunId))) {
+      throw new ManagedAgentRunNotFoundError(request.parentRunId);
+    }
     const receipt = await this.beginReceipt(
       request.agentId,
       'run_create',
@@ -423,6 +426,9 @@ export class ManagedAgentService {
               model_id: sessionOptions.model?.id ?? null,
               thinking_level: sessionOptions.thinkingLevel ?? null,
               cwd: sessionOptions.cwd ?? this.defaultCwd,
+              execution_mode: request.executionMode ?? 'local',
+              worktree_id: request.worktreeId ?? null,
+              parent_run_id: request.parentRunId ?? null,
               status: 'queued',
               error_code: null,
               error_message: null,
@@ -1496,6 +1502,9 @@ export class ManagedAgentService {
           : null,
       thinkingLevel: row.thinking_level,
       cwd: row.cwd,
+      executionMode: row.execution_mode,
+      worktreeId: row.worktree_id,
+      parentRunId: row.parent_run_id,
       status: row.status,
       error:
         row.error_code === null || row.error_message === null

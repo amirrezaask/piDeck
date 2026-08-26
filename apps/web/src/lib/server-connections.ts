@@ -5,6 +5,7 @@ export interface ServerDefinition {
   readonly name: string;
   readonly address: string;
   readonly hasToken: boolean;
+  readonly isBuiltin?: boolean;
 }
 
 export interface ServerInput {
@@ -174,6 +175,7 @@ function publicServer(server: StoredServer): ServerDefinition {
     name: server.name,
     address: server.address,
     hasToken: server.token.length > 0,
+    isBuiltin: false,
   };
 }
 

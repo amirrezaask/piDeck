@@ -43,6 +43,26 @@ import {
   UpdateManagedExtensionsRequestSchema,
   type UpdateManagedProjectRequest,
   UpdateManagedProjectRequestSchema,
+  type ChangeScope,
+  type CreateTerminalSessionRequest,
+  CreateTerminalSessionRequestSchema,
+  type CreateWorktreeRequest,
+  CreateWorktreeRequestSchema,
+  type FleetOverviewResponse,
+  FleetOverviewResponseSchema,
+  type InboxItemResponse,
+  InboxItemResponseSchema,
+  InboxListResponseSchema,
+  type RunChangesResponse,
+  RunChangesResponseSchema,
+  type SessionSearchResponse,
+  SessionSearchResponseSchema,
+  type TerminalSessionResponse,
+  TerminalSessionListResponseSchema,
+  TerminalSessionResponseSchema,
+  type WorktreeResponse,
+  WorktreeListResponseSchema,
+  WorktreeResponseSchema,
 } from '@nextflow/contracts';
 import { ApiError } from './api-error';
 
@@ -186,6 +206,84 @@ export class SupervisorClient {
     if (query.status) params.set('status', query.status);
     if (query.cursor) params.set('cursor', query.cursor);
     return this.request(`/v1/runs?${params.toString()}`, ManagedAgentRunListResponseSchema);
+  }
+
+  getFleet(): Promise<FleetOverviewResponse> {
+    return this.request('/v1/fleet', FleetOverviewResponseSchema);
+  }
+
+  getRunChanges(runId: string, scope: ChangeScope, baseRef?: string): Promise<RunChangesResponse> {
+    const query = new URLSearchParams({ scope });
+    if (baseRef) query.set('baseRef', baseRef);
+    return this.request(
+      `/v1/runs/${encodeURIComponent(runId)}/changes?${query}`,
+      RunChangesResponseSchema,
+    );
+  }
+
+  createWorktree(request: CreateWorktreeRequest): Promise<WorktreeResponse> {
+    return this.request('/v1/worktrees', WorktreeResponseSchema, {
+      method: 'POST',
+      body: JSON.stringify(CreateWorktreeRequestSchema.parse(request)),
+    });
+  }
+  listWorktrees(): Promise<{ worktrees: WorktreeResponse[] }> {
+    return this.request('/v1/worktrees', WorktreeListResponseSchema);
+  }
+  releaseWorktree(id: string): Promise<WorktreeResponse> {
+    return this.request(`/v1/worktrees/${encodeURIComponent(id)}`, WorktreeResponseSchema, {
+      method: 'DELETE',
+    });
+  }
+
+  createTerminalSession(request: CreateTerminalSessionRequest): Promise<TerminalSessionResponse> {
+    return this.request('/v1/terminal-sessions', TerminalSessionResponseSchema, {
+      method: 'POST',
+      body: JSON.stringify(CreateTerminalSessionRequestSchema.parse(request)),
+    });
+  }
+  listTerminalSessions(): Promise<{ sessions: TerminalSessionResponse[] }> {
+    return this.request('/v1/terminal-sessions', TerminalSessionListResponseSchema);
+  }
+  getTerminalSession(id: string): Promise<TerminalSessionResponse> {
+    return this.request(
+      `/v1/terminal-sessions/${encodeURIComponent(id)}`,
+      TerminalSessionResponseSchema,
+    );
+  }
+  writeTerminalSession(id: string, data: string): Promise<TerminalSessionResponse> {
+    return this.request(
+      `/v1/terminal-sessions/${encodeURIComponent(id)}/input`,
+      TerminalSessionResponseSchema,
+      { method: 'POST', body: JSON.stringify({ data }) },
+    );
+  }
+  cancelTerminalSession(id: string): Promise<TerminalSessionResponse> {
+    return this.request(
+      `/v1/terminal-sessions/${encodeURIComponent(id)}/cancel`,
+      TerminalSessionResponseSchema,
+      { method: 'POST' },
+    );
+  }
+
+  listInbox(): Promise<{ items: InboxItemResponse[] }> {
+    return this.request('/v1/inbox', InboxListResponseSchema);
+  }
+  resolveInbox(id: string, response: string): Promise<InboxItemResponse> {
+    return this.request(`/v1/inbox/${encodeURIComponent(id)}/resolve`, InboxItemResponseSchema, {
+      method: 'POST',
+      body: JSON.stringify({ response }),
+    });
+  }
+  cancelInbox(id: string): Promise<InboxItemResponse> {
+    return this.request(`/v1/inbox/${encodeURIComponent(id)}/cancel`, InboxItemResponseSchema, {
+      method: 'POST',
+    });
+  }
+
+  searchSessions(q: string, limit = 30): Promise<SessionSearchResponse> {
+    const query = new URLSearchParams({ q, limit: String(limit) });
+    return this.request(`/v1/sessions/search?${query}`, SessionSearchResponseSchema);
   }
 
   getRun(runId: string): Promise<ManagedAgentRunResponse> {

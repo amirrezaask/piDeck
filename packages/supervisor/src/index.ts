@@ -45,3 +45,4 @@ export {
   SupervisorService,
   type SupervisorServiceOptions,
 } from './service.js';
+export { WorkspaceCapabilityError, WorkspaceService } from './workspace-service.js';
