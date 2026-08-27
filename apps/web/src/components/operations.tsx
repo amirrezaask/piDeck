@@ -60,7 +60,7 @@ export interface OperationsClient {
   createWorktree(
     input: import('@nextflow/contracts').CreateWorktreeRequest,
   ): Promise<WorktreeResponse>;
-  releaseWorktree(id: string): Promise<WorktreeResponse>;
+  releaseWorktree(id: string, force?: boolean): Promise<WorktreeResponse>;
 }
 
 export interface ServerOperationsClient {
@@ -97,19 +97,23 @@ export function FleetOverview({
   >([]);
   useEffect(() => {
     let active = true;
-    void Promise.all(
-      servers.map(async (server) => {
-        try {
-          return { server, fleet: await server.client.getFleet() };
-        } catch (error) {
-          return { server, error: error instanceof Error ? error.message : 'Unavailable' };
-        }
-      }),
-    ).then((next) => {
-      if (active) setData(next);
-    });
+    const refresh = () =>
+      void Promise.all(
+        servers.map(async (server) => {
+          try {
+            return { server, fleet: await server.client.getFleet() };
+          } catch (error) {
+            return { server, error: error instanceof Error ? error.message : 'Unavailable' };
+          }
+        }),
+      ).then((next) => {
+        if (active) setData(next);
+      });
+    refresh();
+    const interval = window.setInterval(refresh, 3_000);
     return () => {
       active = false;
+      window.clearInterval(interval);
     };
   }, [servers]);
   const totals = data.reduce(
@@ -220,19 +224,44 @@ function FleetRunRow({
   );
 }
 
-export function InboxView({ server }: { server?: ServerOperationsClient }) {
-  const [items, setItems] = useState<InboxItemResponse[]>([]);
+export function InboxView({ servers }: { servers: ServerOperationsClient[] }) {
+  const [items, setItems] = useState<
+    Array<InboxItemResponse & { serverId: string; serverName: string }>
+  >([]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
   const load = () => {
-    if (!server) return;
-    void server.client
-      .listInbox()
-      .then((result) => setItems(result.items))
-      .catch((reason) => setError(reason instanceof Error ? reason.message : 'Inbox unavailable'));
+    void Promise.allSettled(
+      servers.map(async (server) => ({
+        server,
+        result: await server.client.listInbox(),
+      })),
+    ).then((results) => {
+      const failures: string[] = [];
+      const next = results.flatMap((result) => {
+        if (result.status === 'rejected') {
+          failures.push(
+            result.reason instanceof Error ? result.reason.message : 'Inbox unavailable',
+          );
+          return [];
+        }
+        return result.value.result.items.map((item) => ({
+          ...item,
+          serverId: result.value.server.id,
+          serverName: result.value.server.name,
+        }));
+      });
+      setItems(next);
+      setError(failures.length ? [...new Set(failures)].join('\n') : undefined);
+    });
   };
-  useEffect(load, [server]);
-  const act = async (item: InboxItemResponse, response: string) => {
+  useEffect(() => {
+    load();
+    const interval = window.setInterval(load, 3_000);
+    return () => window.clearInterval(interval);
+  }, [servers]);
+  const act = async (item: InboxItemResponse & { serverId: string }, response: string) => {
+    const server = servers.find((candidate) => candidate.id === item.serverId);
     if (!server) return;
     try {
       await server.client.resolveInbox(item.id, response);
@@ -240,6 +269,12 @@ export function InboxView({ server }: { server?: ServerOperationsClient }) {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Action failed');
     }
+  };
+  const cancel = async (item: InboxItemResponse & { serverId: string }) => {
+    const server = servers.find((candidate) => candidate.id === item.serverId);
+    if (!server) return;
+    await server.client.cancelInbox(item.id);
+    load();
   };
   return (
     <section className="flex min-h-0 flex-1 flex-col overflow-y-auto">
@@ -267,6 +302,7 @@ export function InboxView({ server }: { server?: ServerOperationsClient }) {
                 <div className="min-w-0 flex-1">
                   <div className="flex gap-2">
                     <h2 className="font-medium">{item.title}</h2>
+                    <Badge variant="outline">{item.serverName}</Badge>
                     <Badge variant="outline">{item.kind}</Badge>
                     <Badge variant={item.status === 'pending' ? 'secondary' : 'outline'}>
                       {item.status}
@@ -312,11 +348,7 @@ export function InboxView({ server }: { server?: ServerOperationsClient }) {
                           </Button>
                         </>
                       ) : null}
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => server && void server.client.cancelInbox(item.id).then(load)}
-                      >
+                      <Button size="sm" variant="ghost" onClick={() => void cancel(item)}>
                         <XIcon />
                         Cancel
                       </Button>
@@ -472,7 +504,23 @@ export function WorktreeManager({
   const [projectId, setProjectId] = useState(projects[0]?.id ?? '');
   const [branch, setBranch] = useState('pideck/task');
   const load = () => void client.listWorktrees().then((result) => setWorktrees(result.worktrees));
-  useEffect(load, [client]);
+  const release = async (worktree: WorktreeResponse) => {
+    try {
+      await client.releaseWorktree(worktree.id);
+    } catch (error) {
+      const confirmed = window.confirm(
+        `${error instanceof Error ? error.message : 'The worktree could not be released.'}\n\nForce cleanup may discard uncommitted work. Continue?`,
+      );
+      if (!confirmed) return;
+      await client.releaseWorktree(worktree.id, true);
+    }
+    load();
+  };
+  useEffect(() => {
+    load();
+    const interval = window.setInterval(load, 3_000);
+    return () => window.clearInterval(interval);
+  }, [client]);
   return (
     <section className="p-5">
       <div className="mx-auto max-w-4xl">
@@ -527,7 +575,8 @@ export function WorktreeManager({
                     size="icon-sm"
                     variant="ghost"
                     aria-label={`Release ${worktree.branch}`}
-                    onClick={() => void client.releaseWorktree(worktree.id).then(load)}
+                    disabled={worktree.status === 'busy'}
+                    onClick={() => void release(worktree)}
                   >
                     <Trash2Icon />
                   </Button>

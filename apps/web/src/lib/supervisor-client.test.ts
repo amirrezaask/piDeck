@@ -128,6 +128,17 @@ describe('SupervisorClient', () => {
     );
   });
 
+  it('aborts stalled HTTP requests at the configured deadline', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation((_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      }),
+    );
+    const client = new SupervisorClient({ fetcher, requestTimeoutMs: 5 });
+
+    await expect(client.listAgents()).rejects.toMatchObject({ name: 'TimeoutError' });
+  });
+
   it('creates an agent with validated input and service authentication', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(agent, 201));
     const client = new SupervisorClient({
@@ -200,6 +211,53 @@ describe('SupervisorClient', () => {
 
     await expect(client.listRunAttachments('run-123')).resolves.toEqual(response);
     expect(fetcher.mock.calls[0]?.[0]).toBe('/supervisor-api/v1/runs/run-123/attachments');
+  });
+
+  it('loads a bounded latest or historical run-event page', async () => {
+    const page = {
+      events: [
+        {
+          agentId,
+          runId,
+          sequence: 7,
+          type: 'agent_start',
+          payload: {},
+          createdAt: timestamp,
+        },
+      ],
+      previousSequence: 7,
+      nextSequence: null,
+      hasMore: true,
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(page));
+    const client = new SupervisorClient({ baseUrl: '/supervisor-api', fetcher });
+
+    await expect(client.listRunEventPage(runId, { beforeSequence: 8, limit: 1 })).resolves.toEqual(
+      page,
+    );
+    expect(fetcher.mock.calls[0]?.[0]).toBe(
+      `/supervisor-api/v1/runs/${runId}/events?afterSequence=0&limit=1&beforeSequence=8`,
+    );
+  });
+
+  it('loads a command receipt by idempotency key', async () => {
+    const receipt = {
+      id: '018bcfe4-7a4b-7000-8000-000000000444',
+      idempotencyKey: 'retry-key',
+      agentId,
+      command: 'run_create',
+      status: 'succeeded',
+      result: run,
+      error: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      completedAt: timestamp,
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(receipt));
+    const client = new SupervisorClient({ baseUrl: '/supervisor-api', fetcher });
+
+    await expect(client.getCommandReceipt('retry-key')).resolves.toEqual(receipt);
+    expect(fetcher.mock.calls[0]?.[0]).toBe('/supervisor-api/v1/command-receipts/retry-key');
   });
 
   it('updates a project by id', async () => {

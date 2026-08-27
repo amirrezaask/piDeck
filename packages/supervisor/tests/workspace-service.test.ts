@@ -128,6 +128,68 @@ describe('WorkspaceService', () => {
       await value.close();
     }
   });
+  it('refuses dirty or active worktrees unless cleanup is explicitly confirmed', async () => {
+    const value = await context();
+    try {
+      const worktree = await value.service.createWorktree({
+        projectId: value.project.id,
+        branch: 'pideck/safe-release',
+        baseRef: 'HEAD',
+      });
+      writeFileSync(join(worktree.path, 'README.md'), 'uncommitted\n');
+      await expect(value.service.releaseWorktree(worktree.id)).rejects.toThrow(
+        'uncommitted changes',
+      );
+
+      const runId = await insertRun(value);
+      await value.connection.db
+        .updateTable('supervisor_agent_runs')
+        .set({ status: 'running', completed_at: null, worktree_id: worktree.id })
+        .where('id', '=', runId)
+        .execute();
+      await expect(value.service.releaseWorktree(worktree.id, true)).rejects.toThrow(
+        'run is active',
+      );
+      await value.connection.db
+        .updateTable('supervisor_agent_runs')
+        .set({ status: 'cancelled', completed_at: nowIso() })
+        .where('id', '=', runId)
+        .execute();
+      expect((await value.service.releaseWorktree(worktree.id, true)).status).toBe('deleted');
+    } finally {
+      await value.close();
+    }
+  });
+
+  it('recovers terminal rows interrupted by a Supervisor restart', async () => {
+    const value = await context();
+    try {
+      const id = createId();
+      await value.connection.db
+        .insertInto('supervisor_terminal_sessions')
+        .values({
+          id,
+          cwd: value.workspace,
+          command: 'node',
+          args_json: '[]',
+          status: 'running',
+          exit_code: null,
+          output: 'partial',
+          truncated: 0,
+          created_at: nowIso(),
+          completed_at: null,
+        })
+        .execute();
+      await value.service.start();
+      expect(await value.service.getTerminal(id)).toMatchObject({
+        status: 'failed',
+        output: expect.stringContaining('Supervisor restart'),
+      });
+    } finally {
+      await value.close();
+    }
+  });
+
   it('runs bounded argv terminal processes and resolves inbox items once', async () => {
     const value = await context();
     try {

@@ -5,6 +5,7 @@ import {
   collapseThinkingMarkers,
   mapPiEvents,
   mergeTranscriptEvents,
+  prependTranscriptEvents,
   TRANSCRIPT_EVENT_WINDOW,
 } from './transcript';
 
@@ -202,6 +203,16 @@ describe('mergeTranscriptEvents', () => {
       retained: 1_000,
       copiedEvents: 9_500_500,
     });
+  });
+
+  it('prepends historical pages while keeping the retained window bounded', () => {
+    const retained = prependTranscriptEvents(
+      [event(4, 'agent_end'), event(5, 'agent_end')],
+      [event(2, 'agent_start'), event(3, 'message_start')],
+      3,
+    );
+
+    expect(retained.map((item) => item.sequence)).toEqual([2, 3, 4]);
   });
 
   it('replaces duplicates and inserts out-of-order events without changing sequence order', () => {

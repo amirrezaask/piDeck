@@ -6,6 +6,7 @@ import {
   type SVGProps,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover';
@@ -84,7 +85,9 @@ export function ComposerInput({
   const [cursor, setCursor] = useState(value.length);
   const [suggestions, setSuggestions] = useState<ComposerSuggestion[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const context = useMemo(() => completionContext(value, cursor), [cursor, value]);
+  const open = suggestions.length > 0 && context !== null && !disabled;
 
   useEffect(() => {
     const fallback = context?.kind === 'command' ? filterCommands(context.prefix) : [];
@@ -112,7 +115,10 @@ export function ComposerInput({
     };
   }, [client, context, cwd]);
 
-  const open = suggestions.length > 0 && context !== null && !disabled;
+  useEffect(() => {
+    if (!open) return;
+    optionRefs.current[activeIndex]?.scrollIntoView({ block: 'nearest' });
+  }, [activeIndex, open]);
 
   function syncCursor(target: HTMLTextAreaElement) {
     setCursor(target.selectionStart);
@@ -200,12 +206,16 @@ export function ComposerInput({
         side={placement}
         align="start"
         sideOffset={8}
-        className="w-[min(34rem,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl p-1"
+        className="w-[min(36rem,calc(100vw-1.5rem))] max-w-[calc(100vw-1.5rem)] gap-0 overflow-hidden rounded-2xl p-1.5 shadow-xl ring-1 ring-foreground/10"
         onOpenAutoFocus={(event) => event.preventDefault()}
         onCloseAutoFocus={(event) => event.preventDefault()}
       >
-        <div role="listbox" aria-label={context?.kind === 'command' ? 'Pi commands' : 'Files'}>
-          <div className="flex items-center gap-1.5 px-2 py-1.5 text-[0.68rem] font-medium uppercase tracking-[0.08em] text-muted-foreground">
+        <div
+          role="listbox"
+          aria-label={context?.kind === 'command' ? 'Pi commands' : 'Files'}
+          className="max-h-[min(22rem,calc(100dvh-8rem))] overflow-y-auto p-0.5"
+        >
+          <div className="sticky top-0 flex items-center gap-1.5 bg-popover/95 px-2 py-2 text-xs font-medium text-muted-foreground backdrop-blur-sm">
             {context?.kind === 'command' ? (
               <>
                 <SlashIcon className="size-3" aria-hidden="true" />
@@ -224,8 +234,11 @@ export function ComposerInput({
               type="button"
               role="option"
               aria-selected={index === activeIndex}
+              ref={(node) => {
+                optionRefs.current[index] = node;
+              }}
               className={cn(
-                'flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm outline-none transition-colors',
+                'flex min-h-11 w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50',
                 index === activeIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/60',
               )}
               onMouseDown={(event) => event.preventDefault()}

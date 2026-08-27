@@ -29,12 +29,34 @@ const { server } = buildSupervisorApp({
 });
 registerWebApp(server, resolve(__dirname, '../../web/dist'));
 
+let shutdownStarted = false;
 async function shutdown(): Promise<void> {
-  await server.close();
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  try {
+    await server.close();
+    process.exitCode = 0;
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  } finally {
+    process.exit();
+  }
 }
 
 process.once('SIGINT', () => void shutdown());
 process.once('SIGTERM', () => void shutdown());
+
+const smokeNonce = process.env.PIDECK_SMOKE_NONCE;
+if (smokeNonce && /^[A-Za-z0-9_-]{20,128}$/.test(smokeNonce)) {
+  server.post('/v1/smoke/quit', async (request, reply) => {
+    if (request.headers['x-pideck-smoke-nonce'] !== smokeNonce) {
+      return reply.code(403).send({ error: 'invalid_smoke_nonce' });
+    }
+    setImmediate(() => void shutdown());
+    return reply.send({ status: 'shutting_down' });
+  });
+}
 
 void server.listen({ host, port }).catch((error: unknown) => {
   console.error(error);

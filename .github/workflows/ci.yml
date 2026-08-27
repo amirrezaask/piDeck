@@ -64,6 +64,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      - run: pnpm test:server:packaged
       - name: Packaged smoke (Linux)
         if: runner.os == 'Linux'
         run: xvfb-run --auto-servernum pnpm test:electron:packaged

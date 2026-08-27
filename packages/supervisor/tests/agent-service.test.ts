@@ -1,15 +1,22 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  createId,
   createMigrationDatabase,
   createSupervisorDatabase,
   migrateToLatest,
+  nowIso,
 } from '@nextflow/database';
 import { describe, expect, it } from 'vitest';
 
-import { ManagedAgentBusyError, ManagedAgentService } from '../agent-service';
+import {
+  ManagedAgentBusyError,
+  ManagedAgentCommandOutcomeUnknownError,
+  ManagedAgentService,
+  type SupervisorLifecyclePhase,
+} from '../agent-service';
 import { Deferred, FakePiSessionFactory } from './fake-pi-session';
 
 async function createService(
@@ -22,6 +29,7 @@ async function createService(
     eventQueueLimits?: { maxCount: number; maxBytes: number };
     eventPayloadLimits?: { maxBytes: number; maxDepth?: number; maxItems?: number };
     writeFaultInjector?: (writeClass: 'admission' | 'event' | 'terminal') => void | Promise<void>;
+    lifecycleObserver?: (phase: SupervisorLifecyclePhase, runId?: string) => void | Promise<void>;
   } = {},
 ) {
   const directory = mkdtempSync(join(tmpdir(), 'nextflow-managed-agent-'));
@@ -44,6 +52,7 @@ async function createService(
     ...(options.eventQueueLimits ? { eventQueueLimits: options.eventQueueLimits } : {}),
     ...(options.eventPayloadLimits ? { eventPayloadLimits: options.eventPayloadLimits } : {}),
     ...(options.writeFaultInjector ? { writeFaultInjector: options.writeFaultInjector } : {}),
+    ...(options.lifecycleObserver ? { lifecycleObserver: options.lifecycleObserver } : {}),
   });
   await service.start();
   return {
@@ -70,6 +79,81 @@ async function waitForEvent(service: ManagedAgentService, agentId: string, event
 }
 
 describe('ManagedAgentService', () => {
+  it('binds worktree runs to the canonical worktree and holds it busy until completion', async () => {
+    const context = await createService();
+    try {
+      const now = nowIso();
+      const projectId = createId();
+      const worktreeId = createId();
+      const worktreePath = join(context.directory, 'worktree');
+      mkdirSync(worktreePath);
+      await context.connection.db
+        .insertInto('supervisor_projects')
+        .values({
+          id: projectId,
+          name: 'Project',
+          path: context.directory,
+          created_at: now,
+          updated_at: now,
+          last_used_at: now,
+        })
+        .execute();
+      await context.connection.db
+        .insertInto('supervisor_worktrees')
+        .values({
+          id: worktreeId,
+          project_id: projectId,
+          path: worktreePath,
+          branch: 'pideck/test',
+          base_ref: 'HEAD',
+          status: 'ready',
+          error: null,
+          created_at: now,
+          updated_at: now,
+        })
+        .execute();
+      const agent = await context.service.createAgent({ systemPrompt: 'Use the worktree.' });
+      await expect(
+        context.service.createRun({
+          agentId: agent.id,
+          prompt: 'Wrong directory',
+          executionMode: 'worktree',
+          worktreeId,
+          cwd: context.directory,
+        }),
+      ).rejects.toThrow('does not match');
+
+      const run = await context.service.createRun({
+        agentId: agent.id,
+        prompt: 'Edit safely',
+        executionMode: 'worktree',
+        worktreeId,
+        cwd: worktreePath,
+      });
+      expect(context.factory.requests[0]?.cwd).toBe(realpathSync(worktreePath));
+      expect(run.cwd).toBe(realpathSync(worktreePath));
+      expect(
+        await context.connection.db
+          .selectFrom('supervisor_worktrees')
+          .select('status')
+          .where('id', '=', worktreeId)
+          .executeTakeFirst(),
+      ).toEqual({ status: 'busy' });
+
+      context.factory.sessions[0]?.settle();
+      await waitForEvent(context.service, agent.id, 'supervisor.run_completed');
+      expect(
+        await context.connection.db
+          .selectFrom('supervisor_worktrees')
+          .select('status')
+          .where('id', '=', worktreeId)
+          .executeTakeFirst(),
+      ).toEqual({ status: 'ready' });
+    } finally {
+      await context.close();
+    }
+  });
+
   it('rejects an admission write fault before starting paid work', async () => {
     let failAdmission = false;
     const context = await createService({
@@ -142,14 +226,57 @@ describe('ManagedAgentService', () => {
       session.settle();
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(await context.service.getRun(run.id)).toMatchObject({
-        status: 'failed',
-        error: { code: 'agent_operation_failed' },
+        status: 'running',
+        error: null,
       });
+      expect(session.disposeCount).toBe(1);
+      await expect(context.service.cancelRun(run.id)).rejects.toBeInstanceOf(
+        ManagedAgentCommandOutcomeUnknownError,
+      );
       expect(
         (await context.service.listRunEvents(run.id, { afterSequence: 0 })).some(
           (event) => event.type === 'supervisor.run_completed',
         ),
       ).toBe(false);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('always disposes admission compensation and marks an unknown receipt when terminal persistence fails', async () => {
+    let failTerminal = true;
+    const context = await createService({
+      lifecycleObserver(phase) {
+        if (phase === 'after_running_commit') throw new Error('injected_admission_transition');
+      },
+      writeFaultInjector(writeClass) {
+        if (failTerminal && writeClass === 'terminal') {
+          failTerminal = false;
+          throw new Error('injected_terminal_eio');
+        }
+      },
+    });
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      await expect(
+        context.service.createRun({
+          agentId: agent.id,
+          prompt: 'Must not remain active.',
+          idempotencyKey: 'admission-terminal-failure',
+        }),
+      ).rejects.toBeInstanceOf(ManagedAgentCommandOutcomeUnknownError);
+      const session = context.factory.sessions[0];
+      if (!session) throw new Error('Fake session was not created');
+      expect(session.disposeCount).toBe(1);
+      expect(await context.service.getCommandReceipt('admission-terminal-failure')).toMatchObject({
+        status: 'indeterminate',
+        error: { code: 'command_outcome_unknown' },
+      });
+      await expect(
+        context.service.cancelRun(
+          (await context.service.listRuns({ agentId: agent.id, limit: 10 })).runs[0]!.id,
+        ),
+      ).rejects.toBeInstanceOf(ManagedAgentCommandOutcomeUnknownError);
     } finally {
       await context.close();
     }

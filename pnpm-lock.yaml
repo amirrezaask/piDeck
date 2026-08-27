@@ -56,6 +56,9 @@ importers:
       '@pideck/supervisor':
         specifier: workspace:*
         version: link:../../packages/supervisor
+      '@pideck/web':
+        specifier: workspace:*
+        version: link:../web
       electron:
         specifier: ^43.4.0
         version: 43.4.1

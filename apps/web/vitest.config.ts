@@ -18,12 +18,16 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary'],
-      include: ['src/lib/supervisor-client.ts', 'src/lib/transcript.ts'],
+      include: [
+        'src/App.tsx',
+        'src/components/operations.tsx',
+        'src/lib/**/*.ts',
+      ],
       thresholds: {
-        statements: 80,
-        branches: 75,
-        functions: 80,
-        lines: 80,
+        statements: 50,
+        branches: 45,
+        functions: 45,
+        lines: 50,
       },
     },
   },

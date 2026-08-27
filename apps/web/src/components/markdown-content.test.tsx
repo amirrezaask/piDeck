@@ -21,12 +21,41 @@ describe('MarkdownContent', () => {
 
   it('does not create unsafe links from Markdown', () => {
     const { container } = render(
-      <MarkdownContent content={'[Do not run](javascript:alert(1)) and **stay safe**.'} />,
+      <MarkdownContent
+        content={
+          '[Script](javascript:alert(1)), [data](data:text/html,boom), and [protocol relative](//evil.example/path) stay inert.'
+        }
+      />,
     );
 
     expect(container.querySelector('a')).toBeNull();
-    expect(container).toHaveTextContent('Do not run');
-    expect(container.querySelector('strong')).toHaveTextContent('stay safe');
+    expect(container).toHaveTextContent('Script');
+    expect(container).toHaveTextContent('protocol relative');
+  });
+
+  it('renders trusted external links with opener isolation', () => {
+    const { container } = render(
+      <MarkdownContent content={'[Open the docs](https://example.com/docs)'} />,
+    );
+
+    expect(container.querySelector('a')).toHaveAttribute('href', 'https://example.com/docs');
+    expect(container.querySelector('a')).toHaveAttribute('target', '_blank');
+    expect(container.querySelector('a')).toHaveAttribute('rel', 'noreferrer');
+  });
+
+  it('renders raw HTML as text instead of creating executable elements', () => {
+    const { container } = render(
+      <MarkdownContent
+        content={'<script>globalThis.markdownXss = true</script><img src=x onerror=alert(1)>'}
+      />,
+    );
+
+    expect(container.querySelector('script')).toBeNull();
+    expect(container.querySelector('img')).toBeNull();
+    expect(container).toHaveTextContent('<script>');
+    expect(
+      (globalThis as typeof globalThis & { markdownXss?: boolean }).markdownXss,
+    ).toBeUndefined();
   });
 
   it('renders fenced code blocks with Shiki highlighting', async () => {

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
 
 import {
   type AgentImageAttachment,
@@ -12,9 +13,12 @@ import {
   type CreateManagedAgentRunRequest,
   CreateManagedAgentRunRequestSchema,
   decodeJson,
+  ErrorCodeSchema,
   encodeJson,
   type JsonObject,
   type JsonValue,
+  type ManagedAgentCommandReceipt,
+  ManagedAgentCommandReceiptSchema,
   type ManagedAgentEvent,
   type ManagedAgentEventsQuery,
   type ManagedAgentListQuery,
@@ -164,6 +168,15 @@ export class ManagedAgentCommandInProgressError extends Error {
   }
 }
 
+export class ManagedAgentCommandOutcomeUnknownError extends Error {
+  readonly code = 'command_outcome_unknown';
+
+  constructor(readonly runId: string) {
+    super(`The outcome of run ${runId} is unknown because durable state could not be persisted`);
+    this.name = 'ManagedAgentCommandOutcomeUnknownError';
+  }
+}
+
 export class ManagedAgentCommandReplayError extends Error {
   readonly code: string;
 
@@ -250,6 +263,8 @@ export class ManagedAgentService {
   private readonly commandTails = new Map<string, Promise<void>>();
   private readonly startTasks = new Map<string, { agentId: string; task: Promise<void> }>();
   private readonly stoppingAgents = new Set<string>();
+  /** Runs whose terminal state could not be persisted; fail closed in-process. */
+  private readonly degradedRuns = new Map<string, { agentId: string }>();
   private readonly instanceId: string;
   private closePromise?: Promise<void>;
   private legacyAgentStatusColumn?: Promise<boolean>;
@@ -290,6 +305,7 @@ export class ManagedAgentService {
     if (this.closed) throw new Error('managed_agent_service_closed');
     this.started = true;
     await this.projectService.initialize();
+    await this.markStaleReceiptsIndeterminate();
     await this.compactEventsIfConfigured();
 
     // Pi cannot reattach an in-flight provider request after process death. We
@@ -301,7 +317,7 @@ export class ManagedAgentService {
       .where('status', 'in', ['queued', 'running'])
       .execute();
     for (const run of interrupted) {
-      await this.finalizeRunWithoutSession(
+      await this.tryFinalizeRun(
         run.agent_id,
         run.id,
         'failed',
@@ -503,7 +519,7 @@ export class ManagedAgentService {
       }
       return result;
     } catch (error) {
-      if (receipt.id) await this.failReceipt(receipt.id, error);
+      if (receipt.id) await this.settleReceiptAfterFailure(receipt.id, error);
       throw error;
     }
   }
@@ -522,16 +538,35 @@ export class ManagedAgentService {
         .where('agent_id', '=', agent.id)
         .where('status', 'in', ['queued', 'running'])
         .executeTakeFirst();
-      if (existing) throw new ManagedAgentBusyError(agent.id);
+      if (existing) {
+        this.assertRunHealthy(existing.id);
+        throw new ManagedAgentBusyError(agent.id);
+      }
 
-      const sessionOptions = createSessionOptions(agent, request);
-      await this.projectService.touchPath(sessionOptions.cwd ?? this.defaultCwd);
+      const workspace = await this.resolveRunWorkspace(request);
+      const admittedRequest = workspace ? { ...request, cwd: workspace.path } : request;
+      const sessionOptions = createSessionOptions(agent, admittedRequest);
+      if (!workspace) await this.projectService.touchPath(sessionOptions.cwd ?? this.defaultCwd);
       const runId = this.idFactory();
       const createdAt = this.now();
       try {
         await this.observeLifecycle('before_run_insert', runId);
         await this.injectWriteFault('admission');
         await this.db.transaction().execute(async (transaction) => {
+          if (workspace) {
+            const claimed = await transaction
+              .updateTable('supervisor_worktrees')
+              .set({ status: 'busy', error: null, updated_at: createdAt })
+              .where('id', '=', workspace.id)
+              .where('status', '=', 'ready')
+              .executeTakeFirst();
+            if (Number(claimed.numUpdatedRows) !== 1) {
+              throw new ManagedAgentNotAvailableError(
+                agent.id,
+                `Worktree ${workspace.id} is no longer ready`,
+              );
+            }
+          }
           await transaction
             .insertInto('supervisor_agent_runs')
             .values({
@@ -542,9 +577,9 @@ export class ManagedAgentService {
               model_id: sessionOptions.model?.id ?? null,
               thinking_level: sessionOptions.thinkingLevel ?? null,
               cwd: sessionOptions.cwd ?? this.defaultCwd,
-              execution_mode: request.executionMode ?? 'local',
-              worktree_id: request.worktreeId ?? null,
-              parent_run_id: request.parentRunId ?? null,
+              execution_mode: admittedRequest.executionMode ?? 'local',
+              worktree_id: admittedRequest.worktreeId ?? null,
+              parent_run_id: admittedRequest.parentRunId ?? null,
               status: 'queued',
               error_code: null,
               error_message: null,
@@ -588,13 +623,102 @@ export class ManagedAgentService {
       } finally {
         if (this.startTasks.get(runId)?.task === startTask) this.startTasks.delete(runId);
       }
+      this.assertRunHealthy(runId);
       return this.requireRun(runId);
     });
+  }
+
+  private async resolveRunWorkspace(
+    request: CreateManagedAgentRunRequest,
+  ): Promise<{ id: string; path: string } | undefined> {
+    const mode = request.executionMode ?? 'local';
+    if (mode === 'local') {
+      if (request.worktreeId) {
+        throw new ManagedAgentNotAvailableError(
+          request.agentId,
+          'Local execution cannot reference a worktree',
+        );
+      }
+      return undefined;
+    }
+    if (!request.worktreeId) {
+      throw new ManagedAgentNotAvailableError(
+        request.agentId,
+        'Worktree execution requires a worktree id',
+      );
+    }
+    const worktree = await this.db
+      .selectFrom('supervisor_worktrees')
+      .select(['id', 'path', 'status'])
+      .where('id', '=', request.worktreeId)
+      .executeTakeFirst();
+    if (worktree?.status !== 'ready') {
+      throw new ManagedAgentNotAvailableError(
+        request.agentId,
+        `Worktree ${request.worktreeId} is not ready`,
+      );
+    }
+    let canonicalPath: string;
+    try {
+      canonicalPath = await realpath(resolveWorkingDirectory(worktree.path));
+    } catch {
+      throw new ManagedAgentNotAvailableError(
+        request.agentId,
+        `Worktree ${request.worktreeId} is not available on disk`,
+      );
+    }
+    if (request.cwd) {
+      let requestedPath: string;
+      try {
+        requestedPath = await realpath(resolveWorkingDirectory(request.cwd));
+      } catch {
+        throw new ManagedAgentNotAvailableError(
+          request.agentId,
+          'The requested worktree directory is not available on disk',
+        );
+      }
+      if (requestedPath !== canonicalPath) {
+        throw new ManagedAgentNotAvailableError(
+          request.agentId,
+          'The requested working directory does not match the selected worktree',
+        );
+      }
+    }
+    return { id: worktree.id, path: canonicalPath };
   }
 
   async getRun(runId: string): Promise<ManagedAgentRunResponse | null> {
     const row = await this.getRunRow(runId);
     return row ? this.toRunResponse(row) : null;
+  }
+
+  async getCommandReceipt(idempotencyKey: string): Promise<ManagedAgentCommandReceipt | null> {
+    const row = await this.db
+      .selectFrom('supervisor_agent_command_receipts')
+      .selectAll()
+      .where('idempotency_key', '=', idempotencyKey)
+      .executeTakeFirst();
+    if (!row) return null;
+    return ManagedAgentCommandReceiptSchema.parse({
+      id: row.id,
+      idempotencyKey: row.idempotency_key,
+      agentId: row.agent_id,
+      command: row.command_type,
+      status: row.status,
+      result: row.result_json === null ? null : decodeJson(row.result_json),
+      error:
+        row.error_code === null || row.error_message === null
+          ? null
+          : {
+              code: ErrorCodeSchema.safeParse(row.error_code).success
+                ? row.error_code
+                : 'internal_error',
+              message: row.error_message,
+            },
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      completedAt: row.completed_at,
+    });
   }
 
   async listRunAttachments(runId: string): Promise<ManagedAgentRunAttachmentsResponse> {
@@ -653,6 +777,7 @@ export class ManagedAgentService {
     return this.serializeRunCommand(runId, async () => {
       const row = await this.getRunRow(runId);
       if (!row) throw new ManagedAgentRunNotFoundError(runId);
+      this.assertRunHealthy(runId);
       const receipt = await this.beginReceipt(row.agent_id, 'cancel', idempotencyKey, {
         command: 'cancel',
         runId,
@@ -674,16 +799,29 @@ export class ManagedAgentService {
           active.generation += 1;
           await this.tryAbort(active, 'cancel');
           await this.waitForOperations(active, 'cancel');
-          await this.waitForEvents(active.agentId);
+          try {
+            await this.waitForEvents(active.agentId);
+          } catch (error) {
+            if (active.persistenceFailure) {
+              await active.persistenceFailure.catch(() => undefined);
+              throw new ManagedAgentCommandOutcomeUnknownError(runId);
+            }
+            throw error;
+          }
         }
-        const won = await this.finalizeRun(
+        const won = await this.tryFinalizeRun(
           row.agent_id,
           runId,
           'cancelled',
           { code: 'run_cancelled', message: 'The run was cancelled by an operator' },
           'supervisor.run_cancelled',
         );
-        if (won && active) await this.disposeActiveRun(active);
+        if (!won) {
+          if (active)
+            await this.disposeActiveRunSafely(active, 'cancel terminal persistence failed');
+          throw new ManagedAgentCommandOutcomeUnknownError(runId);
+        }
+        if (active) await this.disposeActiveRunSafely(active, 'cancel');
         const result = await this.requireRun(runId);
         if (receipt.id) {
           await this.completeReceipt(receipt.id, result);
@@ -691,7 +829,7 @@ export class ManagedAgentService {
         }
         return result;
       } catch (error) {
-        if (receipt.id) await this.failReceipt(receipt.id, error);
+        if (receipt.id) await this.settleReceiptAfterFailure(receipt.id, error);
         throw error;
       }
     });
@@ -786,14 +924,14 @@ export class ManagedAgentService {
           active.generation += 1;
           await this.tryAbort(active, 'agent deletion');
           await this.waitForOperations(active, 'agent deletion');
-          await this.finalizeRun(
+          await this.tryFinalizeRun(
             agentId,
             active.runId,
             'cancelled',
             { code: 'agent_deleted', message: 'The agent profile was deleted' },
             'supervisor.run_cancelled',
           );
-          await this.disposeActiveRun(active);
+          await this.disposeActiveRunSafely(active, 'agent deletion');
         }),
       );
       await this.withTimeout(
@@ -807,14 +945,14 @@ export class ManagedAgentService {
           active.generation += 1;
           await this.tryAbort(active, 'agent deletion');
           await this.waitForOperations(active, 'agent deletion');
-          await this.finalizeRun(
+          await this.tryFinalizeRun(
             agentId,
             active.runId,
             'cancelled',
             { code: 'agent_deleted', message: 'The agent profile was deleted' },
             'supervisor.run_cancelled',
           );
-          await this.disposeActiveRun(active);
+          await this.disposeActiveRunSafely(active, 'agent deletion');
         }),
       );
       const row = await this.db
@@ -865,7 +1003,7 @@ export class ManagedAgentService {
         }
         return result;
       } catch (error) {
-        if (receipt.id) await this.failReceipt(receipt.id, error);
+        if (receipt.id) await this.settleReceiptAfterFailure(receipt.id, error);
         if (error instanceof ManagedAgentBusyError) throw error;
         throw commandError(active.agentId, error);
       }
@@ -914,7 +1052,7 @@ export class ManagedAgentService {
         }
         return result;
       } catch (error) {
-        if (receipt.id) await this.failReceipt(receipt.id, error);
+        if (receipt.id) await this.settleReceiptAfterFailure(receipt.id, error);
         if (error instanceof ManagedAgentBusyError) throw error;
         throw commandError(active.agentId, error);
       }
@@ -932,24 +1070,39 @@ export class ManagedAgentService {
     agentId: string,
     options: ManagedAgentEventsQuery,
     runId?: string,
-  ): Promise<{ events: ManagedAgentEvent[]; nextSequence: number | null; hasMore: boolean }> {
+  ): Promise<{
+    events: ManagedAgentEvent[];
+    nextSequence: number | null;
+    previousSequence: number | null;
+    hasMore: boolean;
+  }> {
     await this.waitForEvents(agentId);
     const limit = Math.min(500, Math.max(1, options.limit ?? 100));
     let query = this.db
       .selectFrom('supervisor_agent_events')
       .selectAll()
-      .where('agent_id', '=', agentId)
-      .where('sequence', '>', options.afterSequence);
+      .where('agent_id', '=', agentId);
+    if (options.beforeSequence !== undefined) {
+      query = query.where('sequence', '<', options.beforeSequence);
+    } else {
+      query = query.where('sequence', '>', options.afterSequence);
+    }
     if (runId) query = query.where('run_id', '=', runId);
     const rows = await query
-      .orderBy('sequence', 'asc')
+      .orderBy('sequence', options.beforeSequence === undefined ? 'asc' : 'desc')
       .limit(limit + 1)
       .execute();
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
+    const orderedPage = options.beforeSequence === undefined ? page : [...page].reverse();
     return {
-      events: page.map(toEvent),
-      nextSequence: hasMore ? (page.at(-1)?.sequence ?? null) : null,
+      events: orderedPage.map(toEvent),
+      nextSequence:
+        options.beforeSequence === undefined && hasMore
+          ? (orderedPage.at(-1)?.sequence ?? null)
+          : null,
+      previousSequence:
+        options.beforeSequence !== undefined && hasMore ? (orderedPage[0]?.sequence ?? null) : null,
       hasMore,
     };
   }
@@ -966,7 +1119,12 @@ export class ManagedAgentService {
   async listRunEventsPage(
     runId: string,
     options: ManagedAgentEventsQuery,
-  ): Promise<{ events: ManagedAgentEvent[]; nextSequence: number | null; hasMore: boolean }> {
+  ): Promise<{
+    events: ManagedAgentEvent[];
+    nextSequence: number | null;
+    previousSequence: number | null;
+    hasMore: boolean;
+  }> {
     const row = await this.getRunRow(runId);
     if (!row) throw new ManagedAgentRunNotFoundError(runId);
     return this.listEventsPage(row.agent_id, options, runId);
@@ -1053,18 +1211,20 @@ export class ManagedAgentService {
       session = await this.sessionFactory.create(sessionOptions);
     } catch (error) {
       if (this.closed) return;
-      await this.finalizeRunWithoutSession(
+      const finalized = await this.tryFinalizeRun(
         agent.id,
         runId,
         'failed',
         { code: 'agent_start_failed', message: 'The Pi agent could not be created' },
         'supervisor.run_failed',
+        error,
       );
       this.logger.error('Pi session creation failed', {
         agentId: agent.id,
         runId,
         error: sanitizeError(error),
       });
+      if (!finalized) throw new ManagedAgentCommandOutcomeUnknownError(runId);
       return;
     }
 
@@ -1076,13 +1236,14 @@ export class ManagedAgentService {
       }
       await this.withTimeout(session.dispose(), this.shutdownTimeoutMs, `dispose session ${runId}`);
       if (this.closed) return;
-      await this.finalizeRunWithoutSession(
+      const finalized = await this.tryFinalizeRun(
         agent.id,
         runId,
         'failed',
         { code: 'agent_deleted', message: 'The agent was deleted before the run started' },
         'supervisor.run_failed',
       );
+      if (!finalized) throw new ManagedAgentCommandOutcomeUnknownError(runId);
       return;
     }
 
@@ -1121,7 +1282,8 @@ export class ManagedAgentService {
       if (Number(identity.numUpdatedRows) === 0) throw new Error('run_admission_race_lost');
       await this.observeLifecycle('after_session_identity_commit', runId);
     } catch (error) {
-      await this.compensateAdmissionFailure(active, error);
+      const finalized = await this.compensateAdmissionFailure(active, error);
+      if (!finalized) throw new ManagedAgentCommandOutcomeUnknownError(runId);
       return;
     }
 
@@ -1167,21 +1329,23 @@ export class ManagedAgentService {
         return;
       } catch (error) {
         resolveRunAcceptance(false);
-        await this.compensateAdmissionFailure(active, error);
+        const finalized = await this.compensateAdmissionFailure(active, error);
+        if (!finalized) throw new ManagedAgentCommandOutcomeUnknownError(runId);
         return;
       }
     }
 
     resolveRunAcceptance(false);
     if (accepted) return;
-    await this.finalizeRun(
+    const finalized = await this.tryFinalizeRun(
       agent.id,
       runId,
       'failed',
       { code: 'prompt_rejected', message: 'The Pi agent rejected the prompt before execution' },
       'supervisor.prompt_rejected',
     );
-    await this.disposeActiveRun(active);
+    await this.disposeActiveRunSafely(active, 'prompt rejected');
+    if (!finalized) throw new ManagedAgentCommandOutcomeUnknownError(runId);
   }
 
   private launchOperation(
@@ -1196,29 +1360,33 @@ export class ManagedAgentService {
         if (active.generation !== generation) return;
         const won = await this.completeRun(active, generation);
         if (won) active.settled = true;
+        else if (this.degradedRuns.has(active.runId)) {
+          await this.disposeActiveRunSafely(active, 'terminal persistence failed');
+        }
       })
       .catch(async (error: unknown) => {
         if (runAcceptance && !(await runAcceptance)) return;
         if (active.generation !== generation) return;
-        const won = await this.finalizeRun(
+        const won = await this.tryFinalizeRun(
           active.agentId,
           active.runId,
           'failed',
           { code: 'agent_operation_failed', message: 'The Pi agent operation failed' },
           'supervisor.run_failed',
+          error,
         );
         this.logger.error('Pi agent operation failed', {
           agentId: active.agentId,
           runId: active.runId,
           error: sanitizeError(error),
         });
-        if (won) {
-          active.settled = true;
-          await this.disposeActiveRun(active);
-        }
+        if (won) active.settled = true;
+        await this.disposeActiveRunSafely(active, 'agent operation finished');
       })
       .finally(async () => {
-        if (runAcceptance && !(await runAcceptance)) await this.disposeActiveRun(active);
+        if (runAcceptance && !(await runAcceptance)) {
+          await this.disposeActiveRunSafely(active, 'run admission rejected');
+        }
       });
     active.operations.add(tracked);
     void tracked
@@ -1331,25 +1499,24 @@ export class ManagedAgentService {
       await this.tryAbort(active, 'event ingestion backpressure');
       await this.waitForOperations(active, 'event ingestion backpressure');
       await this.waitForEvents(active.agentId).catch(() => undefined);
-      try {
-        await this.finalizeRunWithoutSession(
-          active.agentId,
-          active.runId,
-          'failed',
-          {
-            code: 'event_backpressure_exceeded',
-            message: 'Durable event ingestion could not keep up with the provider stream',
-          },
-          'supervisor.event_backpressure_exceeded',
-        );
-      } finally {
-        await this.disposeActiveRun(active);
-      }
+      const finalized = await this.tryFinalizeRun(
+        active.agentId,
+        active.runId,
+        'failed',
+        {
+          code: 'event_backpressure_exceeded',
+          message: 'Durable event ingestion could not keep up with the provider stream',
+        },
+        'supervisor.event_backpressure_exceeded',
+        cause,
+      );
+      await this.disposeActiveRunSafely(active, 'event ingestion backpressure');
       this.logger.error('Run stopped after event ingestion backpressure', {
         agentId: active.agentId,
         runId,
         queuedCount: cause.queuedCount,
         queuedBytes: cause.queuedBytes,
+        ...(finalized ? {} : { degraded: true }),
       });
     })();
     return active.persistenceFailure;
@@ -1373,13 +1540,13 @@ export class ManagedAgentService {
     this.activeRuns.set(runId, active);
   }
 
-  private async compensateAdmissionFailure(active: ActiveRun, cause: unknown): Promise<void> {
+  private async compensateAdmissionFailure(active: ActiveRun, cause: unknown): Promise<boolean> {
     active.generation += 1;
     active.acceptingEvents = false;
     await this.tryAbort(active, 'admission persistence failure');
     await this.waitForOperations(active, 'admission persistence failure');
     await this.waitForEvents(active.agentId).catch(() => undefined);
-    await this.finalizeRunWithoutSession(
+    const finalized = await this.tryFinalizeRun(
       active.agentId,
       active.runId,
       'failed',
@@ -1388,13 +1555,16 @@ export class ManagedAgentService {
         message: 'The run could not be admitted durably',
       },
       'supervisor.run_failed',
+      cause,
     );
-    await this.disposeActiveRun(active);
+    await this.disposeActiveRunSafely(active, 'admission persistence failure');
     this.logger.error('Run admission persistence failed', {
       agentId: active.agentId,
       runId: active.runId,
       error: sanitizeError(cause),
+      ...(finalized ? {} : { degraded: true }),
     });
+    return finalized;
   }
 
   private handleEventPersistenceFailure(runId: string, cause: unknown): Promise<void> {
@@ -1406,21 +1576,20 @@ export class ManagedAgentService {
       await this.tryAbort(active, 'event persistence failure');
       await this.waitForOperations(active, 'event persistence failure');
       await this.waitForEvents(active.agentId).catch(() => undefined);
-      try {
-        await this.finalizeRunWithoutSession(
-          active.agentId,
-          active.runId,
-          'failed',
-          { code: 'event_persistence_failed', message: 'Durable event persistence failed' },
-          'supervisor.run_failed',
-        );
-      } finally {
-        await this.disposeActiveRun(active);
-      }
+      const finalized = await this.tryFinalizeRun(
+        active.agentId,
+        active.runId,
+        'failed',
+        { code: 'event_persistence_failed', message: 'Durable event persistence failed' },
+        'supervisor.run_failed',
+        cause,
+      );
+      await this.disposeActiveRunSafely(active, 'event persistence failure');
       this.logger.error('Run stopped after durable event persistence failure', {
         agentId: active.agentId,
         runId: active.runId,
         error: sanitizeError(cause),
+        ...(finalized ? {} : { degraded: true }),
       });
     })();
     return active.persistenceFailure;
@@ -1546,6 +1715,25 @@ export class ManagedAgentService {
     }
   }
 
+  private async markStaleReceiptsIndeterminate(): Promise<void> {
+    const now = this.now();
+    await withBusyRetry(() =>
+      this.db
+        .updateTable('supervisor_agent_command_receipts')
+        .set({
+          status: 'indeterminate',
+          result_json: null,
+          error_code: 'command_outcome_unknown',
+          error_message: 'The command was in progress when the Supervisor restarted',
+          updated_at: now,
+          completed_at: now,
+          http_status: 409,
+        })
+        .where('status', '=', 'pending')
+        .execute(),
+    );
+  }
+
   private async completeReceipt(receiptId: string, result: ManagedAgentRunResponse): Promise<void> {
     const now = this.now();
     await this.db
@@ -1568,20 +1756,50 @@ export class ManagedAgentService {
     const code = error instanceof Error && 'code' in error ? String(error.code) : 'internal_error';
     const message = error instanceof Error ? error.message : 'The command failed';
     const now = this.now();
-    await this.db
-      .updateTable('supervisor_agent_command_receipts')
-      .set({
-        status: 'failed',
-        result_json: null,
-        error_code: code,
-        error_message: message,
-        updated_at: now,
-        completed_at: now,
-        http_status: code === 'not_found' ? 404 : code === 'agent_busy' ? 409 : 500,
-      })
-      .where('id', '=', receiptId)
-      .where('status', '=', 'pending')
-      .execute();
+    await withBusyRetry(() =>
+      this.db
+        .updateTable('supervisor_agent_command_receipts')
+        .set({
+          status: 'failed',
+          result_json: null,
+          error_code: code,
+          error_message: message,
+          updated_at: now,
+          completed_at: now,
+          http_status: code === 'not_found' ? 404 : code === 'agent_busy' ? 409 : 500,
+        })
+        .where('id', '=', receiptId)
+        .where('status', '=', 'pending')
+        .execute(),
+    );
+  }
+
+  private async markReceiptIndeterminate(receiptId: string): Promise<void> {
+    const now = this.now();
+    await withBusyRetry(() =>
+      this.db
+        .updateTable('supervisor_agent_command_receipts')
+        .set({
+          status: 'indeterminate',
+          result_json: null,
+          error_code: 'command_outcome_unknown',
+          error_message: 'The command outcome could not be durably determined',
+          updated_at: now,
+          completed_at: now,
+          http_status: 409,
+        })
+        .where('id', '=', receiptId)
+        .where('status', '=', 'pending')
+        .execute(),
+    );
+  }
+
+  private async settleReceiptAfterFailure(receiptId: string, error: unknown): Promise<void> {
+    if (error instanceof ManagedAgentCommandOutcomeUnknownError) {
+      await this.markReceiptIndeterminate(receiptId);
+    } else {
+      await this.failReceipt(receiptId, error);
+    }
   }
 
   private async requireActiveRun(
@@ -1590,6 +1808,7 @@ export class ManagedAgentService {
   ): Promise<ActiveRun> {
     const row = await this.getRunRow(runId);
     if (!row) throw new ManagedAgentRunNotFoundError(runId);
+    this.assertRunHealthy(runId);
     const status = ManagedAgentRunStatusSchema.parse(row.status);
     if (isTerminalRunStatus(status) && !(options.allowCompleted && status === 'completed')) {
       throw new ManagedAgentBusyError(row.agent_id, `Run ${runId} is no longer active`);
@@ -1646,7 +1865,7 @@ export class ManagedAgentService {
       return false;
     }
     await this.observeLifecycle('after_provider_completion', active.runId);
-    return this.finalizeRun(
+    return this.tryFinalizeRun(
       active.agentId,
       active.runId,
       'completed',
@@ -1655,14 +1874,31 @@ export class ManagedAgentService {
     );
   }
 
-  private async finalizeRunWithoutSession(
+  /**
+   * Terminal persistence is a separate failure boundary from SDK cleanup. If
+   * it fails, the run must remain blocked in this process rather than being
+   * allowed to look completed or accept another paid command.
+   */
+  private async tryFinalizeRun(
     agentId: string,
     runId: string,
-    status: Extract<ManagedAgentRunStatus, 'failed' | 'cancelled'>,
-    error: { code: string; message: string },
+    status: Extract<ManagedAgentRunStatus, 'completed' | 'failed' | 'cancelled'>,
+    error: { code: string; message: string } | undefined,
     eventType: string,
+    cause?: unknown,
   ): Promise<boolean> {
-    return this.finalizeRun(agentId, runId, status, error, eventType);
+    try {
+      return await this.finalizeRun(agentId, runId, status, error, eventType);
+    } catch (failure) {
+      this.degradedRuns.set(runId, { agentId });
+      this.logger.error('Could not persist terminal run state; run is degraded', {
+        agentId,
+        runId,
+        error: sanitizeError(failure),
+        ...(cause === undefined ? {} : { cause: sanitizeError(cause) }),
+      });
+      return false;
+    }
   }
 
   /**
@@ -1684,6 +1920,12 @@ export class ManagedAgentService {
       await this.injectWriteFault('terminal');
       const persisted = await withBusyRetry(() =>
         this.db.transaction().execute(async (transaction) => {
+          const run = await transaction
+            .selectFrom('supervisor_agent_runs')
+            .select('worktree_id')
+            .where('id', '=', runId)
+            .where('agent_id', '=', agentId)
+            .executeTakeFirst();
           const result = await transaction
             .updateTable('supervisor_agent_runs')
             .set({
@@ -1697,6 +1939,14 @@ export class ManagedAgentService {
             .where('status', 'in', ['queued', 'running'])
             .executeTakeFirst();
           if (Number(result.numUpdatedRows) === 0) return undefined;
+          if (run?.worktree_id) {
+            await transaction
+              .updateTable('supervisor_worktrees')
+              .set({ status: 'ready', error: null, updated_at: this.now() })
+              .where('id', '=', run.worktree_id)
+              .where('status', '=', 'busy')
+              .execute();
+          }
           return this.insertEvent(
             transaction,
             agentId,
@@ -1709,6 +1959,25 @@ export class ManagedAgentService {
       if (persisted) this.events.publish(persisted);
       return persisted !== undefined;
     });
+  }
+
+  private assertRunHealthy(runId: string): void {
+    if (this.degradedRuns.has(runId)) {
+      throw new ManagedAgentCommandOutcomeUnknownError(runId);
+    }
+  }
+
+  private async disposeActiveRunSafely(active: ActiveRun, reason: string): Promise<void> {
+    try {
+      await this.disposeActiveRun(active);
+    } catch (error) {
+      this.logger.warn('Pi session disposal did not complete', {
+        agentId: active.agentId,
+        runId: active.runId,
+        reason,
+        error: sanitizeError(error),
+      });
+    }
   }
 
   private assertMutable(): void {

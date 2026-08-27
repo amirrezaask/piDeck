@@ -11,6 +11,7 @@ import type {
   ManagedAgentRunResponse,
   ManagedProjectResponse,
 } from '@nextflow/contracts';
+import { ManagedAgentRunResponseSchema } from '@nextflow/contracts';
 import {
   ArchiveIcon,
   ArrowUpIcon,
@@ -60,20 +61,6 @@ import {
   useState,
 } from 'react';
 
-const pendingSubmissionPrefix = 'pideck.pending-submission.';
-
-function submissionKey(kind: string, target: string): string {
-  const storageKey = `${pendingSubmissionPrefix}${kind}.${target}`;
-  const existing = globalThis.sessionStorage?.getItem(storageKey);
-  if (existing) return existing;
-  const id = globalThis.crypto.randomUUID();
-  globalThis.sessionStorage?.setItem(storageKey, id);
-  return id;
-}
-
-function completeSubmission(kind: string, target: string): void {
-  globalThis.sessionStorage?.removeItem(`${pendingSubmissionPrefix}${kind}.${target}`);
-}
 import { ComposerInput } from '@/components/composer-input';
 import {
   ChangesPanel,
@@ -175,8 +162,21 @@ import {
   collapseThinkingMarkers,
   mapPiEvents,
   mergeTranscriptEvents,
+  prependTranscriptEvents,
+  TRANSCRIPT_EVENT_WINDOW,
   type TranscriptEvent,
 } from '@/lib/transcript';
+import { LruCache } from '@/lib/lru';
+import {
+  beginSubmission,
+  completeSubmission,
+  isUncertainSubmissionError,
+  markSubmissionFailed,
+  markSubmissionUncertain,
+  readSubmissions,
+  rememberSubmissionReceipt,
+  type SubmissionRecord,
+} from '@/lib/submissions';
 import { cn } from '@/lib/utils';
 
 const DEFAULT_AGENT_INSTRUCTIONS =
@@ -217,6 +217,8 @@ const THEME_STORAGE_KEY = 'pideck-theme';
 const LAYOUT_STORAGE_KEY = 'pideck-layout';
 const SIDEBAR_STORAGE_KEY = 'pideck-sidebar-collapsed';
 const ARCHIVED_RUNS_STORAGE_KEY = 'pideck-archived-runs';
+const RUN_ATTACHMENT_CACHE_LIMIT = 24;
+const LATEST_TRANSCRIPT_PAGE_SIZE = 500;
 
 type AppRoute =
   | { kind: 'default' }
@@ -540,7 +542,11 @@ export type SupervisorClientApi = Pick<
   | 'resolveInbox'
   | 'cancelInbox'
   | 'searchSessions'
->;
+> & {
+  /** Older injected test clients may not implement optional reconciliation APIs. */
+  getCommandReceipt?: SupervisorClient['getCommandReceipt'];
+  listRunEventPage?: SupervisorClient['listRunEventPage'];
+};
 
 function mergeRuns(...groups: ManagedAgentRunResponse[][]): ManagedAgentRunResponse[] {
   const byId = new Map<string, ManagedAgentRunResponse>();
@@ -629,7 +635,13 @@ export default function App({
   const [archivedRunIds, setArchivedRunIds] = useState<string[]>(readArchivedRunIds);
   const initialArchivedRunIdsRef = useRef(archivedRunIds);
   const [events, setEvents] = useState<ManagedAgentEvent[]>([]);
+  const [hasOlderEvents, setHasOlderEvents] = useState(false);
+  const [loadingOlderEvents, setLoadingOlderEvents] = useState(false);
+  const historyExpandedRef = useRef(false);
   const [runAttachments, setRunAttachments] = useState<Record<string, AgentImageAttachment[]>>({});
+  const attachmentCacheRef = useRef(
+    new LruCache<string, AgentImageAttachment[]>(RUN_ATTACHMENT_CACHE_LIMIT),
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>(
@@ -644,6 +656,7 @@ export default function App({
   const [connectionState, setConnectionState] = useState<StreamConnectionState>('stale');
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string>();
+  const [attentionCount, setAttentionCount] = useState(0);
 
   const sessions = useMemo<ServerSession[]>(
     () =>
@@ -661,6 +674,15 @@ export default function App({
       ),
     [archivedRunIds, sessions],
   );
+  const archivedSessions = useMemo(
+    () =>
+      sessions.filter(
+        (session) =>
+          archivedRunIds.includes(sessionKey(session.serverId, session.run.id)) ||
+          archivedRunIds.includes(session.run.id),
+      ),
+    [archivedRunIds, sessions],
+  );
   const run = runs.find((candidate) => candidate.id === selectedRunId);
   const selectedAgent = agents.find((agent) => agent.id === run?.agentId);
   const activeServer = servers.find((server) => server.id === activeServerId);
@@ -668,12 +690,6 @@ export default function App({
     activeServerId && selectedRunId ? sessionKey(activeServerId, selectedRunId) : undefined;
   const transcript = useMemo(() => mapPiEvents(events), [events]);
   const runIsActive = run?.status === 'queued' || run?.status === 'running';
-  const activeSessionCount = visibleSessions.filter(
-    ({ run: candidate }) => candidate.status === 'queued' || candidate.status === 'running',
-  ).length;
-  const attentionSessionCount = visibleSessions.filter(
-    ({ run: candidate }) => candidate.status === 'failed' || candidate.status === 'cancelled',
-  ).length;
   const operationsServers = useMemo<ServerOperationsClient[]>(
     () =>
       Object.values(snapshots).map((snapshot) => ({
@@ -883,6 +899,59 @@ export default function App({
   }, [connectionManager, fallbackServer, injectedClient]);
 
   useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      const currentSnapshots = Object.values(snapshotsRef.current);
+      if (currentSnapshots.length === 0) return;
+      void Promise.allSettled(
+        currentSnapshots.map(async (snapshot) => {
+          const [runPage, inbox] = await Promise.all([
+            snapshot.client.listRuns({ limit: 100 }),
+            snapshot.client.listInbox(),
+          ]);
+          return { snapshot, runPage, inbox };
+        }),
+      ).then((results) => {
+        if (!active) return;
+        let attention = 0;
+        const nextSnapshots = { ...snapshotsRef.current };
+        for (const result of results) {
+          if (result.status === 'rejected') {
+            attention += 1;
+            continue;
+          }
+          const { snapshot, runPage, inbox } = result.value;
+          const nextRuns = mergeRuns(runPage.runs, snapshot.runs);
+          attention +=
+            nextRuns.filter((candidate) => candidate.status === 'failed').length +
+            inbox.items.filter((item) => item.status === 'pending').length;
+          nextSnapshots[snapshot.server.id] = {
+            ...snapshot,
+            runs: nextRuns,
+            resources: {
+              ...snapshot.resources,
+              runs: { status: 'live', checkedAt: new Date().toISOString() },
+            },
+          };
+          if (snapshot.server.id === activeServerId) setRuns(nextRuns);
+        }
+        snapshotsRef.current = nextSnapshots;
+        setSnapshots(nextSnapshots);
+        setAttentionCount(attention);
+      });
+    };
+    const interval = window.setInterval(refresh, 3_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [activeServerId, servers]);
+
+  useEffect(() => {
+    document.title = attentionCount > 0 ? `(${attentionCount}) piDeck` : 'piDeck';
+  }, [attentionCount]);
+
+  useEffect(() => {
     if (!activeServerId || !snapshotsRef.current[activeServerId]) return;
     const current = snapshotsRef.current[activeServerId];
     const next = { ...current, agents, models, runs, projects };
@@ -894,16 +963,19 @@ export default function App({
   useEffect(() => {
     const runId = run?.id;
     const attachmentKey = selectedSessionKey;
-    if (!runId || !attachmentKey || runAttachments[attachmentKey]) return;
+    if (!runId || !attachmentKey) return;
+    const cached = attachmentCacheRef.current.get(attachmentKey);
+    if (cached) {
+      setRunAttachments(attachmentCacheRef.current.snapshot());
+      return;
+    }
     let active = true;
     void client
       .listRunAttachments(runId)
       .then((response) => {
         if (!active) return;
-        setRunAttachments((current) => ({
-          ...current,
-          [attachmentKey]: response.attachments,
-        }));
+        attachmentCacheRef.current.set(attachmentKey, response.attachments);
+        setRunAttachments(attachmentCacheRef.current.snapshot());
       })
       .catch((reason: unknown) => {
         if (active) setError(errorMessage(reason));
@@ -911,28 +983,82 @@ export default function App({
     return () => {
       active = false;
     };
-  }, [client, run?.id, runAttachments, selectedSessionKey]);
+  }, [client, run?.id, selectedSessionKey]);
+
+  useEffect(() => {
+    const getReceipt = client.getCommandReceipt;
+    if (!getReceipt) return;
+    let active = true;
+    for (const submission of readSubmissions()) {
+      void client
+        .getCommandReceipt(submission.key)
+        .then((receipt) => {
+          if (!active) return;
+          if (receipt.status === 'succeeded') {
+            const result = ManagedAgentRunResponseSchema.safeParse(receipt.result);
+            if (result.success) {
+              setRuns((current) => [
+                result.data,
+                ...current.filter((candidate) => candidate.id !== result.data.id),
+              ]);
+            }
+            completeSubmission(submission);
+          } else if (receipt.status === 'failed') {
+            markSubmissionFailed(submission, receipt.id);
+          } else {
+            markSubmissionUncertain(submission, receipt.id);
+          }
+        })
+        .catch((reason: unknown) => {
+          if (!active) return;
+          if (reason instanceof ApiError && reason.status === 404) {
+            // No receipt means the command never became durable. Keep the key
+            // for a same-payload retry, but allow a new payload to replace it.
+            markSubmissionFailed(submission, submission.receiptId);
+          } else {
+            markSubmissionUncertain(submission, submission.receiptId);
+          }
+        });
+    }
+    return () => {
+      active = false;
+    };
+  }, [client, connectionState]);
 
   useEffect(() => {
     if (!run?.id) {
       setEvents([]);
+      setHasOlderEvents(false);
       return;
     }
     const controller = new AbortController();
     let active = true;
     let lastSequence = 0;
     setEvents([]);
+    setHasOlderEvents(false);
+    historyExpandedRef.current = false;
 
     void (async () => {
       try {
-        for await (const response of client.listRunEventPages(run.id)) {
+        if (client.listRunEventPage) {
+          const response = await client.listRunEventPage(run.id, {
+            beforeSequence: Number.MAX_SAFE_INTEGER,
+            limit: LATEST_TRANSCRIPT_PAGE_SIZE,
+          });
           if (!active) return;
-          lastSequence = Math.max(
-            lastSequence,
-            ...response.events.map((event) => event.sequence),
-            0,
-          );
+          lastSequence = response.events.at(-1)?.sequence ?? 0;
+          setHasOlderEvents(response.hasMore === true && response.previousSequence != null);
           setEvents((current) => mergeTranscriptEvents(current, response.events));
+        } else {
+          for await (const response of client.listRunEventPages(run.id)) {
+            if (!active) return;
+            lastSequence = Math.max(
+              lastSequence,
+              ...response.events.map((event) => event.sequence),
+              0,
+            );
+            setEvents((current) => mergeTranscriptEvents(current, response.events));
+          }
         }
 
         const onConnectionState = (state: StreamConnectionState) => {
@@ -956,7 +1082,13 @@ export default function App({
         })) {
           if (!active) return;
           lastSequence = Math.max(lastSequence, event.sequence);
-          setEvents((current) => mergeTranscriptEvents(current, [event]));
+          setEvents((current) =>
+            mergeTranscriptEvents(
+              current,
+              [event],
+              historyExpandedRef.current ? current.length + 1 : TRANSCRIPT_EVENT_WINDOW,
+            ),
+          );
         }
       } catch (reason) {
         if (active && !controller.signal.aborted) setError(errorMessage(reason));
@@ -968,6 +1100,34 @@ export default function App({
       controller.abort();
     };
   }, [client, run?.id]);
+
+  const loadOlderEvents = useCallback(async () => {
+    if (
+      !client.listRunEventPage ||
+      !run?.id ||
+      !hasOlderEvents ||
+      loadingOlderEvents ||
+      events.length === 0
+    ) {
+      return;
+    }
+    const oldestSequence = events[0]?.sequence;
+    if (oldestSequence === undefined) return;
+    setLoadingOlderEvents(true);
+    try {
+      const page = await client.listRunEventPage(run.id, {
+        beforeSequence: oldestSequence,
+        limit: LATEST_TRANSCRIPT_PAGE_SIZE,
+      });
+      historyExpandedRef.current = true;
+      setEvents((current) => prependTranscriptEvents(current, page.events));
+      setHasOlderEvents(page.hasMore === true && page.previousSequence != null);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoadingOlderEvents(false);
+    }
+  }, [client, events, hasOlderEvents, loadingOlderEvents, run?.id]);
 
   useEffect(() => {
     if (!runIsActive || !run) return;
@@ -1103,24 +1263,34 @@ export default function App({
   }) {
     setSubmitting(true);
     setError(undefined);
-    const idempotencyKey = submissionKey('create-run', input.agentId);
+    let submission: SubmissionRecord | undefined;
+    let runRequestStarted = false;
     try {
+      submission = beginSubmission('create-run', input.agentId, input, {
+        prompt: input.prompt,
+        cwd: input.cwd,
+        attachmentCount: input.attachments?.length ?? 0,
+        executionMode: input.executionMode ?? 'local',
+      });
       const project = await client.createProject({ path: input.cwd });
       setProjects((current) => [
         project,
         ...current.filter((candidate) => candidate.id !== project.id),
       ]);
-      const nextRun = await client.createRun({ ...input, idempotencyKey });
-      completeSubmission('create-run', input.agentId);
+      runRequestStarted = true;
+      const nextRun = await client.createRun({ ...input, idempotencyKey: submission.key });
+      rememberSubmissionReceipt(submission, nextRun.acknowledgementId);
+      completeSubmission(submission);
       setRuns((current) => [
         nextRun,
         ...current.filter((candidate) => candidate.id !== nextRun.id),
       ]);
       if (input.attachments?.length) {
-        setRunAttachments((current) => ({
-          ...current,
-          [sessionKey(activeServerId ?? 'local', nextRun.id)]: input.attachments ?? [],
-        }));
+        attachmentCacheRef.current.set(
+          sessionKey(activeServerId ?? 'local', nextRun.id),
+          input.attachments,
+        );
+        setRunAttachments(attachmentCacheRef.current.snapshot());
       }
       if (activeServerId) {
         setSelectedRunId(nextRun.id);
@@ -1130,6 +1300,13 @@ export default function App({
       }
       setEvents([]);
     } catch (reason) {
+      if (submission) {
+        if (runRequestStarted && isUncertainSubmissionError(reason)) {
+          markSubmissionUncertain(submission);
+        } else {
+          markSubmissionFailed(submission);
+        }
+      }
       setError(errorMessage(reason));
       throw reason;
     } finally {
@@ -1196,14 +1373,20 @@ export default function App({
   async function cancelRun() {
     if (!run) return;
     setSubmitting(true);
-    const idempotencyKey = submissionKey('cancel-run', run.id);
+    let submission: SubmissionRecord | undefined;
     try {
-      const nextRun = await client.cancelRun(run.id, idempotencyKey);
-      completeSubmission('cancel-run', run.id);
+      submission = beginSubmission('cancel-run', run.id, { runId: run.id }, { runId: run.id });
+      const nextRun = await client.cancelRun(run.id, submission.key);
+      rememberSubmissionReceipt(submission, nextRun.acknowledgementId);
+      completeSubmission(submission);
       setRuns((current) =>
         current.map((candidate) => (candidate.id === nextRun.id ? nextRun : candidate)),
       );
     } catch (reason) {
+      if (submission) {
+        if (isUncertainSubmissionError(reason)) markSubmissionUncertain(submission);
+        else markSubmissionFailed(submission);
+      }
       setError(errorMessage(reason));
     } finally {
       setSubmitting(false);
@@ -1214,18 +1397,30 @@ export default function App({
     if (!run) return;
     setSubmitting(true);
     setError(undefined);
-    const idempotencyKey = submissionKey('steer-run', run.id);
+    let submission: SubmissionRecord | undefined;
     try {
-      const nextRun = await client.steerRun(run.id, {
+      const request = {
         message,
-        idempotencyKey,
         ...(attachments?.length ? { attachments } : {}),
+      };
+      submission = beginSubmission('steer-run', run.id, request, {
+        message,
+        attachmentCount: attachments?.length ?? 0,
       });
-      completeSubmission('steer-run', run.id);
+      const nextRun = await client.steerRun(run.id, {
+        ...request,
+        idempotencyKey: submission.key,
+      });
+      rememberSubmissionReceipt(submission, nextRun.acknowledgementId);
+      completeSubmission(submission);
       setRuns((current) =>
         current.map((candidate) => (candidate.id === nextRun.id ? nextRun : candidate)),
       );
     } catch (reason) {
+      if (submission) {
+        if (isUncertainSubmissionError(reason)) markSubmissionUncertain(submission);
+        else markSubmissionFailed(submission);
+      }
       setError(errorMessage(reason));
       throw reason;
     } finally {
@@ -1237,18 +1432,30 @@ export default function App({
     if (!run) return;
     setSubmitting(true);
     setError(undefined);
-    const idempotencyKey = submissionKey('follow-up-run', run.id);
+    let submission: SubmissionRecord | undefined;
     try {
-      const nextRun = await client.followUpRun(run.id, {
+      const request = {
         message,
-        idempotencyKey,
         ...(attachments?.length ? { attachments } : {}),
+      };
+      submission = beginSubmission('follow-up-run', run.id, request, {
+        message,
+        attachmentCount: attachments?.length ?? 0,
       });
-      completeSubmission('follow-up-run', run.id);
+      const nextRun = await client.followUpRun(run.id, {
+        ...request,
+        idempotencyKey: submission.key,
+      });
+      rememberSubmissionReceipt(submission, nextRun.acknowledgementId);
+      completeSubmission(submission);
       setRuns((current) =>
         current.map((candidate) => (candidate.id === nextRun.id ? nextRun : candidate)),
       );
     } catch (reason) {
+      if (submission) {
+        if (isUncertainSubmissionError(reason)) markSubmissionUncertain(submission);
+        else markSubmissionFailed(submission);
+      }
       setError(errorMessage(reason));
       throw reason;
     } finally {
@@ -1281,6 +1488,12 @@ export default function App({
     setEvents([]);
     setRoute({ kind });
     writeAppRoute({ kind });
+  }
+
+  function restoreRun(serverId: string, runId: string) {
+    const key = sessionKey(serverId, runId);
+    setArchivedRunIds((current) => current.filter((item) => item !== key && item !== runId));
+    openRun(serverId, runId);
   }
 
   function archiveRun(serverId: string, runId: string) {
@@ -1345,7 +1558,7 @@ export default function App({
             >
               {appLayout === 'sidebar' ? (
                 <motion.aside
-                  className="flex flex-col border-b bg-sidebar md:min-h-svh md:border-r md:border-b-0"
+                  className="flex min-w-0 flex-col border-b bg-sidebar md:min-h-svh md:border-r md:border-b-0"
                   initial={{ opacity: 0, x: -18 }}
                   animate={{ opacity: 1, x: 0 }}
                   transition={{
@@ -1356,7 +1569,7 @@ export default function App({
                 >
                   <motion.div
                     className={cn(
-                      'flex w-full items-center justify-between gap-3 px-4 py-3 md:py-4',
+                      'flex w-full items-center justify-end gap-1 px-4 py-3 md:py-4',
                       sidebarCollapsed && 'flex-col items-center gap-2 px-2 py-3',
                     )}
                     initial={{ opacity: 0, y: -8 }}
@@ -1367,90 +1580,29 @@ export default function App({
                       ease: [0.22, 1, 0.36, 1],
                     }}
                   >
-                    <motion.button
+                    <Button
                       type="button"
-                      className={cn(
-                        'flex min-w-0 items-center gap-2 rounded-lg font-semibold tracking-tight outline-none focus-visible:ring-3 focus-visible:ring-ring/50',
-                        sidebarCollapsed && 'size-8 justify-center',
-                      )}
-                      aria-label={sidebarCollapsed ? 'piDeck — New session' : undefined}
-                      title={sidebarCollapsed ? 'piDeck — New session' : undefined}
+                      variant="ghost"
+                      size="icon"
+                      aria-label="New session"
+                      title="New session"
                       onClick={openNewSession}
-                      whileHover={{ x: 2 }}
-                      whileTap={{ scale: 0.98 }}
                     >
-                      <motion.span
-                        className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground"
-                        initial={{ opacity: 0, scale: 0.7, rotate: -15 }}
-                        animate={{ opacity: 1, scale: 1, rotate: 0 }}
-                        transition={{
-                          type: 'spring',
-                          stiffness: 420,
-                          damping: 24,
-                          delay: 0.15,
-                        }}
-                      >
-                        <PiIcon className="size-4" />
-                      </motion.span>
-                      {sidebarCollapsed ? null : 'piDeck'}
-                    </motion.button>
-                    <div className="flex items-center gap-1">
-                      <motion.div
-                        layout
-                        initial={{ opacity: 0, x: 8 }}
-                        animate={{ opacity: 1, x: 0 }}
-                      >
-                        <Badge
-                          variant="outline"
-                          className={sidebarCollapsed ? 'sr-only' : undefined}
-                        >
-                          {activeServer?.name ?? `${servers.length} servers`}
-                        </Badge>
-                      </motion.div>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        aria-label="New session"
-                        title="New session"
-                        onClick={openNewSession}
-                      >
-                        <PlusIcon aria-hidden="true" />
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        aria-expanded={!sidebarCollapsed}
-                        aria-controls="sidebar-sessions"
-                        aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-                        title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-                        onClick={() => setSidebarCollapsed((current) => !current)}
-                      >
-                        {sidebarCollapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
-                      </Button>
-                    </div>
+                      <PlusIcon aria-hidden="true" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-expanded={!sidebarCollapsed}
+                      aria-controls="sidebar-sessions"
+                      aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                      title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                      onClick={() => setSidebarCollapsed((current) => !current)}
+                    >
+                      {sidebarCollapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
+                    </Button>
                   </motion.div>
-                  <Separator />
-                  {sidebarCollapsed ? null : (
-                    <motion.div
-                      className="flex items-center gap-2 px-4 pt-3 pb-1"
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      transition={{ duration: 0.17, delay: 0.18 }}
-                    >
-                      <span className="text-xs font-medium text-muted-foreground">Sessions</span>
-                      <span
-                        className="ml-auto flex items-center gap-2 text-[0.68rem] text-muted-foreground"
-                        aria-live="polite"
-                      >
-                        <span>{activeSessionCount} active</span>
-                        {attentionSessionCount > 0 ? (
-                          <span>{attentionSessionCount} attention</span>
-                        ) : null}
-                      </span>
-                    </motion.div>
-                  )}
                   <nav
                     id="sidebar-sessions"
                     className={cn(
@@ -1710,6 +1862,23 @@ export default function App({
 
               <TabsContent value={workspaceTabValue} forceMount className="contents">
                 <section className="flex h-full min-h-0 min-w-0 flex-col">
+                  {archivedSessions.length > 0 ? (
+                    <div className="flex items-center gap-2 overflow-x-auto border-b px-3 py-2 text-xs">
+                      <span className="shrink-0 text-muted-foreground">Archived:</span>
+                      {archivedSessions.map((session) => (
+                        <Button
+                          key={sessionKey(session.serverId, session.run.id)}
+                          type="button"
+                          variant="outline"
+                          size="xs"
+                          onClick={() => restoreRun(session.serverId, session.run.id)}
+                        >
+                          <ArchiveIcon aria-hidden="true" />
+                          Restore {sessionTitle(session.run.prompt)}
+                        </Button>
+                      ))}
+                    </div>
+                  ) : null}
                   {activeServerId &&
                   snapshots[activeServerId] &&
                   Object.values(snapshots[activeServerId].resources).some(
@@ -1759,13 +1928,7 @@ export default function App({
                     ) : route.kind === 'fleet' ? (
                       <FleetOverview key="fleet" servers={operationsServers} onOpenRun={openRun} />
                     ) : route.kind === 'inbox' ? (
-                      <InboxView
-                        key="inbox"
-                        server={
-                          operationsServers.find((server) => server.id === activeServerId) ??
-                          operationsServers[0]
-                        }
-                      />
+                      <InboxView key="inbox" servers={operationsServers} />
                     ) : route.kind === 'worktrees' ? (
                       <div key="worktrees" className="min-h-0 flex-1 overflow-y-auto">
                         <WorktreeManager client={client} projects={projects} />
@@ -1788,6 +1951,9 @@ export default function App({
                           projectLabel={sessionProjectLabel(run.cwd, projects)}
                           branchLabel={sessionBranchLabel(run.cwd, projects)}
                           transcript={transcript}
+                          hasOlderEvents={hasOlderEvents}
+                          loadingOlderEvents={loadingOlderEvents}
+                          onLoadOlderEvents={loadOlderEvents}
                           promptAttachments={
                             runAttachments[sessionKey(activeServerId ?? 'local', run.id)] ?? []
                           }
@@ -1932,9 +2098,9 @@ function TabsWorkspaceHeader({
       <Separator orientation="vertical" className="mx-1 h-5" />
 
       <TabsList
-        variant="line"
+        variant="default"
         aria-label="Sessions"
-        className="h-9 max-w-full min-w-0 flex-1 justify-start overflow-x-auto overflow-y-hidden p-0"
+        className="h-9 max-w-full min-w-0 flex-1 justify-start overflow-x-auto overflow-y-hidden"
       >
         {sessions.map((session, index) => {
           const candidate = session.run;
@@ -2100,7 +2266,9 @@ function NewSession({
   useEffect(() => {
     void client
       .listWorktrees()
-      .then((response) => setWorktrees(response.worktrees))
+      .then((response) =>
+        setWorktrees(response.worktrees.filter((item) => item.status === 'ready')),
+      )
       .catch(() => setWorktrees([]));
   }, [client]);
 
@@ -2212,12 +2380,13 @@ function NewSession({
       const imageAttachments = await prepareImageAttachments();
       if (attachments.length > 0 && !imageAttachments) return;
       const model = decodeModel(modelKey);
+      const selectedWorktree = worktrees.find((item) => item.id === worktreeId);
       await onStart({
         agentId,
         prompt: value || 'Please inspect the attached image.',
         ...(model ? { model } : {}),
         thinkingLevel,
-        cwd: cwd.trim(),
+        cwd: executionMode === 'worktree' && selectedWorktree ? selectedWorktree.path : cwd.trim(),
         ...(imageAttachments ? { attachments: imageAttachments } : {}),
         ...(executionMode === 'worktree' ? { executionMode, worktreeId } : {}),
       });
@@ -2306,7 +2475,7 @@ function NewSession({
 
   return (
     <motion.div
-      className="flex min-h-0 flex-1 flex-col"
+      className="flex min-h-0 min-w-0 flex-1 flex-col"
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
@@ -2319,10 +2488,10 @@ function NewSession({
       >
         <h1 className="text-sm font-semibold">New session</h1>
       </motion.header>
-      <div className="flex flex-1 justify-center overflow-y-auto px-4 py-10 md:px-8 md:py-16">
+      <div className="flex flex-1 justify-center overflow-y-auto px-4 py-8 md:px-8 md:py-14">
         <div className="w-full max-w-3xl">
           <motion.div
-            className="mb-8"
+            className="mb-7"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.2, delay: 0.04 }}
@@ -2336,7 +2505,7 @@ function NewSession({
           </motion.div>
           <motion.form
             aria-label="New session composer"
-            className="relative w-full overflow-hidden rounded-2xl border bg-card shadow-[0_18px_50px_-36px_oklch(0.145_0_0/0.45)] transition-[border-color,box-shadow] focus-within:border-foreground/25 focus-within:shadow-[0_22px_60px_-34px_oklch(0.145_0_0/0.55)]"
+            className="group/composer relative w-full overflow-hidden rounded-2xl border border-border/80 bg-card transition-[border-color,background-color] focus-within:border-foreground/30"
             initial={{ opacity: 0, y: 18, scale: 0.985 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             transition={{ duration: 0.18, delay: 0.03, ease: [0.22, 1, 0.36, 1] }}
@@ -2372,7 +2541,7 @@ function NewSession({
               cwd={cwd}
               client={client}
               disabled={submitting}
-              className="min-h-32 resize-none rounded-none border-0 bg-transparent px-5 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-36"
+              className="min-h-28 resize-none rounded-none border-0 bg-transparent px-4 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-32 md:px-5 md:py-5"
               placement="top"
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
@@ -2381,8 +2550,9 @@ function NewSession({
                 }
               }}
             />
+            <Separator />
             <motion.div
-              className="flex flex-col border-t bg-muted/20"
+              className="flex flex-col bg-muted/15"
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.18, delay: 0.14 }}
@@ -2444,21 +2614,12 @@ function NewSession({
                   })}
                 </AttachmentGroup>
               ) : null}
-              <div className="flex flex-wrap items-center gap-1 px-3 py-2">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  className="sr-only"
-                  aria-label="Files to attach"
-                  onChange={handleFileInput}
-                  tabIndex={-1}
-                />
+              <div className="flex min-w-0 items-center gap-1 overflow-x-auto px-2.5 py-1.5 [scrollbar-width:none]">
                 <Select value={serverId} onValueChange={onServerChange}>
                   <SelectTrigger
                     aria-label="Server"
                     size="sm"
-                    className="max-w-44 border-0 bg-transparent shadow-none"
+                    className="max-w-40 shrink-0 border-0 bg-transparent shadow-none"
                   >
                     <ServerIcon />
                     <SelectValue placeholder="Choose server" />
@@ -2480,7 +2641,7 @@ function NewSession({
                   <SelectTrigger
                     aria-label="Execution mode"
                     size="sm"
-                    className="border-0 bg-transparent shadow-none"
+                    className="shrink-0 border-0 bg-transparent shadow-none"
                   >
                     <GitForkIcon />
                     <SelectValue />
@@ -2499,7 +2660,7 @@ function NewSession({
                     <SelectTrigger
                       aria-label="Worktree"
                       size="sm"
-                      className="max-w-48 border-0 bg-transparent shadow-none"
+                      className="max-w-48 shrink-0 border-0 bg-transparent shadow-none"
                     >
                       <SelectValue placeholder="Choose worktree" />
                     </SelectTrigger>
@@ -2516,7 +2677,26 @@ function NewSession({
                     </SelectContent>
                   </Select>
                 ) : null}
-                <Separator orientation="vertical" className="hidden h-5 sm:block" />
+                <Separator orientation="vertical" className="h-4 shrink-0" />
+                <ProjectPicker
+                  projects={projects}
+                  path={cwd}
+                  onPathChange={setCwd}
+                  onDeleteProject={onDeleteProject}
+                  disabled={submitting}
+                />
+              </div>
+              <Separator />
+              <div className="flex items-center gap-1 p-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  className="sr-only"
+                  aria-label="Files to attach"
+                  onChange={handleFileInput}
+                  tabIndex={-1}
+                />
                 <Button
                   type="button"
                   variant="ghost"
@@ -2524,19 +2704,16 @@ function NewSession({
                   aria-label="Attach files"
                   onClick={() => fileInputRef.current?.click()}
                   disabled={submitting}
+                  className="rounded-full"
                 >
                   <PaperclipIcon />
                 </Button>
-                <motion.div
-                  whileHover={{ y: -1 }}
-                  whileTap={{ scale: 0.99 }}
-                  transition={{ duration: 0.16 }}
-                >
+                <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
                   <Select value={agentId} onValueChange={setAgentId}>
                     <SelectTrigger
                       aria-label="Agent profile"
                       size="sm"
-                      className="max-w-40 border-0 bg-transparent shadow-none"
+                      className="max-w-40 shrink-0 border-0 bg-transparent shadow-none"
                     >
                       <BotIcon />
                       <SelectValue placeholder="Choose agent" />
@@ -2551,18 +2728,12 @@ function NewSession({
                       </SelectGroup>
                     </SelectContent>
                   </Select>
-                </motion.div>
-                <Separator orientation="vertical" className="hidden h-5 sm:block" />
-                <motion.div
-                  whileHover={{ y: -1 }}
-                  whileTap={{ scale: 0.99 }}
-                  transition={{ duration: 0.16 }}
-                >
+                  <Separator orientation="vertical" className="hidden h-4 shrink-0 sm:block" />
                   <Select value={modelKey} onValueChange={setModelKey}>
                     <SelectTrigger
                       aria-label="Model"
                       size="sm"
-                      className="max-w-52 border-0 bg-transparent shadow-none"
+                      className="max-w-52 shrink-0 border-0 bg-transparent shadow-none"
                     >
                       <SparklesIcon />
                       <SelectValue placeholder="Default model" />
@@ -2577,13 +2748,7 @@ function NewSession({
                       </SelectGroup>
                     </SelectContent>
                   </Select>
-                </motion.div>
-                <Separator orientation="vertical" className="hidden h-5 sm:block" />
-                <motion.div
-                  whileHover={{ y: -1 }}
-                  whileTap={{ scale: 0.99 }}
-                  transition={{ duration: 0.16 }}
-                >
+                  <Separator orientation="vertical" className="hidden h-4 shrink-0 sm:block" />
                   <Select
                     value={thinkingLevel}
                     onValueChange={(value) => setThinkingLevel(value as AgentThinkingLevel)}
@@ -2591,7 +2756,7 @@ function NewSession({
                     <SelectTrigger
                       aria-label="Thinking level"
                       size="sm"
-                      className="border-0 bg-transparent shadow-none"
+                      className="shrink-0 border-0 bg-transparent shadow-none"
                     >
                       <BrainIcon />
                       <SelectValue />
@@ -2606,19 +2771,11 @@ function NewSession({
                       </SelectGroup>
                     </SelectContent>
                   </Select>
-                </motion.div>
-                <Separator orientation="vertical" className="hidden h-5 sm:block" />
-                <ProjectPicker
-                  projects={projects}
-                  path={cwd}
-                  onPathChange={setCwd}
-                  onDeleteProject={onDeleteProject}
-                  disabled={submitting}
-                />
+                </div>
                 <Button
                   type="submit"
                   size="icon-lg"
-                  className="ml-auto rounded-lg"
+                  className="ml-auto shrink-0 rounded-full"
                   title="Start session (⌘Enter)"
                   disabled={
                     submitting ||
@@ -2634,16 +2791,16 @@ function NewSession({
               </div>
             </motion.div>
           </motion.form>
-          <div className="mt-5 grid gap-1 sm:grid-cols-3" aria-label="Task starters">
+          <div className="mt-4 flex flex-wrap items-center gap-1" aria-label="Task starters">
             {TASK_STARTERS.map((starter) => (
               <Button
                 key={starter.label}
                 type="button"
                 variant="ghost"
-                className="h-auto justify-start px-3 py-2 text-left text-xs font-normal text-foreground/70 hover:text-foreground"
+                size="sm"
+                className="rounded-full"
                 onClick={() => setPrompt(starter.prompt)}
               >
-                <ArrowUpIcon className="rotate-45" aria-hidden="true" />
                 {starter.label}
               </Button>
             ))}
@@ -2816,7 +2973,7 @@ function ProjectPicker({
   }
 
   return (
-    <div className="relative min-w-0 basis-full sm:min-w-36 sm:flex-1 sm:basis-auto">
+    <div className="relative min-w-40 flex-1">
       <Popover open={open} onOpenChange={setOpen} modal={false}>
         <PopoverTrigger asChild>
           <Button
@@ -2859,7 +3016,7 @@ function ProjectPicker({
               event.preventDefault();
             }
           }}
-          className="mt-11 max-h-[calc(100dvh-1.5rem)] w-[min(34rem,calc(100vw-2rem))] overflow-x-hidden overflow-y-auto rounded-2xl border bg-popover p-2 text-popover-foreground shadow-[0_20px_60px_-24px_oklch(0.145_0_0/0.65)] ring-1 ring-foreground/8"
+          className="max-h-[calc(100dvh-1.5rem)] w-[min(34rem,calc(100vw-2rem))] overflow-x-hidden overflow-y-auto rounded-2xl bg-popover p-2 text-popover-foreground shadow-xl ring-1 ring-foreground/10"
         >
           {newProjectOpen ? (
             <div>
@@ -3191,6 +3348,9 @@ function Conversation({
   projectLabel,
   branchLabel,
   transcript,
+  hasOlderEvents,
+  loadingOlderEvents,
+  onLoadOlderEvents,
   promptAttachments,
   submitting,
   runIsActive,
@@ -3207,6 +3367,9 @@ function Conversation({
   projectLabel: string;
   branchLabel: string;
   transcript: ReturnType<typeof mapPiEvents>;
+  hasOlderEvents: boolean;
+  loadingOlderEvents: boolean;
+  onLoadOlderEvents(): Promise<void>;
   promptAttachments: AgentImageAttachment[];
   submitting: boolean;
   runIsActive: boolean;
@@ -3221,6 +3384,7 @@ function Conversation({
   const [dragActive, setDragActive] = useState(false);
   const [inspector, setInspector] = useState<'changes' | 'terminal'>();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const transcriptViewportRef = useRef<HTMLDivElement>(null);
   const dragDepthRef = useRef(0);
   const attachmentSequenceRef = useRef(0);
   const attachmentsRef = useRef(attachments);
@@ -3332,6 +3496,18 @@ function Conversation({
     } catch {
       // Keep the draft and attachments visible while the app-level error explains what failed.
     }
+  }
+
+  async function loadOlderTranscript() {
+    const viewport = transcriptViewportRef.current;
+    const previousHeight = viewport?.scrollHeight ?? 0;
+    const previousTop = viewport?.scrollTop ?? 0;
+    await onLoadOlderEvents();
+    if (!viewport) return;
+    requestAnimationFrame(() => {
+      const heightDelta = viewport.scrollHeight - previousHeight;
+      viewport.scrollTop = previousTop + heightDelta;
+    });
   }
 
   async function submitSteer() {
@@ -3506,8 +3682,26 @@ function Conversation({
       </AnimatePresence>
       <MessageScrollerProvider autoScroll defaultScrollPosition="end">
         <MessageScroller className="flex-1">
-          <MessageScrollerViewport aria-label={`${agent?.name ?? 'Agent'} conversation`}>
+          <MessageScrollerViewport
+            ref={transcriptViewportRef}
+            aria-label={`${agent?.name ?? 'Agent'} conversation`}
+          >
             <MessageScrollerContent className="mx-auto w-[calc(100vw-2.5rem)] max-w-4xl px-5 py-8 md:w-full md:px-8">
+              {hasOlderEvents ? (
+                <MessageScrollerItem messageId="load-older-transcript">
+                  <div className="flex justify-center">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={loadOlderTranscript}
+                      disabled={loadingOlderEvents}
+                    >
+                      {loadingOlderEvents ? 'Loading older activity…' : 'Load older activity'}
+                    </Button>
+                  </div>
+                </MessageScrollerItem>
+              ) : null}
               <MessageScrollerItem messageId={`prompt-${run.id}`} scrollAnchor>
                 <motion.div
                   layout="position"
@@ -3635,7 +3829,7 @@ function Conversation({
                   })}
                 </AttachmentGroup>
               ) : null}
-              <div className="flex items-end gap-1.5 rounded-2xl border bg-card p-1.5 shadow-[0_14px_40px_-30px_oklch(0.145_0_0/0.5)] transition-[border-color,box-shadow] focus-within:border-foreground/25 focus-within:shadow-[0_18px_44px_-28px_oklch(0.145_0_0/0.58)]">
+              <div className="overflow-hidden rounded-2xl border border-border/80 bg-card transition-[border-color] focus-within:border-foreground/30">
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -3645,17 +3839,6 @@ function Conversation({
                   onChange={handleFileInput}
                   tabIndex={-1}
                 />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label="Attach files"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={submitting}
-                  className="self-center rounded-xl"
-                >
-                  <PaperclipIcon />
-                </Button>
                 <ComposerInput
                   ariaLabel="Message agent"
                   value={message}
@@ -3672,29 +3855,48 @@ function Conversation({
                   disabled={submitting}
                   rows={1}
                   placement="top"
-                  className="max-h-32 min-h-10 resize-none rounded-xl border-0 bg-transparent py-2.5 shadow-none focus-visible:ring-0"
+                  className="max-h-32 min-h-14 resize-none rounded-none border-0 bg-transparent px-3.5 py-3 shadow-none focus-visible:ring-0"
                 />
-                {runIsActive ? (
+                <div className="flex items-center gap-1 px-2 pb-2">
                   <Button
                     type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void submitSteer()}
-                    disabled={submitting || !message.trim()}
-                    aria-label="Steer now"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Attach files"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={submitting}
+                    className="rounded-full"
                   >
-                    Steer now
+                    <PaperclipIcon />
                   </Button>
-                ) : null}
-                <Button
-                  type="submit"
-                  size="icon-lg"
-                  className="shrink-0 rounded-full"
-                  disabled={submitting || (!message.trim() && attachments.length === 0)}
-                >
-                  <ArrowUpIcon />
-                  <span className="sr-only">Send message</span>
-                </Button>
+                  <span className="hidden text-xs text-muted-foreground sm:inline">
+                    {runIsActive ? 'Steer or queue a follow-up' : 'Continue this session'}
+                  </span>
+                  <div className="ml-auto flex items-center gap-1">
+                    {runIsActive ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void submitSteer()}
+                        disabled={submitting || !message.trim()}
+                        aria-label="Steer now"
+                        className="rounded-full"
+                      >
+                        Steer now
+                      </Button>
+                    ) : null}
+                    <Button
+                      type="submit"
+                      size="icon-lg"
+                      className="shrink-0 rounded-full"
+                      disabled={submitting || (!message.trim() && attachments.length === 0)}
+                    >
+                      <ArrowUpIcon />
+                      <span className="sr-only">Send message</span>
+                    </Button>
+                  </div>
+                </div>
               </div>
             </div>
             <p className="mx-auto mt-1.5 flex max-w-4xl items-center justify-between gap-3 px-1 text-[11px] text-muted-foreground">

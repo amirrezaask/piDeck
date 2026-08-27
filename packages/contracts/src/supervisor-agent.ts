@@ -255,10 +255,12 @@ export type ManagedAgentEvent = z.infer<typeof ManagedAgentEventSchema>;
 
 export const ManagedAgentEventsQuerySchema = z.object({
   afterSequence: z.coerce.number().int().min(0).default(0),
+  beforeSequence: z.coerce.number().int().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),
 });
 export interface ManagedAgentEventsQuery {
   afterSequence: number;
+  beforeSequence?: number | undefined;
   limit?: number;
 }
 
@@ -268,6 +270,7 @@ export const ManagedAgentEventsResponseSchema = z.object({
   // always provide both values so consumers have an explicit continuation
   // contract.
   nextSequence: z.number().int().positive().nullable().optional(),
+  previousSequence: z.number().int().positive().nullable().optional(),
   hasMore: z.boolean().optional(),
 });
 export type ManagedAgentEventsResponse = z.infer<typeof ManagedAgentEventsResponseSchema>;
@@ -298,7 +301,7 @@ export const ManagedAgentCommandReceiptSchema = z.object({
   agentId: IdSchema,
   command: ManagedAgentCommandTypeSchema,
   status: ManagedAgentCommandStatusSchema,
-  result: ManagedAgentResponseSchema.nullable(),
+  result: z.union([ManagedAgentResponseSchema, ManagedAgentRunResponseSchema]).nullable(),
   error: z
     .object({
       code: ErrorCodeSchema,

@@ -7,7 +7,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "build": "pnpm build:binary && pnpm --filter @pideck/client make && node scripts/verify-build.mjs",
+    "build": "pnpm build:binary && pnpm --filter @pideck/client make:dist && node scripts/verify-build.mjs",
     "build:binary": "turbo run build && node scripts/build-binary.mjs",
     "dev": "turbo run dev",
     "dev:web": "pnpm --filter @pideck/web dev",
@@ -20,15 +20,17 @@
     "check": "pnpm typecheck && pnpm lint:boundaries",
     "test": "turbo run test",
     "test:coverage": "pnpm --filter @pideck/web test:coverage",
-    "test:recovery": "pnpm --filter @nextflow/database test -- recovery.test.ts && pnpm --filter @pideck/supervisor test -- recovery-process.test.ts",
+    "test:recovery": "pnpm vitest run --project node packages/database/tests/recovery.test.ts && pnpm vitest run --project node packages/supervisor/tests/recovery-process.test.ts",
     "test:soak": "node --expose-gc --import tsx --test tests/soak/event-stream-soak.test.mjs",
     "test:soak:ci": "node --expose-gc --import tsx --test tests/soak/event-stream-soak.test.mjs",
     "test:backup-restore": "node --test scripts/tests/backup-restore.test.mjs",
     "test:electron:packaged": "node scripts/test-packaged-electron.mjs",
+    "test:server:packaged": "node scripts/test-packaged-server.mjs",
     "test:e2e": "playwright test",
     "lint": "turbo run lint && biome check tests scripts playwright.config.ts",
     "format": "biome format --write apps packages",
-    "format:check": "biome format apps packages scripts tests"
+    "format:check": "biome format apps packages scripts tests",
+    "verify": "pnpm check && pnpm lint && pnpm test && pnpm test:coverage && pnpm test:recovery && pnpm test:backup-restore && pnpm build:binary"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.4",

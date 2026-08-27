@@ -78,6 +78,21 @@ export function mergeTranscriptEvents(
   return next;
 }
 
+/** Merge a historical page before the retained window while preserving the oldest side. */
+export function prependTranscriptEvents(
+  current: readonly ManagedAgentEvent[],
+  incoming: readonly ManagedAgentEvent[],
+  limit = Number.MAX_SAFE_INTEGER,
+): ManagedAgentEvent[] {
+  if (incoming.length === 0) return current as ManagedAgentEvent[];
+  const bySequence = new Map<number, ManagedAgentEvent>();
+  for (const event of current) bySequence.set(event.sequence, event);
+  for (const event of incoming) bySequence.set(event.sequence, event);
+  return [...bySequence.values()]
+    .sort((left, right) => left.sequence - right.sequence)
+    .slice(0, limit);
+}
+
 function binarySearchSequence(events: readonly ManagedAgentEvent[], sequence: number): number {
   let low = 0;
   let high = events.length;

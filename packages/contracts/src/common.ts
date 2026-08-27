@@ -25,6 +25,7 @@ export const ErrorCodeSchema = z.enum([
   'agent_not_available',
   'agent_busy',
   'supervisor_unavailable',
+  'payload_too_large',
   'internal_error',
 ]);
 export type ErrorCode = z.infer<typeof ErrorCodeSchema>;

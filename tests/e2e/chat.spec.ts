@@ -170,7 +170,8 @@ test('renders persisted and streamed PI events with chat primitives', async ({
         payload: {
           assistantMessageEvent: {
             type: 'text_delta',
-            delta: 'Everything checks out.\n\n```ts\nconst answer: number = 42;\n```',
+            delta:
+              'Everything checks out. [Docs](https://example.com/docs) [Unsafe](//evil.example/path) <script>globalThis.markdownXss = true</script>\n\n```ts\nconst answer: number = 42;\n```',
           },
         },
         createdAt: timestamp,
@@ -194,7 +195,14 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   await expect(
     page.locator('[data-slot="marker-content"]').filter({ hasText: 'bash finished' }),
   ).toHaveCount(0);
-  await expect(page.getByText('Everything checks out.')).toBeVisible();
+  await expect(page.getByText(/Everything checks out\./)).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Docs' })).toHaveAttribute('target', '_blank');
+  await expect(page.getByRole('link', { name: 'Docs' })).toHaveAttribute('rel', 'noreferrer');
+  await expect(page.getByRole('link', { name: 'Unsafe' })).toHaveCount(0);
+  await expect(page.locator('[aria-label="Workspace agent conversation"] script')).toHaveCount(0);
+  expect(await page.evaluate(() => (globalThis as { markdownXss?: boolean }).markdownXss)).toBe(
+    undefined,
+  );
   await expect(page.locator('[data-slot="code-highlight"] .shiki')).toContainText(
     'const answer: number = 42;',
   );

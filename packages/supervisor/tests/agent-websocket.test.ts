@@ -13,7 +13,9 @@ afterEach(async () => {
   await Promise.allSettled(cleanup.splice(0).map((close) => close()));
 });
 
-async function createListeningApp(): Promise<{ baseUrl: string }> {
+async function createListeningApp(
+  options: { websocketMaxConnectionsPerCredential?: number } = {},
+): Promise<{ baseUrl: string }> {
   const directory = mkdtempSync(join(tmpdir(), 'nextflow-agent-websocket-'));
   const filename = join(directory, 'test.sqlite');
   const migration = createMigrationDatabase(filename);
@@ -23,6 +25,7 @@ async function createListeningApp(): Promise<{ baseUrl: string }> {
     databasePath: filename,
     serviceToken: 'ws-secret',
     piSessionFactory: new FakePiSessionFactory(),
+    ...options,
   });
   await app.server.listen({ host: '127.0.0.1', port: 0 });
   const address = app.server.server.address();
@@ -46,6 +49,42 @@ function openSocket(url: string, headers?: Record<string, string>): Promise<WebS
 }
 
 describe('Supervisor agent event WebSocket', () => {
+  it('rejects invalid cursors and enforces per-credential connection limits', async () => {
+    const { baseUrl } = await createListeningApp({
+      websocketMaxConnectionsPerCredential: 1,
+    });
+    const headers = {
+      Authorization: 'Bearer ws-secret',
+      'Content-Type': 'application/json',
+    };
+    const createdResponse = await fetch(`${baseUrl}/v1/agents`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ systemPrompt: 'You are a connection-limit test agent.' }),
+    });
+    const agent = (await createdResponse.json()) as { id: string };
+    const streamUrl = `${baseUrl.replace('http:', 'ws:')}/v1/agents/${agent.id}/stream`;
+
+    await expect(
+      openSocket(`${streamUrl}?afterSequence=not-a-number`, {
+        Authorization: 'Bearer ws-secret',
+      }),
+    ).rejects.toThrow('400');
+
+    const first = await openSocket(streamUrl, { Authorization: 'Bearer ws-secret' });
+    await expect(openSocket(streamUrl, { Authorization: 'Bearer ws-secret' })).rejects.toThrow(
+      '429',
+    );
+    const closed = new Promise<void>((resolve) => first.once('close', () => resolve()));
+    first.close();
+    await closed;
+
+    const replacement = await openSocket(streamUrl, {
+      Authorization: 'Bearer ws-secret',
+    });
+    replacement.close();
+  });
+
   it('authenticates, replays after the requested sequence, and emits JSON frames', async () => {
     const { baseUrl } = await createListeningApp();
     const headers = {

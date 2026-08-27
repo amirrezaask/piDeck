@@ -5,6 +5,26 @@ import { DatabaseSync } from 'node:sqlite';
 
 const FORMAT_VERSION = 1;
 
+// Keep this list aligned with packages/database/src/migrations.ts. Backups
+// must never be restored by an older binary without an explicit compatibility
+// decision.
+export const SUPPORTED_SCHEMA_MIGRATIONS = Object.freeze([
+  '001_initial',
+  '002_supervisor_agents',
+  '003_workflow_runs_api',
+  '004_supervisor_agent_command_receipts',
+  '005_supervisor_agent_names',
+  '006_supervisor_agent_runs',
+  '007_supervisor_agent_definition_runtime_split',
+  '008_supervisor_run_configuration',
+  '009_supervisor_projects',
+  '010_supervisor_run_admission_and_profiles',
+  '011_supervisor_command_receipt_types',
+  '012_supervisor_agent_run_attachments',
+  '013_workspace_capabilities',
+  '014_pi_session_ownership',
+]);
+
 async function exists(path) { return Boolean(await stat(path).catch(() => undefined)); }
 async function hashFile(path) { return createHash('sha256').update(await readFile(path)).digest('hex'); }
 function inside(root, path) { const value = relative(root, path); return value && !value.startsWith(`..${sep}`) && value !== '..'; }
@@ -76,11 +96,36 @@ export async function createBackup({ databasePath, sessionDirectory, destination
   return manifest;
 }
 
-export async function verifyBackup(backupDirectory, supportedMigrations) {
+export async function verifyBackup(
+  backupDirectory,
+  supportedMigrations = SUPPORTED_SCHEMA_MIGRATIONS,
+) {
   const root = resolve(backupDirectory);
   const manifest = JSON.parse(await readFile(join(root, 'manifest.json'), 'utf8'));
-  if (manifest.formatVersion !== FORMAT_VERSION || !Array.isArray(manifest.files)) throw new Error('Unsupported backup manifest');
+  if (
+    manifest.formatVersion !== FORMAT_VERSION ||
+    !Array.isArray(manifest.files) ||
+    !Array.isArray(manifest.schemaMigrations) ||
+    manifest.schemaMigrations.some((name) => typeof name !== 'string') ||
+    (manifest.sessionOwnership !== undefined && !Array.isArray(manifest.sessionOwnership))
+  ) throw new Error('Unsupported backup manifest');
+  const sessionsRoot = resolve(root, 'sessions');
+  for (const ownership of manifest.sessionOwnership ?? []) {
+    if (
+      !ownership ||
+      typeof ownership !== 'object' ||
+      typeof ownership.runId !== 'string' ||
+      typeof ownership.relativePath !== 'string' ||
+      !inside(sessionsRoot, resolve(sessionsRoot, ownership.relativePath))
+    ) throw new Error('Backup session ownership escapes the backup root');
+  }
   for (const file of manifest.files) {
+    if (
+      !file ||
+      typeof file !== 'object' ||
+      typeof file.path !== 'string' ||
+      typeof file.sha256 !== 'string'
+    ) throw new Error('Unsupported backup manifest');
     const path = resolve(root, file.path);
     if (!inside(root, path) || (await hashFile(path)) !== file.sha256) throw new Error(`Backup hash verification failed: ${file.path}`);
   }

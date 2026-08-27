@@ -36,7 +36,14 @@ async function launch(binary) {
   for (const stream of [child.stdout, child.stderr]) stream.on('data', (chunk) => logs.push(String(chunk).slice(0, 4096)));
   const marker = await waitFor(async () => {
     const value = JSON.parse(await readFile(markerPath, 'utf8'));
-    return value.nonce === nonce && value.preloadReady === true ? value : undefined;
+    return value.nonce === nonce &&
+      value.preloadReady === true &&
+      value.rendererReady === true &&
+      value.builtinServerReady === true &&
+      value.bridgeHealthReady === true &&
+      value.requestBoundaryReady === true
+      ? value
+      : undefined;
   }, 'renderer and preload readiness');
   if (marker.pid !== child.pid) throw new Error('Readiness marker belongs to another process');
   return child;
@@ -72,7 +79,16 @@ try {
   const integrity = database.prepare('PRAGMA integrity_check').get();
   database.close();
   if (Object.values(integrity)[0] !== 'ok') throw new Error('Packaged database integrity check failed');
-  console.log(JSON.stringify({ launches: 2, preloadReady: true, databaseIntegrity: 'ok', orphanProcesses: 0 }));
+  console.log(JSON.stringify({
+    launches: 2,
+    preloadReady: true,
+    rendererReady: true,
+    builtinServerReady: true,
+    bridgeHealthReady: true,
+    requestBoundaryReady: true,
+    databaseIntegrity: 'ok',
+    orphanProcesses: 0,
+  }));
 } catch (error) {
   console.error(logs.join('').replace(/(authorization|token|prompt)[^\n]*/gi, '$1=[redacted]').slice(-16_384));
   throw error;

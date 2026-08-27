@@ -22,8 +22,10 @@ import {
   ExecutionListResponseSchema,
   FleetOverviewResponseSchema,
   HealthResponseSchema,
+  IdempotencyKeySchema,
   InboxItemResponseSchema,
   InboxListResponseSchema,
+  ManagedAgentCommandReceiptSchema,
   ManagedAgentEventsQuerySchema,
   ManagedAgentEventsResponseSchema,
   ManagedAgentExtensionsResponseSchema,
@@ -64,6 +66,7 @@ import { z } from 'zod';
 import {
   ManagedAgentBusyError,
   ManagedAgentCommandInProgressError,
+  ManagedAgentCommandOutcomeUnknownError,
   ManagedAgentCommandReplayError,
   ManagedAgentIdempotencyConflictError,
   ManagedAgentNotAvailableError,
@@ -98,6 +101,7 @@ const AgentParamsSchema = z.object({ agentId: z.string().uuid() });
 const AgentRunParamsSchema = z.object({ runId: z.string().uuid() });
 const ProjectParamsSchema = z.object({ projectId: z.string().uuid() });
 const ResourceParamsSchema = z.object({ id: z.string().uuid() });
+const CommandReceiptParamsSchema = z.object({ idempotencyKey: IdempotencyKeySchema });
 
 export interface SupervisorAppOptions {
   databasePath: string;
@@ -122,6 +126,7 @@ export interface SupervisorAppOptions {
   eventPayloadMaxDepth?: number;
   eventPayloadMaxItems?: number;
   eventRetentionDays?: number;
+  bodyLimitBytes?: number;
 }
 
 export interface SupervisorApp {
@@ -200,7 +205,12 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
       ? {}
       : { eventRetentionDays: options.eventRetentionDays }),
   });
-  const server = Fastify({ logger: options.logger ?? false, requestIdHeader: 'x-request-id' });
+  // Four 6 MB images expand to roughly 32 MB as base64, plus JSON metadata.
+  const server = Fastify({
+    logger: options.logger ?? false,
+    requestIdHeader: 'x-request-id',
+    bodyLimit: Math.max(1_024, options.bodyLimitBytes ?? 34_000_000),
+  });
   const eventWebSocketServer = new WebSocketServer({ noServer: true });
   const eventSockets = new Map<WebSocket, string>();
   const websocketTickets = new Map<string, { expiresAt: number; used: boolean }>();
@@ -383,6 +393,14 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     },
   );
   server.setErrorHandler((error, _request, reply) => {
+    if (error instanceof Error && 'code' in error && error.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
+      return sendError(
+        reply,
+        413,
+        'payload_too_large',
+        'The request body exceeds the 34 MB attachment limit',
+      );
+    }
     if (error instanceof z.ZodError) {
       return sendError(reply, 400, 'validation_failed', 'The request is invalid', error.issues);
     }
@@ -560,6 +578,16 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
       return sendError(reply, 404, 'not_found', 'Run not found');
     }
     return reply.send(ManagedAgentRunResponseSchema.parse(run));
+  });
+
+  server.get('/v1/command-receipts/:idempotencyKey', async (request, reply) => {
+    const params = CommandReceiptParamsSchema.safeParse(request.params);
+    if (!params.success) {
+      return sendError(reply, 400, 'validation_failed', 'The receipt key is invalid');
+    }
+    const receipt = await agents.getCommandReceipt(params.data.idempotencyKey);
+    if (!receipt) return sendError(reply, 404, 'not_found', 'Command receipt not found');
+    return reply.send(ManagedAgentCommandReceiptSchema.parse(receipt));
   });
 
   server.post('/v1/runs/:runId/cancel', async (request, reply) => {
@@ -786,13 +814,17 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
   server.get('/v1/worktrees', async (_request, reply) =>
     reply.send(WorktreeListResponseSchema.parse({ worktrees: await workspace.listWorktrees() })),
   );
-  server.delete('/v1/worktrees/:id', async (request, reply) =>
-    reply.send(
+  server.delete('/v1/worktrees/:id', async (request, reply) => {
+    const query = z.object({ force: z.enum(['true']).optional() }).parse(request.query);
+    return reply.send(
       WorktreeResponseSchema.parse(
-        await workspace.releaseWorktree(ResourceParamsSchema.parse(request.params).id),
+        await workspace.releaseWorktree(
+          ResourceParamsSchema.parse(request.params).id,
+          query.force === 'true',
+        ),
       ),
-    ),
-  );
+    );
+  });
 
   server.post('/v1/terminal-sessions', async (request, reply) =>
     reply
@@ -995,6 +1027,7 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
       // The supervisor opens the database itself, so bootstrap and upgrade the
       // schema before either service can issue a query against it.
       await migrateToLatest(database.db as unknown as Kysely<MigrationDatabase>);
+      await workspace.start();
       await service.start();
       await agents.start();
     });
@@ -1091,6 +1124,9 @@ function handleError(reply: FastifyReply, error: unknown): FastifyReply {
   }
   if (error instanceof ManagedAgentCommandInProgressError) {
     return sendError(reply, 409, 'idempotency_in_progress', error.message);
+  }
+  if (error instanceof ManagedAgentCommandOutcomeUnknownError) {
+    return sendError(reply, 409, 'command_outcome_unknown', error.message);
   }
   if (error instanceof ManagedAgentCommandReplayError) {
     const code = isPublicErrorCode(error.code) ? error.code : 'internal_error';

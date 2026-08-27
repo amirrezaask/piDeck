@@ -14,6 +14,7 @@ import {
   session,
 } from 'electron';
 import { normalizeServerOrigin } from './server-origin.js';
+import { parseServerInput, parseServerRequest, prepareServerRequest } from './server-request.js';
 
 interface StoredServer {
   readonly id: string;
@@ -22,23 +23,7 @@ interface StoredServer {
   readonly encryptedToken?: string;
 }
 
-interface ServerInput {
-  readonly id?: string;
-  readonly name: string;
-  readonly address: string;
-  readonly token?: string;
-}
-
-interface ServerRequest {
-  readonly serverId: string;
-  readonly path: string;
-  readonly method: string;
-  readonly headers?: Record<string, string>;
-  readonly body?: string;
-}
-
 const BUILTIN_SERVER_ID = 'builtin';
-const allowedMethods = new Set(['GET', 'POST', 'PATCH', 'DELETE']);
 let mainWindow: BrowserWindow | undefined;
 let servers: StoredServer[] = [];
 let builtinServer: StoredServer | undefined;
@@ -190,38 +175,32 @@ function registerIpc(): void {
     const request = parseServerRequest(value);
     const server = servers.find((candidate) => candidate.id === request.serverId);
     if (!server) throw new Error('Server is not configured');
-    const method = request.method.toUpperCase();
-    if (!allowedMethods.has(method)) throw new Error('Unsupported server request method');
-    const target = new URL(request.path, server.address);
-    if (
-      target.origin !== server.address ||
-      !/^\/v1\/[A-Za-z0-9_~!$&'()*+,;=:@%./-]*$/.test(target.pathname)
-    ) {
-      throw new Error('Unsupported server request path');
-    }
-    if ((request.body?.length ?? 0) > 32 * 1024 * 1024)
-      throw new Error('Server request is too large');
-
-    const headers = new Headers();
-    for (const name of ['accept', 'content-type', 'idempotency-key']) {
-      const value = request.headers?.[name];
-      if (value) headers.set(name, value);
-    }
     const token = decryptToken(server);
     const validatedOrigin = normalizeServerOrigin(server.address, Boolean(token));
     if (validatedOrigin !== server.address)
       throw new Error('Stored server origin is not canonical');
-    if (token) headers.set('authorization', `Bearer ${token}`);
-    const response = await net.fetch(target.toString(), {
-      method,
-      headers,
-      ...(request.body === undefined ? {} : { body: request.body }),
-    });
-    return {
-      status: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
-      body: await response.text(),
-    };
+    const prepared = prepareServerRequest(request, validatedOrigin);
+    if (token) prepared.headers.set('authorization', `Bearer ${token}`);
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new DOMException('Supervisor request timed out', 'TimeoutError')),
+      30_000,
+    );
+    try {
+      const response = await net.fetch(prepared.target.toString(), {
+        method: prepared.method,
+        headers: prepared.headers,
+        signal: controller.signal,
+        ...(prepared.body === undefined ? {} : { body: prepared.body }),
+      });
+      return {
+        status: response.status,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: await response.text(),
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
   });
 }
 
@@ -245,7 +224,39 @@ function createWindow(): void {
     },
   });
   mainWindow = window;
+  let recoveryAttempts = 0;
+  let responsive = true;
+  const recover = (reason: string) => {
+    if (window.isDestroyed() || isQuitting) return;
+    recoveryAttempts += 1;
+    console.error(`Renderer failure (${reason}); recovery attempt ${recoveryAttempts}`);
+    if (recoveryAttempts <= 2) {
+      setTimeout(() => {
+        if (!window.isDestroyed()) window.webContents.reloadIgnoringCache();
+      }, 500);
+      return;
+    }
+    app.relaunch();
+    app.exit(1);
+  };
   window.once('ready-to-show', () => window.show());
+  window.webContents.on('did-finish-load', () => {
+    responsive = true;
+    setTimeout(() => {
+      recoveryAttempts = 0;
+    }, 30_000).unref();
+  });
+  window.webContents.on('render-process-gone', (_event, details) => {
+    if (details.reason !== 'clean-exit') recover(details.reason);
+  });
+  window.webContents.on('unresponsive', () => {
+    if (!responsive) return;
+    responsive = false;
+    recover('unresponsive');
+  });
+  window.webContents.on('responsive', () => {
+    responsive = true;
+  });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', (event) => event.preventDefault());
   window.on('closed', () => {
@@ -255,14 +266,83 @@ function createWindow(): void {
   const smokeNonce = process.env.PIDECK_SMOKE_NONCE;
   if (smokeNonce && /^[A-Za-z0-9_-]{20,128}$/.test(smokeNonce)) {
     window.webContents.once('did-finish-load', async () => {
-      const preloadReady = await window.webContents.executeJavaScript(
-        "typeof window.piDeckServers?.list === 'function'",
+      const readiness = (await window.webContents.executeJavaScript(
+        `(async () => {
+          const preloadReady = typeof window.piDeckServers?.list === 'function';
+          const rendererReady = await new Promise((resolveRenderer) => {
+            const deadline = Date.now() + 10_000;
+            const check = () => {
+              if (
+                document.querySelector('[aria-label="piDeck agent workspace"]') &&
+                document.body.textContent?.includes('Create an agent profile first')
+              ) {
+                resolveRenderer(true);
+              } else if (Date.now() >= deadline) {
+                resolveRenderer(false);
+              } else {
+                setTimeout(check, 50);
+              }
+            };
+            check();
+          });
+          if (!preloadReady) {
+            return {
+              preloadReady,
+              rendererReady,
+              builtinServerReady: false,
+              bridgeHealthReady: false,
+              requestBoundaryReady: false,
+            };
+          }
+          const servers = await window.piDeckServers.list();
+          const builtin = servers.find((server) => server.id === 'builtin' && server.isBuiltin === true);
+          if (!builtin) {
+            return {
+              preloadReady,
+              rendererReady,
+              builtinServerReady: false,
+              bridgeHealthReady: false,
+              requestBoundaryReady: false,
+            };
+          }
+          let requestBoundaryReady = false;
+          try {
+            await window.piDeckServers.request({
+              serverId: builtin.id,
+              path: 'https://evil.example/v1/health',
+              method: 'GET',
+            });
+          } catch {
+            requestBoundaryReady = true;
+          }
+          const response = await window.piDeckServers.request({
+            serverId: builtin.id,
+            path: '/v1/health',
+            method: 'GET',
+            headers: { accept: 'application/json' },
+          });
+          const health = JSON.parse(response.body);
+          return {
+            preloadReady,
+            rendererReady,
+            builtinServerReady: true,
+            bridgeHealthReady:
+              response.status === 200 && health.status === 'ok' && health.service === 'supervisor',
+            requestBoundaryReady,
+          };
+        })()`,
         true,
-      );
+      )) as {
+        preloadReady: boolean;
+        rendererReady: boolean;
+        builtinServerReady: boolean;
+        bridgeHealthReady: boolean;
+        requestBoundaryReady: boolean;
+      };
       const marker = join(app.getPath('userData'), 'pideck-smoke-ready.json');
       await writeFile(
         marker,
-        `${JSON.stringify({ nonce: smokeNonce, preloadReady, pid: process.pid })}\n`,
+        `${JSON.stringify({ nonce: smokeNonce, ...readiness, pid: process.pid })}\n`,
         { mode: 0o600 },
       );
     });
@@ -278,38 +358,6 @@ function isStoredServer(value: unknown): value is StoredServer {
     typeof candidate.address === 'string' &&
     (candidate.encryptedToken === undefined || typeof candidate.encryptedToken === 'string')
   );
-}
-
-function parseServerInput(value: unknown): ServerInput {
-  if (!value || typeof value !== 'object') throw new Error('Invalid server');
-  const input = value as Partial<ServerInput>;
-  if (
-    (input.id !== undefined && typeof input.id !== 'string') ||
-    typeof input.name !== 'string' ||
-    !input.name.trim() ||
-    typeof input.address !== 'string' ||
-    (input.token !== undefined && typeof input.token !== 'string')
-  ) {
-    throw new Error('Invalid server');
-  }
-  return input as ServerInput;
-}
-
-function parseServerRequest(value: unknown): ServerRequest {
-  if (!value || typeof value !== 'object') throw new Error('Invalid server request');
-  const request = value as Partial<ServerRequest>;
-  if (
-    typeof request.serverId !== 'string' ||
-    typeof request.path !== 'string' ||
-    typeof request.method !== 'string' ||
-    (request.headers !== undefined &&
-      (typeof request.headers !== 'object' ||
-        Object.values(request.headers).some((item) => typeof item !== 'string'))) ||
-    (request.body !== undefined && typeof request.body !== 'string')
-  ) {
-    throw new Error('Invalid server request');
-  }
-  return request as ServerRequest;
 }
 
 if (!app.requestSingleInstanceLock()) {
@@ -337,6 +385,20 @@ if (!app.requestSingleInstanceLock()) {
   void app
     .whenReady()
     .then(async () => {
+      session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+        if (!details.url.startsWith('file:')) {
+          callback({ responseHeaders: details.responseHeaders });
+          return;
+        }
+        callback({
+          responseHeaders: {
+            ...details.responseHeaders,
+            'Content-Security-Policy': [
+              "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            ],
+          },
+        });
+      });
       session.defaultSession.setPermissionCheckHandler(() => false);
       session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
         callback(false),

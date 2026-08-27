@@ -491,7 +491,7 @@ describe('App', () => {
 
     await user.click(screen.getByRole('button', { name: 'Expand sidebar' }));
 
-    expect(screen.getByText('Sessions')).toBeVisible();
+    expect(screen.queryByText('Sessions')).not.toBeInTheDocument();
     expect(window.localStorage.getItem('pideck-sidebar-collapsed')).toBe('false');
   });
 
@@ -543,9 +543,13 @@ describe('App', () => {
 
     await user.click(await screen.findByRole('menuitem', { name: 'Archive' }));
 
-    expect(screen.queryByRole('button', { name: /Review the changes\./ })).not.toBeInTheDocument();
+    const restore = screen.getByRole('button', { name: 'Restore Review the changes.' });
     expect(window.location.pathname).toBe('/new');
     expect(window.localStorage.getItem('pideck-archived-runs')).toContain(run.id);
+
+    await user.click(restore);
+    expect(window.location.pathname).toBe(`/sessions/${run.id}`);
+    expect(window.localStorage.getItem('pideck-archived-runs')).not.toContain(run.id);
   });
 
   it('archives a session from the hover action', async () => {
@@ -563,7 +567,7 @@ describe('App', () => {
     await user.hover(sessionButton);
     await user.click(screen.getByRole('button', { name: 'Archive session' }));
 
-    expect(screen.queryByRole('button', { name: /Review the changes\./ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Restore Review the changes.' })).toBeInTheDocument();
     expect(window.location.pathname).toBe('/new');
     expect(window.localStorage.getItem('pideck-archived-runs')).toContain(run.id);
   });
@@ -624,6 +628,45 @@ describe('App', () => {
     expect(thinkingMarker).toHaveClass('shimmer');
     expect(await screen.findByText('Looks good.')).toBeVisible();
     expect(screen.getByLabelText('Workspace agent conversation')).toBeInTheDocument();
+  });
+
+  it('loads older transcript pages on demand', async () => {
+    const user = userEvent.setup();
+    const event = (sequence: number, type: string): ManagedAgentEvent => ({
+      agentId: agent.id,
+      runId: run.id,
+      sequence,
+      type,
+      payload: {},
+      createdAt: timestamp,
+    });
+    const listRunEventPage = vi
+      .fn()
+      .mockResolvedValueOnce({
+        events: [event(2, 'agent_start'), event(3, 'agent_end')],
+        previousSequence: 2,
+        nextSequence: null,
+        hasMore: true,
+      })
+      .mockResolvedValueOnce({
+        events: [event(1, 'turn_start')],
+        previousSequence: null,
+        nextSequence: null,
+        hasMore: false,
+      });
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+      listRunEventPage,
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Load older activity' }));
+    expect(listRunEventPage).toHaveBeenNthCalledWith(2, run.id, {
+      beforeSequence: 2,
+      limit: 500,
+    });
+    expect(screen.queryByRole('button', { name: 'Load older activity' })).not.toBeInTheDocument();
   });
 
   it('expands tool calls to show their arguments', async () => {

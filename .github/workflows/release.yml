@@ -91,6 +91,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      - run: pnpm test:server:packaged
       - name: Sign Windows artifacts with Azure Trusted Signing
         if: runner.os == 'Windows'
         uses: azure/trusted-signing-action@v0.5.1

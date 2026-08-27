@@ -24,7 +24,7 @@ import {
   WorktreeResponseSchema,
 } from '@nextflow/contracts';
 import { createId, nowIso, type SupervisorDatabase } from '@nextflow/database';
-import type { Kysely, Selectable } from 'kysely';
+import { type Kysely, type Selectable, sql } from 'kysely';
 
 const execFileAsync = promisify(execFile);
 const MAX_GIT_OUTPUT = 2_000_000;
@@ -43,13 +43,41 @@ export class WorkspaceCapabilityError extends Error {
 
 export class WorkspaceService {
   private readonly processes = new Map<string, ChildProcessWithoutNullStreams>();
+  private readonly processCompletions = new Map<string, Promise<void>>();
   private closing = false;
   constructor(private readonly db: Kysely<SupervisorDatabase>) {}
+
+  async start(): Promise<void> {
+    await this.db
+      .updateTable('supervisor_terminal_sessions')
+      .set({
+        status: 'failed',
+        output: sql<string>`output || ${'\nTerminal interrupted by Supervisor restart.'}`,
+        completed_at: nowIso(),
+      })
+      .where('status', '=', 'running')
+      .execute();
+  }
 
   async close(): Promise<void> {
     this.closing = true;
     for (const child of this.processes.values()) child.kill('SIGTERM');
+    const completions = [...this.processCompletions.values()];
+    if (completions.length > 0) {
+      await Promise.race([
+        Promise.allSettled(completions),
+        new Promise((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+      for (const child of this.processes.values()) child.kill('SIGKILL');
+      await Promise.allSettled([...this.processCompletions.values()]);
+      await this.db
+        .updateTable('supervisor_terminal_sessions')
+        .set({ status: 'failed', completed_at: nowIso() })
+        .where('status', '=', 'running')
+        .execute();
+    }
     this.processes.clear();
+    this.processCompletions.clear();
   }
 
   async fleet(): Promise<FleetOverviewResponse> {
@@ -240,7 +268,7 @@ export class WorkspaceService {
     return rows.map((row) => this.toWorktree(row));
   }
 
-  async releaseWorktree(id: string): Promise<WorktreeResponse> {
+  async releaseWorktree(id: string, force = false): Promise<WorktreeResponse> {
     const row = await this.db
       .selectFrom('supervisor_worktrees')
       .selectAll()
@@ -252,6 +280,18 @@ export class WorkspaceService {
         'invalid_state_transition',
         'Worktree cannot be released in its current state',
       );
+    const activeRun = await this.db
+      .selectFrom('supervisor_agent_runs')
+      .select('id')
+      .where('worktree_id', '=', id)
+      .where('status', 'in', ['queued', 'running'])
+      .executeTakeFirst();
+    if (activeRun) {
+      throw new WorkspaceCapabilityError(
+        'invalid_state_transition',
+        'Worktree cannot be released while a run is active',
+      );
+    }
     const project = await this.db
       .selectFrom('supervisor_projects')
       .selectAll()
@@ -259,13 +299,25 @@ export class WorkspaceService {
       .executeTakeFirstOrThrow();
     const managedRoot = resolve(dirname(await realpath(project.path)), '.pideck-worktrees');
     this.assertWithin(managedRoot, row.path);
+    const dirty = (await this.git(row.path, ['status', '--porcelain'])).trim().length > 0;
+    if (dirty && !force) {
+      throw new WorkspaceCapabilityError(
+        'invalid_state_transition',
+        'Worktree has uncommitted changes; confirm destructive cleanup to release it',
+      );
+    }
     await this.db
       .updateTable('supervisor_worktrees')
       .set({ status: 'releasing', updated_at: nowIso() })
       .where('id', '=', id)
       .execute();
     try {
-      await this.git(project.path, ['worktree', 'remove', '--force', row.path]);
+      await this.git(project.path, [
+        'worktree',
+        'remove',
+        ...(dirty && force ? ['--force'] : []),
+        row.path,
+      ]);
       await this.db
         .updateTable('supervisor_worktrees')
         .set({ status: 'deleted', updated_at: nowIso() })
@@ -311,6 +363,11 @@ export class WorkspaceService {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.processes.set(id, child);
+    let resolveCompletion!: () => void;
+    const completion = new Promise<void>((resolvePromise) => {
+      resolveCompletion = resolvePromise;
+    });
+    this.processCompletions.set(id, completion);
     let output = '';
     let bytes = 0;
     let limited = false;
@@ -347,14 +404,16 @@ export class WorkspaceService {
       clearTimeout(timer);
       if (flushTimer) clearTimeout(flushTimer);
       this.processes.delete(id);
-      const timedOut = signal === 'SIGTERM' && !limited;
-      const status = limited
-        ? 'output_limited'
-        : timedOut
-          ? 'timed_out'
-          : code === 0
-            ? 'completed'
-            : 'failed';
+      const timedOut = signal === 'SIGTERM' && !limited && !this.closing;
+      const status = this.closing
+        ? 'cancelled'
+        : limited
+          ? 'output_limited'
+          : timedOut
+            ? 'timed_out'
+            : code === 0
+              ? 'completed'
+              : 'failed';
       void this.db
         .updateTable('supervisor_terminal_sessions')
         .set({
@@ -366,7 +425,11 @@ export class WorkspaceService {
         })
         .where('id', '=', id)
         .where('status', '=', 'running')
-        .execute();
+        .execute()
+        .finally(() => {
+          this.processCompletions.delete(id);
+          resolveCompletion();
+        });
     });
     return this.requireTerminal(id);
   }

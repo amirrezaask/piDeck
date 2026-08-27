@@ -13,8 +13,11 @@ import {
   type CreateManagedProjectRequest,
   CreateManagedProjectRequestSchema,
   ErrorResponseSchema,
+  type ManagedAgentCommandReceipt,
+  ManagedAgentCommandReceiptSchema,
   type ManagedAgentEvent,
   ManagedAgentEventSchema,
+  type ManagedAgentEventsQuery,
   type ManagedAgentEventsResponse,
   ManagedAgentEventsResponseSchema,
   type ManagedAgentExtensionsResponse,
@@ -94,6 +97,7 @@ export interface SupervisorClientOptions {
   readonly serviceToken?: string;
   readonly fetcher?: typeof fetch;
   readonly webSocketFactory?: typeof WebSocket;
+  readonly requestTimeoutMs?: number;
 }
 
 export type StreamConnectionState = 'connected' | 'reconnecting' | 'stale' | 'failed';
@@ -117,12 +121,14 @@ export class SupervisorClient {
   private readonly serviceToken: string | undefined;
   private readonly fetcher: typeof fetch;
   private readonly webSocketFactory: typeof WebSocket | undefined;
+  private readonly requestTimeoutMs: number;
 
   constructor(options: SupervisorClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? '/supervisor-api').replace(/\/$/, '');
     this.serviceToken = options.serviceToken;
     this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
     this.webSocketFactory = options.webSocketFactory ?? globalThis.WebSocket;
+    this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? 30_000);
   }
 
   createAgent(request: CreateManagedAgentRequest): Promise<ManagedAgentResponse> {
@@ -266,8 +272,9 @@ export class SupervisorClient {
   listWorktrees(): Promise<{ worktrees: WorktreeResponse[] }> {
     return this.request('/v1/worktrees', WorktreeListResponseSchema);
   }
-  releaseWorktree(id: string): Promise<WorktreeResponse> {
-    return this.request(`/v1/worktrees/${encodeURIComponent(id)}`, WorktreeResponseSchema, {
+  releaseWorktree(id: string, force = false): Promise<WorktreeResponse> {
+    const query = force ? '?force=true' : '';
+    return this.request(`/v1/worktrees/${encodeURIComponent(id)}${query}`, WorktreeResponseSchema, {
       method: 'DELETE',
     });
   }
@@ -326,6 +333,13 @@ export class SupervisorClient {
     return this.request(`/v1/runs/${encodeURIComponent(runId)}`, ManagedAgentRunResponseSchema);
   }
 
+  getCommandReceipt(idempotencyKey: string): Promise<ManagedAgentCommandReceipt> {
+    return this.request(
+      `/v1/command-receipts/${encodeURIComponent(idempotencyKey)}`,
+      ManagedAgentCommandReceiptSchema,
+    );
+  }
+
   cancelRun(runId: string, idempotencyKey?: string): Promise<ManagedAgentRunResponse> {
     return this.request(
       `/v1/runs/${encodeURIComponent(runId)}/cancel`,
@@ -352,6 +366,23 @@ export class SupervisorClient {
     );
   }
 
+  async listRunEventPage(
+    runId: string,
+    query: Partial<ManagedAgentEventsQuery> = {},
+  ): Promise<ManagedAgentEventsResponse> {
+    const params = new URLSearchParams({
+      afterSequence: String(query.afterSequence ?? 0),
+      limit: String(query.limit ?? 500),
+    });
+    if (query.beforeSequence !== undefined) {
+      params.set('beforeSequence', String(query.beforeSequence));
+    }
+    return this.request(
+      `/v1/runs/${encodeURIComponent(runId)}/events?${params.toString()}`,
+      ManagedAgentEventsResponseSchema,
+    );
+  }
+
   async listRunEvents(runId: string, afterSequence = 0): Promise<ManagedAgentEventsResponse> {
     const events: ManagedAgentEvent[] = [];
     for await (const page of this.listRunEventPages(runId, afterSequence))
@@ -366,14 +397,10 @@ export class SupervisorClient {
     let cursor = afterSequence;
     let hasMore = true;
     while (hasMore) {
-      const params = new URLSearchParams({ afterSequence: String(cursor), limit: '500' });
-      const page = await this.request(
-        `/v1/runs/${encodeURIComponent(runId)}/events?${params.toString()}`,
-        ManagedAgentEventsResponseSchema,
-      );
+      const page = await this.listRunEventPage(runId, { afterSequence: cursor, limit: 500 });
       yield page;
       hasMore = page.hasMore === true && page.nextSequence != null;
-      if (hasMore) cursor = page.nextSequence as number;
+      if (hasMore) cursor = page.nextSequence;
     }
   }
 
@@ -589,18 +616,32 @@ export class SupervisorClient {
     schema: RuntimeSchema<T>,
     init: RequestInit = {},
   ): Promise<T> {
-    const response = await this.fetcher(`${this.baseUrl}${path}`, {
-      ...init,
-      headers: {
-        ...this.headers('application/json'),
-        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-        ...init.headers,
-      },
-    });
-    if (!response.ok) {
-      throw await responseError(response);
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(
+      () => controller.abort(new DOMException('Supervisor request timed out', 'TimeoutError')),
+      this.requestTimeoutMs,
+    );
+    const abort = () => controller.abort(init.signal?.reason);
+    init.signal?.addEventListener('abort', abort, { once: true });
+    if (init.signal?.aborted) abort();
+    try {
+      const response = await this.fetcher(`${this.baseUrl}${path}`, {
+        ...init,
+        signal: controller.signal,
+        headers: {
+          ...this.headers('application/json'),
+          ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+          ...init.headers,
+        },
+      });
+      if (!response.ok) {
+        throw await responseError(response);
+      }
+      return schema.parse(await response.json());
+    } finally {
+      globalThis.clearTimeout(timeout);
+      init.signal?.removeEventListener('abort', abort);
     }
-    return schema.parse(await response.json());
   }
 
   private headers(accept: string): Record<string, string> {

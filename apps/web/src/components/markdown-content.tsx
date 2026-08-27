@@ -903,6 +903,7 @@ function parseInlineLink(value: string, index: number): InlineLink | undefined {
 
 function safeLinkHref(href: string): string | undefined {
   const normalized = href.trim();
+  if (/^(?:\/\/|\/\\|\\\\)/.test(normalized)) return undefined;
   if (/^(?:https?:|mailto:|tel:|\/|#|\.\/|\.\.\/)/i.test(normalized)) return normalized;
   return undefined;
 }

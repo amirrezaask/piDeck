@@ -14,7 +14,11 @@ async function withAgentApp<T>(
     factory: FakePiSessionFactory;
     directory: string;
   }) => Promise<T>,
-  options: { serviceToken?: string; piSessionFactory?: FakePiSessionFactory } = {},
+  options: {
+    serviceToken?: string;
+    piSessionFactory?: FakePiSessionFactory;
+    bodyLimitBytes?: number;
+  } = {},
 ): Promise<T> {
   const directory = mkdtempSync(join(tmpdir(), 'nextflow-agent-http-'));
   const filename = join(directory, 'test.sqlite');
@@ -46,6 +50,27 @@ const createPayload = {
 };
 
 describe('Supervisor managed-agent HTTP API', () => {
+  it('returns a structured 413 when an attachment request exceeds the body limit', async () => {
+    await withAgentApp(
+      async ({ server }) => {
+        const response = await server.inject({
+          method: 'POST',
+          url: '/v1/runs',
+          headers: { 'content-type': 'application/json' },
+          payload: JSON.stringify({ prompt: 'x'.repeat(2_000) }),
+        });
+        expect(response.statusCode).toBe(413);
+        expect(response.json()).toEqual({
+          error: {
+            code: 'payload_too_large',
+            message: 'The request body exceeds the 34 MB attachment limit',
+          },
+        });
+      },
+      { bodyLimitBytes: 1_024 },
+    );
+  });
+
   it('protects definition and run resources with the service credential', async () => {
     await withAgentApp(
       async ({ server }) => {
@@ -227,6 +252,17 @@ describe('Supervisor managed-agent HTTP API', () => {
         acknowledgementId: expect.any(String),
       });
       expect(factory.sessions).toHaveLength(1);
+      const receipt = await server.inject({
+        method: 'GET',
+        url: '/v1/command-receipts/run-retry-1',
+      });
+      expect(receipt.statusCode).toBe(200);
+      expect(receipt.json()).toMatchObject({
+        idempotencyKey: 'run-retry-1',
+        command: 'run_create',
+        status: 'succeeded',
+        result: { id: first.json<{ id: string }>().id },
+      });
 
       const conflict = await server.inject({
         method: 'POST',

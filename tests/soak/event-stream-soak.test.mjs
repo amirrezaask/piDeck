@@ -4,6 +4,10 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import WebSocket from 'ws';
+import { LruCache } from '../../apps/web/src/lib/lru.ts';
+import { RendererSoakProbe } from '../../apps/web/src/lib/renderer-soak.tsx';
+import { SupervisorClient } from '../../apps/web/src/lib/supervisor-client.ts';
+import { mergeTranscriptEvents } from '../../apps/web/src/lib/transcript.ts';
 import supervisorPackage from '../../packages/supervisor/index.ts';
 
 const { buildSupervisorApp } = supervisorPackage;
@@ -117,37 +121,68 @@ async function ticket(baseUrl, authorization = token) {
   return (await response.json()).ticket;
 }
 
-async function connectStream(baseUrl, runId, state) {
-  const started = performance.now();
-  const streamTicket = await ticket(baseUrl);
-  const url = `${baseUrl.replace('http:', 'ws:')}/v1/runs/${runId}/stream?afterSequence=${state.cursor}&ticket=${encodeURIComponent(streamTicket)}`;
-  const socket = new WebSocket(url);
-  socket.on('message', (frame) => {
-    const event = JSON.parse(frame.toString());
-    if (event.sequence <= state.cursor) {
-      state.duplicates += 1;
-      return;
-    }
-    if (event.sequence !== state.cursor + 1) state.gaps += 1;
-    state.cursor = event.sequence;
-    state.received += 1;
-    state.retained.push(event.sequence);
-    if (state.retained.length > budgets.rendererRetainedPerAgent) state.retained.shift();
-  });
-  await new Promise((resolve, reject) => {
-    socket.once('open', resolve);
-    socket.once('error', reject);
-  });
-  state.reconnects += 1;
-  state.maxReconnectMs = Math.max(state.maxReconnectMs, performance.now() - started);
-  return socket;
+class TrackingWebSocket extends WebSocket {
+  static instances = new Set();
+
+  constructor(url) {
+    super(url);
+    TrackingWebSocket.instances.add(this);
+    this.once('close', () => TrackingWebSocket.instances.delete(this));
+  }
 }
 
-async function closeSocket(socket) {
-  if (!socket || socket.readyState === WebSocket.CLOSED) return;
-  const closed = new Promise((resolve) => socket.once('close', resolve));
-  socket.close();
-  await closed;
+function forceDisconnect(runId) {
+  for (const socket of TrackingWebSocket.instances) {
+    if (socket.url.includes(encodeURIComponent(runId)) || socket.url.includes(runId))
+      socket.terminate();
+  }
+}
+
+function connectStream(client, runId, state) {
+  const controller = new AbortController();
+  const started = performance.now();
+  let reconnectingAt = started;
+  const task = (async () => {
+    try {
+      for await (const event of client.streamRunEvents(runId, {
+        afterSequence: state.cursor,
+        signal: controller.signal,
+        onConnectionState(connectionState) {
+          if (connectionState === 'reconnecting') reconnectingAt = performance.now();
+          if (connectionState !== 'connected') return;
+          state.reconnects += 1;
+          const elapsed =
+            state.reconnects === 1
+              ? performance.now() - started
+              : performance.now() - reconnectingAt;
+          state.maxReconnectMs = Math.max(state.maxReconnectMs, elapsed);
+        },
+      })) {
+        if (event.sequence <= state.cursor) {
+          state.duplicates += 1;
+          continue;
+        }
+        if (event.sequence !== state.cursor + 1) state.gaps += 1;
+        state.cursor = event.sequence;
+        state.received += 1;
+        state.retained = mergeTranscriptEvents(state.retained, [event]);
+      }
+    } catch (error) {
+      state.streamError = String(error);
+    }
+  })();
+  return {
+    close() {
+      controller.abort();
+    },
+    task,
+  };
+}
+
+async function closeStream(stream) {
+  if (!stream) return;
+  stream.close();
+  await stream.task;
 }
 
 function syntheticCount(app) {
@@ -173,7 +208,7 @@ async function closeApp(app) {
   await app.server.close();
 }
 
-test('100k-event/25-agent supervisor and WebSocket soak stays lossless across reconnect and restart', {
+test('100k-event/25-agent SupervisorClient and React renderer soak stays lossless across reconnect and restart', {
   timeout: budgets.maxDurationMs,
 }, async () => {
   const started = performance.now();
@@ -185,7 +220,9 @@ test('100k-event/25-agent supervisor and WebSocket soak stays lossless across re
   await mkdir(sessionDirectory, { recursive: true });
   const factory = new SoakSessionFactory(sessionDirectory);
   let app;
-  let sockets = [];
+  let streams = [];
+  let rendererRoot;
+  let rendererDom;
   try {
     app = buildSupervisorApp({
       databasePath,
@@ -198,6 +235,24 @@ test('100k-event/25-agent supervisor and WebSocket soak stays lossless across re
     });
     let baseUrl = await listen(app);
     await assert.rejects(() => ticket(baseUrl, 'wrong-token'), /ticket_401/);
+    const realFetch = globalThis.fetch.bind(globalThis);
+    let ticketFailures = 0;
+    const client = new SupervisorClient({
+      baseUrl,
+      serviceToken: token,
+      fetcher: async (input, init) => {
+        const url = String(input);
+        if (url.endsWith('/v1/ws-tickets') && ticketFailures < budgets.agents) {
+          ticketFailures += 1;
+          return new Response(JSON.stringify({ error: { code: 'temporary', message: 'retry' } }), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return realFetch(input, init);
+      },
+      webSocketFactory: TrackingWebSocket,
+    });
 
     const agents = [];
     for (let index = 0; index < budgets.agents; index += 1) {
@@ -214,11 +269,49 @@ test('100k-event/25-agent supervisor and WebSocket soak stays lossless across re
         retained: [],
         reconnects: 0,
         maxReconnectMs: 0,
+        streamError: undefined,
       };
-      const socket = await connectStream(baseUrl, run.id, state);
+      const stream = connectStream(client, run.id, state);
       agents.push({ agent, run, state, session: factory.sessions[index] });
-      sockets.push(socket);
+      streams.push(stream);
     }
+
+    const { JSDOM } = await import('../../apps/web/node_modules/jsdom/lib/api.js');
+    const React = await import('../../apps/web/node_modules/react/index.js');
+    const { createRoot } = await import('../../apps/web/node_modules/react-dom/client.js');
+    rendererDom = new JSDOM('<!doctype html><main id="renderer"></main>', {
+      url: 'http://renderer.test/',
+    });
+    globalThis.window = rendererDom.window;
+    globalThis.document = rendererDom.window.document;
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: rendererDom.window.navigator,
+    });
+    const rendererContainer = rendererDom.window.document.querySelector('#renderer');
+    if (!rendererContainer) throw new Error('renderer_container_missing');
+    rendererRoot = createRoot(rendererContainer);
+    const rendererStates = [];
+    const onRendererState = (state) => rendererStates.push(state);
+    const renderRoute = (runId) => {
+      rendererRoot.render(
+        React.createElement(RendererSoakProbe, {
+          client,
+          runId,
+          onConnectionState: onRendererState,
+        }),
+      );
+    };
+    renderRoute(agents[0].run.id);
+    await waitUntil(
+      () =>
+        rendererContainer.querySelector('output')?.getAttribute('data-run-id') === agents[0].run.id,
+      'initial production renderer route',
+    );
+    const rendererAttachmentCache = new LruCache(24);
+    for (const entry of agents) rendererAttachmentCache.set(entry.run.id, entry.run.id);
+    assert.equal(rendererAttachmentCache.size, 24);
+    assert.equal(rendererAttachmentCache.has(agents[0].run.id), false);
 
     const eventsPerBatch = budgets.maxQueuedEventsPerAgent;
     let emitted = 0;
@@ -228,8 +321,15 @@ test('100k-event/25-agent supervisor and WebSocket soak stays lossless across re
       const disconnectIndexes =
         batch % 4 === 0 ? [batch % agents.length, (batch + 7) % agents.length] : [];
       for (const index of disconnectIndexes) {
-        await closeSocket(sockets[index]);
-        sockets[index] = undefined;
+        forceDisconnect(agents[index].run.id);
+      }
+      if (batch % 5 === 0) {
+        const route = agents[batch % agents.length].run.id;
+        renderRoute(route);
+        await waitUntil(
+          () => rendererContainer.querySelector('output')?.getAttribute('data-run-id') === route,
+          `production renderer route ${route}`,
+        );
       }
 
       for (let perAgent = 0; perAgent < eventsPerBatch && emitted < budgets.events; perAgent += 1) {
@@ -246,9 +346,6 @@ test('100k-event/25-agent supervisor and WebSocket soak stays lossless across re
       }
 
       await waitUntil(() => syntheticCount(app) === emitted, `durable event ${emitted}`, 30_000);
-      for (const index of disconnectIndexes) {
-        sockets[index] = await connectStream(baseUrl, agents[index].run.id, agents[index].state);
-      }
       await waitUntil(
         () => agents.every((entry) => entry.state.cursor === maxSequence(app, entry.agent.id)),
         `stream convergence after batch ${batch}: ${JSON.stringify(
@@ -261,6 +358,16 @@ test('100k-event/25-agent supervisor and WebSocket soak stays lossless across re
         15_000,
       );
     }
+
+    assert.ok(ticketFailures > 0);
+    assert.ok(rendererStates.includes('connected'));
+    assert.ok(agents.every((entry) => entry.state.streamError === undefined));
+    const historyPage = await client.listRunEventPage(agents[0].run.id, {
+      beforeSequence: maxSequence(app, agents[0].agent.id),
+      limit: 10,
+    });
+    assert.equal(historyPage.events.length, 10);
+    assert.equal(historyPage.events.at(-1).sequence < maxSequence(app, agents[0].agent.id), true);
 
     const interventionStarted = performance.now();
     for (let index = 0; index < 5; index += 1) factory.sessions[index].settle();
@@ -283,8 +390,12 @@ test('100k-event/25-agent supervisor and WebSocket soak stays lossless across re
     }, 'completed and cancelled terminal states');
     const interventionLatencyMs = performance.now() - interventionStarted;
 
-    await Promise.all(sockets.map(closeSocket));
-    sockets = [];
+    rendererRoot.unmount();
+    rendererRoot = undefined;
+    rendererDom.window.close();
+    rendererDom = undefined;
+    await Promise.all(streams.map(closeStream));
+    streams = [];
     await closeApp(app);
     app = undefined;
 
@@ -363,7 +474,11 @@ test('100k-event/25-agent supervisor and WebSocket soak stays lossless across re
       `${JSON.stringify(summary, null, 2)}\n`,
     );
   } finally {
-    await Promise.all(sockets.map(closeSocket));
+    rendererRoot?.unmount();
+    rendererRoot = undefined;
+    rendererDom?.window.close();
+    rendererDom = undefined;
+    await Promise.all(streams.map(closeStream));
     await closeApp(app);
     await rm(directory, { recursive: true, force: true });
   }
