@@ -12,8 +12,14 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   projects: [
-    { name: 'desktop-chromium', use: { ...devices['Desktop Chrome'], channel: 'chrome' } },
-    { name: 'mobile-chromium', use: { ...devices['Pixel 7'], channel: 'chrome' } },
+    {
+      name: 'desktop-chromium',
+      use: { ...devices['Desktop Chrome'], channel: process.env.CI ? undefined : 'chrome' },
+    },
+    {
+      name: 'mobile-chromium',
+      use: { ...devices['Pixel 7'], channel: process.env.CI ? undefined : 'chrome' },
+    },
   ],
   webServer: {
     command:

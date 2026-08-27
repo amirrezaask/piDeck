@@ -8,22 +8,22 @@ Execute in the order below unless dependencies say otherwise. Each executor must
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |---|---|---:|---:|---|---|
-| 001 | Make accepted-run admission durable and compensating | P1 | M | — | TODO |
-| 002 | Stop paid execution when durable event persistence fails | P1 | M | 001 | TODO |
-| 003 | Persist and recover Pi session ownership | P1 | L | 001, 002 | TODO |
-| 004 | Make renderer interventions idempotent | P1 | M | 001 | TODO |
-| 005 | Make event-stream failure and reconnect semantics reliable | P1 | M | — | TODO |
-| 006 | Preserve run visibility during partial server failure | P1 | M | 005 | TODO |
-| 007 | Load all active and historical runs safely | P1 | M | 006 | TODO |
-| 008 | Enforce configured authentication on standalone loopback requests | P1 | S | — | TODO |
-| 009 | Require TLS for token-bearing non-loopback supervisors | P1 | S | 008 | TODO |
-| 010 | Make migration 013 rollback/reapply safe | P1 | M | — | TODO |
-| 011 | Bound supervisor and renderer event memory | P1 | L | 002, 005 | TODO |
-| 012 | Add crash, restart, and disk-write-failure integration tests | P1 | L | 001, 002, 003, 010 | TODO |
-| 013 | Add packaged Electron smoke tests | P1 | M | 003, 008, 009, 012 | TODO |
-| 014 | Add a sustained event-stream soak test | P1 | M | 005, 011, 012 | TODO |
-| 015 | Enforce production CI and release gates | P1 | M | 010, 012, 013, 014 | TODO |
-| 016 | Document and verify backup/restore procedures | P1 | M | 003, 010, 012 | TODO |
+| 001 | Make accepted-run admission durable and compensating | P1 | M | — | DONE |
+| 002 | Stop paid execution when durable event persistence fails | P1 | M | 001 | DONE |
+| 003 | Persist and recover Pi session ownership | P1 | L | 001, 002 | DONE |
+| 004 | Make renderer interventions idempotent | P1 | M | 001 | DONE |
+| 005 | Make event-stream failure and reconnect semantics reliable | P1 | M | — | DONE |
+| 006 | Preserve run visibility during partial server failure | P1 | M | 005 | DONE |
+| 007 | Load all active and historical runs safely | P1 | M | 006 | DONE |
+| 008 | Enforce configured authentication on standalone loopback requests | P1 | S | — | DONE |
+| 009 | Require TLS for token-bearing non-loopback supervisors | P1 | S | 008 | DONE |
+| 010 | Make migration 013 rollback/reapply safe | P1 | M | — | DONE |
+| 011 | Bound supervisor and renderer event memory | P1 | L | 002, 005 | DONE |
+| 012 | Add crash, restart, and disk-write-failure integration tests | P1 | L | 001, 002, 003, 010 | DONE |
+| 013 | Add packaged Electron smoke tests | P1 | M | 003, 008, 009, 012 | DONE |
+| 014 | Add a sustained event-stream soak test | P1 | M | 005, 011, 012 | DONE |
+| 015 | Enforce production CI and release gates | P1 | M | 010, 012, 013, 014 | DONE |
+| 016 | Document and verify backup/restore procedures | P1 | M | 003, 010, 012 | DONE |
 
 Status values: `TODO`, `IN PROGRESS`, `DONE`, `BLOCKED: <reason>`, `REJECTED: <reason>`.
 

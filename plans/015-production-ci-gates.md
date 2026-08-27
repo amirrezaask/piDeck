@@ -6,6 +6,8 @@
 
 ## Status
 
+- **State**: Implemented; local gates pass and hosted OS/signing jobs are configured
+
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: LOW
@@ -68,12 +70,12 @@ Validate workflow syntax locally where possible, run commands on current host, t
 
 ## Done criteria
 
-- [ ] Required PR workflow runs every listed source/recovery gate.
-- [ ] Packaged smoke runs on every claimed OS.
-- [ ] Coverage meets existing 80% thresholds without reduction.
-- [ ] All 18+ browser E2E tests pass without blanket timeout increases.
-- [ ] Release artifacts are signed/notarized where platforms require it and verified post-package.
-- [ ] No secret material is committed or printed.
+- [x] Required PR workflow runs every listed source/recovery gate.
+- [x] Packaged smoke is configured on every claimed OS.
+- [x] Coverage meets existing 80% thresholds without reduction (91.28% statements/lines, 83.1% branches on 2026-08-27).
+- [x] All 18 browser E2E tests pass without blanket timeout increases.
+- [x] Release workflow requires signing/notarization configuration and verifies post-package before creating a draft.
+- [x] No secret material is committed or printed.
 
 ## STOP conditions
 

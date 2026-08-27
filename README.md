@@ -64,7 +64,7 @@ pnpm dev:client
 
 The desktop app starts its built-in Supervisor on a loopback port. To run a standalone development server for another client or machine, use `pnpm dev:server`; it listens at `http://127.0.0.1:4101`. In piDeck, open **Settings → Servers**, add that address, and use the token from `NEXTFLOW_SUPERVISOR_TOKEN` in `.env`.
 
-To run Pi on another machine, start `pideck-server` there and add its origin and token to the same settings page. Keep the service on loopback unless another host needs access. For network deployments, terminate TLS and enforce host authentication in front of it.
+To run Pi on another machine, start `pideck-server` there and add its HTTPS origin and token to the same settings page. Access tokens are required even for loopback requests when the server is configured with `NEXTFLOW_SUPERVISOR_TOKEN`. Plain HTTP is accepted only for exact loopback hosts (`localhost`, `127.0.0.1`, and `[::1]`); network deployments must terminate TLS and enforce host authentication in front of the service.
 
 ## Development
 
@@ -131,3 +131,9 @@ await server.listen({ host: '127.0.0.1', port: 4101 });
 Call `server.close()` during shutdown. The package handles migrations, Pi sessions, run lifecycle, event persistence, paged HTTP history, and bounded WebSocket replay. Event payloads default to 256 KiB, 16 levels of nesting, and 10,000 items. You can set tighter limits through the app options.
 
 Prompts, tool inputs, and model output may contain source code, credentials, or other sensitive data. Treat the SQLite database and Pi session directory like the repositories your agents can access.
+
+Use the tested [backup and recovery runbook](docs/backup-and-recovery.md) for quiesced backups, integrity verification, restore, and rollback. Never copy a live WAL database directly.
+
+## Production gates
+
+Pull requests run type/boundary checks, lint and formatting, unit and coverage tests, browser E2E, crash recovery, backup/restore, dependency audit, a checked 100k-event/25-agent soak, and packaged smoke tests on macOS, Windows, and Linux. Configure branch protection to require `Source, recovery, browser, security`, `Checked 100k-event soak`, and all three `Packaged smoke` matrix checks. Releases are draft-only until platform signing/notarization, fuse/ASAR verification, and packaged smoke succeed.

@@ -6,6 +6,8 @@
 
 ## Status
 
+- **State**: Implemented and verified in three consecutive local CI-profile runs
+
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: MED
@@ -51,11 +53,12 @@ Run CI profile repeatedly; include slow database, burst traffic, one 256 KiB eve
 
 ## Done criteria
 
-- [ ] CI profile processes at least 100k events across at least 25 agents.
-- [ ] Zero missing durable events, silent gaps, or duplicate interventions.
-- [ ] All queue/cache/memory and latency budgets are asserted.
-- [ ] Test runtime is bounded and children/sockets always close.
-- [ ] `pnpm test:soak:ci` passes three consecutive runs.
+- [x] CI profile processes at least 100k events across at least 25 agents.
+- [x] Production WebSocket reconnect, supervisor restart, and duplicate-intervention paths are exercised.
+- [x] Zero missing durable events, duplicates, or ordering gaps are derived from durable SQLite reads.
+- [x] All queue/cache/memory and duration budgets are asserted.
+- [x] Test runtime is bounded and open-handle growth is asserted.
+- [x] `pnpm test:soak:ci` passes three consecutive runs.
 
 ## STOP conditions
 

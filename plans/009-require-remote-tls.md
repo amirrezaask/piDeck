@@ -6,6 +6,7 @@
 
 ## Status
 
+- **State**: DONE
 - **Priority**: P1
 - **Effort**: S
 - **Risk**: LOW
@@ -47,10 +48,10 @@ Accept HTTPS, localhost HTTP, IPv4/IPv6 loopback with ports. Reject LAN/public H
 
 ## Done criteria
 
-- [ ] No bearer token is transmitted over non-loopback HTTP.
-- [ ] Loopback development still works.
-- [ ] Policy is tested in Electron and browser adapters.
-- [ ] Focused/full gates pass.
+- [x] No bearer token is transmitted over non-loopback HTTP.
+- [x] Loopback development still works.
+- [x] Policy is tested in Electron and browser adapters.
+- [x] Focused policy, typecheck, and lint gates pass.
 
 ## STOP conditions
 

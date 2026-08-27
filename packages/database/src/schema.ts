@@ -225,6 +225,11 @@ export interface SupervisorAgentRunsTable {
   execution_mode: DatabaseColumn<string>;
   worktree_id: DatabaseColumn<Nullable<string>>;
   parent_run_id: DatabaseColumn<Nullable<string>>;
+  pi_session_id: DatabaseColumn<Nullable<string>>;
+  pi_session_file: DatabaseColumn<Nullable<string>>;
+  pi_owner_instance: DatabaseColumn<Nullable<string>>;
+  pi_recovery_state: DatabaseColumn<Nullable<string>>;
+  pi_recovered_at: DatabaseColumn<Nullable<string>>;
   status: string;
   error_code: Nullable<string>;
   error_message: Nullable<string>;

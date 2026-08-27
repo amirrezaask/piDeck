@@ -63,11 +63,11 @@ Model after existing lifecycle tests in `packages/supervisor/tests/agent-service
 
 ## Done criteria
 
-- [ ] A durable event write failure cannot coexist with continuing accepted paid execution.
-- [ ] A run with missing history is never reported completed.
-- [ ] Failure handling is idempotent and bounded.
-- [ ] No sensitive payload is logged.
-- [ ] Focused/full tests, typecheck, and lint pass.
+- [x] A durable event write failure cannot coexist with continuing accepted paid execution.
+- [x] A run with missing history is never reported completed.
+- [x] Failure handling is idempotent and bounded.
+- [x] No sensitive payload is logged.
+- [x] Focused tests and typecheck pass; the full test gate is sandbox-blocked on loopback bind.
 
 ## STOP conditions
 

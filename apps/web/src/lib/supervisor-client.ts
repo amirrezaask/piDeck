@@ -107,6 +107,11 @@ export interface StreamAgentEventsOptions {
   readonly onConnectionState?: (state: StreamConnectionState) => void;
 }
 
+export interface PageIterationOptions {
+  readonly signal?: AbortSignal;
+  readonly maxPages?: number;
+}
+
 export class SupervisorClient {
   private readonly baseUrl: string;
   private readonly serviceToken: string | undefined;
@@ -201,11 +206,42 @@ export class SupervisorClient {
   }
 
   listRuns(query: Partial<ManagedAgentRunListQuery> = {}): Promise<ManagedAgentRunListResponse> {
+    return this.listRunsPage(query);
+  }
+
+  private listRunsPage(
+    query: Partial<ManagedAgentRunListQuery>,
+    signal?: AbortSignal,
+  ): Promise<ManagedAgentRunListResponse> {
     const params = new URLSearchParams({ limit: String(query.limit ?? 50) });
     if (query.agentId) params.set('agentId', query.agentId);
     if (query.status) params.set('status', query.status);
     if (query.cursor) params.set('cursor', query.cursor);
-    return this.request(`/v1/runs?${params.toString()}`, ManagedAgentRunListResponseSchema);
+    return this.request(`/v1/runs?${params.toString()}`, ManagedAgentRunListResponseSchema, {
+      signal,
+    });
+  }
+
+  async listAllRuns(
+    query: Partial<ManagedAgentRunListQuery> = {},
+    options: PageIterationOptions = {},
+  ): Promise<ManagedAgentRunResponse[]> {
+    const runs: ManagedAgentRunResponse[] = [];
+    const seenCursors = new Set<string>();
+    let cursor = query.cursor;
+    const maxPages = options.maxPages ?? 100;
+    for (let pageNumber = 0; pageNumber < maxPages; pageNumber += 1) {
+      if (options.signal?.aborted) throw abortError();
+      const page = await this.listRunsPage({ ...query, cursor }, options.signal);
+      runs.push(...page.runs);
+      if (!page.nextCursor) return runs;
+      if (page.nextCursor === cursor || seenCursors.has(page.nextCursor)) {
+        throw new Error('Supervisor pagination cursor did not advance');
+      }
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+    throw new Error(`Supervisor pagination exceeded ${maxPages} pages`);
   }
 
   getFleet(): Promise<FleetOverviewResponse> {
@@ -318,20 +354,27 @@ export class SupervisorClient {
 
   async listRunEvents(runId: string, afterSequence = 0): Promise<ManagedAgentEventsResponse> {
     const events: ManagedAgentEvent[] = [];
+    for await (const page of this.listRunEventPages(runId, afterSequence))
+      events.push(...page.events);
+    return { events };
+  }
+
+  async *listRunEventPages(
+    runId: string,
+    afterSequence = 0,
+  ): AsyncGenerator<ManagedAgentEventsResponse> {
     let cursor = afterSequence;
-    let page: ManagedAgentEventsResponse;
     let hasMore = true;
     while (hasMore) {
-      const params = new URLSearchParams({ afterSequence: String(cursor) });
-      page = await this.request(
+      const params = new URLSearchParams({ afterSequence: String(cursor), limit: '500' });
+      const page = await this.request(
         `/v1/runs/${encodeURIComponent(runId)}/events?${params.toString()}`,
         ManagedAgentEventsResponseSchema,
       );
-      events.push(...page.events);
+      yield page;
       hasMore = page.hasMore === true && page.nextSequence != null;
       if (hasMore) cursor = page.nextSequence as number;
     }
-    return { events };
   }
 
   listAgents(query: Partial<ManagedAgentListQuery> = {}): Promise<ManagedAgentListResponse> {
@@ -408,50 +451,60 @@ export class SupervisorClient {
 
     while (!signal?.aborted) {
       options.onConnectionState?.(reconnectAttempt === 0 ? 'stale' : 'reconnecting');
-      const params = new URLSearchParams({ afterSequence: String(lastSequence) });
-      const ticket = await this.websocketTicket();
-      const socket = new this.webSocketFactory(this.websocketUrl(path, params, ticket));
       const queue = new AsyncEventQueue<ManagedAgentEvent>();
+      let socket: WebSocket | undefined;
       let closedUnexpectedly = false;
+      let demonstratedHealth = false;
       const abort = () => {
         queue.end();
-        socket.close();
+        socket?.close();
       };
       const onOpen = () => {
-        options.onConnectionState?.('connected');
-      };
-      socket.onopen = onOpen;
-      socket.onmessage = (event) => {
-        try {
-          const payload = ManagedAgentEventSchema.parse(
-            JSON.parse(typeof event.data === 'string' ? event.data : String(event.data)) as unknown,
-          );
-          if (payload.sequence <= lastSequence) return;
-          if (options.detectGaps !== false && payload.sequence > lastSequence + 1) {
-            queue.fail(
-              new Error(
-                `Supervisor event sequence gap: expected ${lastSequence + 1}, received ${payload.sequence}`,
-              ),
-            );
-            socket.close();
-            return;
-          }
-          lastSequence = payload.sequence;
-          queue.push(payload);
-        } catch (reason) {
-          queue.fail(reason instanceof Error ? reason : new Error('Invalid Supervisor event'));
-          socket.close();
-        }
-      };
-      socket.onerror = () => queue.fail(new Error('Supervisor event WebSocket failed'));
-      socket.onclose = () => {
-        closedUnexpectedly = !signal?.aborted;
-        queue.end();
+        options.onConnectionState?.('stale');
       };
       signal?.addEventListener('abort', abort, { once: true });
 
       let failure: Error | undefined;
       try {
+        const params = new URLSearchParams({ afterSequence: String(lastSequence) });
+        const ticket = await this.websocketTicket(signal);
+        if (signal?.aborted) return;
+        socket = new this.webSocketFactory(this.websocketUrl(path, params, ticket));
+        socket.onopen = onOpen;
+        socket.onmessage = (event) => {
+          try {
+            const payload = ManagedAgentEventSchema.parse(
+              JSON.parse(
+                typeof event.data === 'string' ? event.data : String(event.data),
+              ) as unknown,
+            );
+            if (payload.sequence <= lastSequence) return;
+            if (options.detectGaps !== false && payload.sequence > lastSequence + 1) {
+              queue.fail(
+                new Error(
+                  `Supervisor event sequence gap: expected ${lastSequence + 1}, received ${payload.sequence}`,
+                ),
+              );
+              socket?.close();
+              return;
+            }
+            lastSequence = payload.sequence;
+            if (!demonstratedHealth) {
+              demonstratedHealth = true;
+              reconnectAttempt = 0;
+              options.onConnectionState?.('connected');
+            }
+            queue.push(payload);
+          } catch (reason) {
+            queue.fail(reason instanceof Error ? reason : new Error('Invalid Supervisor event'));
+            socket?.close();
+          }
+        };
+        socket.onerror = () => queue.fail(new Error('Supervisor event WebSocket failed'));
+        socket.onclose = () => {
+          closedUnexpectedly = !signal?.aborted;
+          queue.end();
+        };
         let reading = true;
         while (reading) {
           const result = await queue.next();
@@ -465,7 +518,13 @@ export class SupervisorClient {
         failure = error instanceof Error ? error : new Error('Supervisor event stream failed');
       } finally {
         signal?.removeEventListener('abort', abort);
-        socket.close();
+        if (socket) {
+          socket.onopen = null;
+          socket.onmessage = null;
+          socket.onerror = null;
+          socket.onclose = null;
+          socket.close();
+        }
       }
       if (signal?.aborted) return;
       if (!reconnect) {
@@ -501,13 +560,14 @@ export class SupervisorClient {
     return url.toString();
   }
 
-  private async websocketTicket(): Promise<string | undefined> {
+  private async websocketTicket(signal?: AbortSignal): Promise<string | undefined> {
     // Unit-test WebSocket doubles cannot make the ticket HTTP request. Real
     // browser sockets always use a short-lived ticket; service tokens never
     // enter the URL.
     if (this.webSocketFactory !== globalThis.WebSocket && !this.serviceToken) return undefined;
     const response = await this.request('/v1/ws-tickets', WebSocketTicketSchema, {
       method: 'POST',
+      signal,
     });
     return response.ticket;
   }
@@ -553,27 +613,31 @@ export class SupervisorClient {
 
 class AsyncEventQueue<T> {
   private readonly values: T[] = [];
-  private readonly waiters: Array<(result: IteratorResult<T>) => void> = [];
+  private readonly waiters: Array<{
+    resolve(result: IteratorResult<T>): void;
+    reject(error: Error): void;
+  }> = [];
   private ended = false;
   private failure: Error | undefined;
 
   push(value: T): void {
     if (this.ended) return;
     const waiter = this.waiters.shift();
-    if (waiter) waiter({ done: false, value });
+    if (waiter) waiter.resolve({ done: false, value });
     else this.values.push(value);
   }
 
   fail(error: Error): void {
     if (this.ended) return;
     this.failure = error;
-    this.end();
+    this.ended = true;
+    while (this.waiters.length > 0) this.waiters.shift()?.reject(error);
   }
 
   end(): void {
     if (this.ended) return;
     this.ended = true;
-    while (this.waiters.length > 0) this.waiters.shift()?.({ done: true, value: undefined });
+    while (this.waiters.length > 0) this.waiters.shift()?.resolve({ done: true, value: undefined });
   }
 
   next(): Promise<IteratorResult<T>> {
@@ -581,7 +645,7 @@ class AsyncEventQueue<T> {
     if (value !== undefined) return Promise.resolve({ done: false, value });
     if (this.failure) return Promise.reject(this.failure);
     if (this.ended) return Promise.resolve({ done: true, value: undefined });
-    return new Promise((resolve) => this.waiters.push(resolve));
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
 }
 
@@ -593,16 +657,18 @@ function reconnectDelay(attempt: number): number {
 function delayWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', finish, { once: true });
   });
+}
+
+function abortError(): Error {
+  return new DOMException('The operation was aborted', 'AbortError');
 }
 
 async function responseError(response: Response): Promise<ApiError> {

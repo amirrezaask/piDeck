@@ -10,6 +10,7 @@ import type {
   ManagedPiSession,
   PiImageContent,
   PiSessionFactory,
+  ResumePiSessionOptions,
 } from '../pi-session';
 
 export class Deferred<T> {
@@ -31,8 +32,8 @@ export class Deferred<T> {
 }
 
 export class FakePiSession implements ManagedPiSession {
-  readonly sessionId = 'fake-pi-session';
-  readonly sessionFile = '/tmp/fake-pi-session.jsonl';
+  readonly sessionId: string;
+  readonly sessionFile: string;
   readonly model: AgentModel = { provider: 'fake', id: 'fake-model' };
   readonly thinkingLevel: AgentThinkingLevel = 'off';
   readonly prompts: string[] = [];
@@ -52,13 +53,17 @@ export class FakePiSession implements ManagedPiSession {
   private rejectCurrent: ((reason?: unknown) => void) | undefined;
 
   constructor(
+    identity: number | string,
     private readonly preflightAccepted = true,
     private readonly controls: {
       preflightDeferred?: Deferred<boolean>;
       abortMode?: 'resolve' | 'reject' | 'hang';
       abortError?: Error;
     } = {},
-  ) {}
+  ) {
+    this.sessionId = `fake-pi-session-${identity}`;
+    this.sessionFile = `/tmp/fake-pi-session-${identity}.jsonl`;
+  }
 
   async prompt(
     prompt: string,
@@ -175,6 +180,7 @@ export class FakePiSession implements ManagedPiSession {
 export class FakePiSessionFactory implements PiSessionFactory {
   readonly sessions: FakePiSession[] = [];
   readonly requests: CreatePiSessionOptions[] = [];
+  readonly resumeRequests: ResumePiSessionOptions[] = [];
 
   async listModels(): Promise<ManagedAgentModelsResponse> {
     const model: AgentModelOption = { provider: 'fake', id: 'fake-model', name: 'Fake model' };
@@ -197,13 +203,25 @@ export class FakePiSessionFactory implements PiSessionFactory {
     this.requests.push(options);
     if (this.options.createDeferred) await this.options.createDeferred.promise;
     if (this.options.createError) throw this.options.createError;
-    const session = new FakePiSession(this.options.preflightAccepted ?? true, {
-      ...(this.options.preflightDeferred
-        ? { preflightDeferred: this.options.preflightDeferred }
-        : {}),
-      ...(this.options.abortMode ? { abortMode: this.options.abortMode } : {}),
-      ...(this.options.abortError ? { abortError: this.options.abortError } : {}),
-    });
+    const session = new FakePiSession(
+      this.sessions.length + 1,
+      this.options.preflightAccepted ?? true,
+      {
+        ...(this.options.preflightDeferred
+          ? { preflightDeferred: this.options.preflightDeferred }
+          : {}),
+        ...(this.options.abortMode ? { abortMode: this.options.abortMode } : {}),
+        ...(this.options.abortError ? { abortError: this.options.abortError } : {}),
+      },
+    );
+    this.sessions.push(session);
+    return session;
+  }
+
+  async resume(options: ResumePiSessionOptions): Promise<ManagedPiSession> {
+    this.resumeRequests.push(options);
+    const identity = options.sessionId.replace('fake-pi-session-', '');
+    const session = new FakePiSession(identity, this.options.preflightAccepted ?? true);
     this.sessions.push(session);
     return session;
   }

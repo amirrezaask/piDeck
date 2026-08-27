@@ -58,6 +58,12 @@ function emptyStream(): AsyncGenerator<ManagedAgentEvent> {
   return (async function* () {})();
 }
 
+function eventPages(events: ManagedAgentEvent[]) {
+  return vi.fn().mockImplementation(async function* () {
+    yield { events };
+  });
+}
+
 afterEach(() => {
   document.documentElement.classList.remove('dark');
   document.documentElement.style.colorScheme = '';
@@ -65,6 +71,7 @@ afterEach(() => {
   window.localStorage.removeItem('pideck-layout');
   window.localStorage.removeItem('pideck-sidebar-collapsed');
   window.localStorage.removeItem('pideck-archived-runs');
+  window.sessionStorage.clear();
   window.history.replaceState({}, '', '/');
 });
 
@@ -132,9 +139,13 @@ function createClient(overrides: Partial<SupervisorClientApi> = {}): SupervisorC
       updateCheckError: null,
     } satisfies ManagedAgentExtensionsResponse),
     listRuns: vi.fn().mockResolvedValue({ runs: [], nextCursor: null }),
+    listAllRuns: vi.fn().mockResolvedValue([]),
     listProjects: vi.fn().mockResolvedValue({ projects: [project], nextCursor: null }),
     listRunAttachments: vi.fn().mockResolvedValue({ attachments: [] }),
     listRunEvents: vi.fn().mockResolvedValue({ events: [] }),
+    listRunEventPages: vi.fn().mockImplementation(async function* () {
+      yield { events: [] };
+    }),
     streamRunEvents: vi.fn().mockImplementation(emptyStream),
     getRun: vi.fn().mockResolvedValue(run),
     createAgent: vi.fn().mockResolvedValue(agent),
@@ -185,6 +196,61 @@ function createClient(overrides: Partial<SupervisorClientApi> = {}): SupervisorC
 }
 
 describe('App', () => {
+  it('keeps active runs visible when auxiliary model data is degraded', async () => {
+    const activeRun = { ...run, status: 'running' as const, completedAt: null };
+    const client = createClient({
+      listModels: vi.fn().mockRejectedValue(new Error('models offline')),
+      listRuns: vi.fn().mockResolvedValue({ runs: [], nextCursor: null }),
+      listAllRuns: vi
+        .fn()
+        .mockImplementation(({ status }) =>
+          Promise.resolve(status === 'running' ? [activeRun] : []),
+        ),
+    });
+
+    render(<App client={client} />);
+
+    expect((await screen.findAllByText('Review the changes.'))[0]).toBeVisible();
+    expect(screen.getByText('Server data is degraded')).toBeVisible();
+    expect(screen.getByText(/models data is stale or unavailable/i)).toBeVisible();
+  });
+
+  it('loads additional history without duplicating active runs', async () => {
+    const olderRun = {
+      ...run,
+      id: '018bcfe4-7a4b-7000-8000-000000000223',
+      prompt: 'Older history.',
+      createdAt: '2026-08-22T20:00:00.000Z',
+    };
+    const listRuns = vi
+      .fn()
+      .mockResolvedValueOnce({ runs: [run], nextCursor: 'next-page' })
+      .mockResolvedValueOnce({ runs: [olderRun, run], nextCursor: null });
+    const client = createClient({ listRuns });
+    render(<App client={client} />);
+
+    const loadMore = await screen.findByRole('button', { name: 'Load more history' });
+    await userEvent.click(loadMore);
+    expect(await screen.findByText('Older history.')).toBeVisible();
+    expect(
+      within(screen.getByRole('navigation', { name: 'Sessions' })).getAllByText(
+        'Review the changes.',
+      ),
+    ).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Load more history' })).not.toBeInTheDocument();
+  });
+
+  it('restores a routed run that was not present in the initial history page', async () => {
+    window.history.replaceState({}, '', `/servers/local/sessions/${run.id}`);
+    const client = createClient({
+      listRuns: vi.fn().mockResolvedValue({ runs: [], nextCursor: 'more' }),
+      getRun: vi.fn().mockResolvedValue(run),
+    });
+    render(<App client={client} />);
+    expect((await screen.findAllByText('Review the changes.'))[0]).toBeVisible();
+    expect(client.getRun).toHaveBeenCalledWith(run.id);
+  });
+
   it('creates the first persisted agent from the empty state', async () => {
     const user = userEvent.setup();
     const client = createClient();
@@ -533,7 +599,7 @@ describe('App', () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
-      listRunEvents: vi.fn().mockResolvedValue({ events }),
+      listRunEventPages: eventPages(events),
     });
     render(<App client={client} />);
 
@@ -583,7 +649,7 @@ describe('App', () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
-      listRunEvents: vi.fn().mockResolvedValue({ events }),
+      listRunEventPages: eventPages(events),
     });
     render(<App client={client} />);
 
@@ -609,7 +675,7 @@ describe('App', () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
-      listRunEvents: vi.fn().mockResolvedValue({ events }),
+      listRunEventPages: eventPages(events),
     });
     render(<App client={client} />);
 
@@ -647,7 +713,9 @@ describe('App', () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
-      listRunEvents: vi.fn().mockReturnValue(replay),
+      listRunEventPages: vi.fn().mockImplementation(async function* () {
+        yield await replay;
+      }),
       streamRunEvents,
     });
     render(<App client={client} />);
@@ -672,7 +740,13 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: 'Send message' }));
 
     await waitFor(() =>
-      expect(client.followUpRun).toHaveBeenCalledWith(run.id, { message: 'Keep going.' }),
+      expect(client.followUpRun).toHaveBeenCalledWith(
+        run.id,
+        expect.objectContaining({
+          message: 'Keep going.',
+          idempotencyKey: expect.any(String),
+        }),
+      ),
     );
   });
 
@@ -743,6 +817,7 @@ describe('App', () => {
         model: { provider: 'fake', id: 'fake-model' },
         thinkingLevel: 'medium',
         cwd: '/workspace',
+        idempotencyKey: expect.any(String),
         attachments: [
           {
             name: 'screen.png',
@@ -868,10 +943,11 @@ describe('App', () => {
         model: { provider: 'fake', id: 'fake-model' },
         thinkingLevel: 'medium',
         cwd: '/workspace',
+        idempotencyKey: expect.any(String),
       }),
     );
     await user.click(await screen.findByRole('button', { name: 'Cancel run' }));
-    await waitFor(() => expect(client.cancelRun).toHaveBeenCalledWith(run.id));
+    await waitFor(() => expect(client.cancelRun).toHaveBeenCalledWith(run.id, expect.any(String)));
     expect(await screen.findByText('Cancelled')).toBeVisible();
   });
 
@@ -1005,6 +1081,6 @@ describe('App', () => {
     render(<App client={client} />);
 
     expect(await screen.findByText('Supervisor request failed')).toBeVisible();
-    expect(screen.getByText('Supervisor is offline')).toBeVisible();
+    expect(screen.getByText(/Supervisor is offline/)).toBeVisible();
   });
 });

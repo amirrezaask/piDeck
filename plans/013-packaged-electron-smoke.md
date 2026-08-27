@@ -6,6 +6,8 @@
 
 ## Status
 
+- **State**: Implemented and verified against the packaged macOS artifact
+
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: MED
@@ -52,11 +54,11 @@ Cover first launch, second launch same data, single-instance behavior, malformed
 
 ## Done criteria
 
-- [ ] Test launches the packaged binary with production fuses intact.
-- [ ] Embedded supervisor and renderer readiness are verified.
-- [ ] Restart on existing temp data succeeds.
-- [ ] Shutdown leaves no child process and DB integrity is `ok`.
-- [ ] Works on each CI target OS or is explicitly platform-scoped with equivalent jobs.
+- [x] Test launches the packaged binary with production fuses intact.
+- [x] Embedded supervisor and renderer readiness are verified.
+- [x] Restart on existing temp data succeeds.
+- [x] Shutdown leaves no child process and DB integrity is `ok`.
+- [x] Works on each CI target OS or is explicitly platform-scoped with equivalent jobs.
 
 ## STOP conditions
 

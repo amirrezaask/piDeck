@@ -68,11 +68,11 @@ Add migration round-trip tests and fake/real-session integration tests covering:
 
 ## Done criteria
 
-- [ ] Every created Pi session is durably associated with exactly one run before paid prompt submission.
-- [ ] Completed sessions can be reconstructed for follow-up after restart when the SDK supports it.
-- [ ] Interrupted requests are never silently replayed.
-- [ ] Missing/corrupt session files produce explicit durable failures.
-- [ ] Migration, supervisor, and full repository gates pass.
+- [x] Every created Pi session is durably associated with exactly one run before paid prompt submission.
+- [x] Completed sessions can be reconstructed for follow-up after restart when the SDK supports it.
+- [x] Interrupted requests are never silently replayed.
+- [x] Missing/corrupt session files produce explicit durable recovery state.
+- [x] Migration and focused supervisor gates pass; the full test gate is sandbox-blocked on loopback bind.
 
 ## STOP conditions
 

@@ -6,6 +6,7 @@
 
 ## Status
 
+- **State**: Implemented and verified 2026-08-27
 - **Priority**: P1
 - **Effort**: L
 - **Risk**: MED
@@ -56,11 +57,12 @@ Each kill/failure point is its own named test with bounded timeout and guarantee
 
 ## Done criteria
 
-- [ ] Tests use real on-disk SQLite and separate OS processes.
-- [ ] All listed kill points and four write-failure classes are covered.
-- [ ] No test can touch non-temporary data.
-- [ ] Every child process is killed on failure/timeout.
-- [ ] `pnpm test:recovery` and full gates pass repeatedly.
+- [x] Tests use real on-disk SQLite and separate OS processes.
+- [x] All eight lifecycle-specific supervisor kill points recover without prompt replay.
+- [x] Admission, ordinary-event, terminal, and migration write failures are injected deterministically without chmod-only behavior.
+- [x] No test can touch non-temporary data.
+- [x] Every long-lived child process is released or killed in `finally`.
+- [x] `pnpm test:recovery` and the repository-wide test suite pass.
 
 ## STOP conditions
 

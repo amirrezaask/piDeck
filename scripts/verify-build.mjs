@@ -1,5 +1,8 @@
-import { readdir, stat } from 'node:fs/promises';
-import { basename, resolve } from 'node:path';
+import { stat } from 'node:fs/promises';
+import { basename, dirname, resolve } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { findElectronArtifacts } from './lib/electron-artifacts.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const serverBinary = resolve(
@@ -8,16 +11,7 @@ const serverBinary = resolve(
 );
 const electronOutput = resolve(root, 'dist/electron');
 
-async function collectFiles(directory) {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const files = [];
-  for (const entry of entries) {
-    const path = resolve(directory, entry.name);
-    if (entry.isDirectory()) files.push(...(await collectFiles(path)));
-    else files.push(path);
-  }
-  return files;
-}
+const execFileAsync = promisify(execFile);
 
 async function assertStaticServerBinary() {
   const metadata = await stat(serverBinary).catch(() => undefined);
@@ -29,29 +23,23 @@ async function assertStaticServerBinary() {
   }
 }
 
-async function findElectronArtifacts() {
-  const files = await collectFiles(electronOutput).catch(() => []);
-  const artifacts = files.filter((path) => /\.(zip|dmg|pkg|deb|rpm|AppImage|exe)$/i.test(path));
-  if (artifacts.length === 0) {
-    throw new Error(`Electron artifact was not created under ${electronOutput}`);
+async function verifyAsarAndFuses(binary) {
+  const asar = resolve(dirname(binary), process.platform === 'darwin' ? '../Resources/app.asar' : 'resources/app.asar');
+  const metadata = await stat(asar).catch(() => undefined);
+  if (!metadata?.isFile() || metadata.size === 0) throw new Error(`Packaged ASAR is missing: ${asar}`);
+  const fuseCli = resolve(root, 'node_modules/.bin/electron-fuses');
+  const fuseTarget = process.platform === 'darwin' ? binary.slice(0, binary.indexOf('.app/') + 4) : binary;
+  const { stdout } = await execFileAsync(fuseCli, ['read', '--app', fuseTarget]);
+  for (const expected of ['RunAsNode is Disabled', 'EnableNodeOptionsEnvironmentVariable is Disabled', 'EnableNodeCliInspectArguments is Disabled', 'OnlyLoadAppFromAsar is Enabled']) {
+    if (!stdout.includes(expected)) throw new Error(`Required Electron fuse is not set: ${expected}`);
   }
-  const binaries = files.filter((path) => ['piDeck', 'piDeck.exe'].includes(basename(path)));
-  if (binaries.length === 0) {
-    throw new Error(`Electron executable was not created under ${electronOutput}`);
-  }
-  for (const binary of binaries) {
-    const metadata = await stat(binary);
-    if (metadata.size === 0 || (process.platform !== 'win32' && (metadata.mode & 0o111) === 0)) {
-      throw new Error(`Electron executable is not runnable: ${binary}`);
-    }
-  }
-  return { artifacts, binaries };
 }
 
 await assertStaticServerBinary();
-const electronOutputFiles = await findElectronArtifacts();
+const electronOutputFiles = await findElectronArtifacts(electronOutput);
 console.log(`Verified static server binary: ${serverBinary}`);
 for (const binary of electronOutputFiles.binaries) {
+  await verifyAsarAndFuses(binary);
   console.log(`Verified static Electron binary: ${binary}`);
 }
 for (const artifact of electronOutputFiles.artifacts) {

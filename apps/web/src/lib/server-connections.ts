@@ -64,9 +64,18 @@ interface StoredServer {
   readonly token: string;
 }
 
-export function normalizeServerAddress(address: string): string {
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+export function normalizeServerAddress(address: string, sendsToken = false): string {
   const trimmed = address.trim();
-  if (trimmed === '/' || trimmed === '/supervisor') return trimmed;
+  if (trimmed === '/' || trimmed === '/supervisor') {
+    if (sendsToken) {
+      const pageOrigin = globalThis.location?.origin;
+      if (!pageOrigin) throw new Error('Cannot validate token transport without a page origin');
+      normalizeServerAddress(pageOrigin, true);
+    }
+    return trimmed;
+  }
   const value = trimmed.replace(/\/+$/, '');
   const url = new URL(value);
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
@@ -74,6 +83,9 @@ export function normalizeServerAddress(address: string): string {
   }
   if (url.username || url.password || url.search || url.hash || url.pathname !== '/') {
     throw new Error('Enter the server origin only, without credentials, query, or path');
+  }
+  if (sendsToken && url.protocol !== 'https:' && !LOOPBACK_HOSTS.has(url.hostname)) {
+    throw new Error('Servers outside this computer must use HTTPS when an access token is saved');
   }
   return url.origin;
 }
@@ -87,11 +99,12 @@ class BrowserServerConnectionManager implements ServerConnectionManager {
     const servers = this.read();
     const id = input.id ?? crypto.randomUUID();
     const existing = servers.find((server) => server.id === id);
+    const token = input.token === undefined ? (existing?.token ?? '') : input.token.trim();
     const server: StoredServer = {
       id,
       name: input.name.trim(),
-      address: normalizeServerAddress(input.address),
-      token: input.token === undefined ? (existing?.token ?? '') : input.token.trim(),
+      address: normalizeServerAddress(input.address, Boolean(token)),
+      token,
     };
     if (!server.name) throw new Error('Server name is required');
     const next = [server, ...servers.filter((candidate) => candidate.id !== id)];
@@ -106,8 +119,9 @@ class BrowserServerConnectionManager implements ServerConnectionManager {
 
   client(server: ServerDefinition): SupervisorClient {
     const stored = this.read().find((candidate) => candidate.id === server.id);
+    const baseUrl = normalizeServerAddress(server.address, Boolean(stored?.token));
     return new SupervisorClient({
-      baseUrl: server.address,
+      baseUrl,
       ...(stored?.token ? { serviceToken: stored.token } : {}),
     });
   }

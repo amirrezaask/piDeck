@@ -6,6 +6,8 @@
 
 ## Status
 
+- **Status**: DONE
+
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: LOW
@@ -48,11 +50,11 @@ Cover 250 runs, an old active run beyond page one, duplicate IDs across active/h
 
 ## Done criteria
 
-- [ ] Every active run is visible regardless of historical page position.
-- [ ] Any run URL can restore via direct fetch.
-- [ ] History pagination is bounded and cursor-safe.
-- [ ] No duplicate runs appear.
-- [ ] Focused/full gates pass.
+- [x] Every active run is visible regardless of historical page position.
+- [x] Any run URL can restore via direct fetch.
+- [x] History pagination is bounded and cursor-safe.
+- [x] No duplicate runs appear.
+- [x] Focused gates pass; the full suite reaches one sandbox-blocked loopback-listen test.
 
 ## STOP conditions
 

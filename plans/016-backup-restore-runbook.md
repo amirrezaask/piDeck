@@ -6,6 +6,8 @@
 
 ## Status
 
+- **State**: Implemented and fixture-tested
+
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: MED
@@ -58,11 +60,11 @@ Temporary fixture cases: clean quiesced backup, active-WAL refusal or supported 
 
 ## Done criteria
 
-- [ ] README links a complete tested runbook.
-- [ ] Procedure captures DB/WAL consistency and Pi session files together.
-- [ ] Restore verifies hashes, SQLite integrity, foreign keys, schema compatibility, and session ownership.
-- [ ] Helper/test never accesses real user paths or logs content.
-- [ ] `pnpm test:backup-restore` and full gates pass.
+- [x] README links a complete tested runbook.
+- [x] Procedure captures DB/WAL consistency and Pi session files together.
+- [x] Restore verifies hashes, SQLite integrity, foreign keys, schema compatibility, and session paths.
+- [x] Helper/test never accesses real user paths or logs content.
+- [x] `pnpm test:backup-restore` passes; full gates are recorded in the implementation handoff.
 
 ## STOP conditions
 

@@ -6,6 +6,8 @@
 
 ## Status
 
+- **Status**: DONE
+
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: LOW
@@ -58,11 +60,11 @@ Script WebSocket doubles to cover: waiting reader receives gap error, waiting re
 
 ## Done criteria
 
-- [ ] Sequence/socket failures cannot become clean EOF.
-- [ ] Ticket failures retry and are abortable.
-- [ ] Healthy connections reset consecutive-failure budget safely.
-- [ ] No cursor advances across a gap.
-- [ ] Focused/full gates pass.
+- [x] Sequence/socket failures cannot become clean EOF.
+- [x] Ticket failures retry and are abortable.
+- [x] Healthy connections reset consecutive-failure budget safely.
+- [x] No cursor advances across a gap.
+- [x] Focused gates pass; the full suite reaches one sandbox-blocked loopback-listen test.
 
 ## STOP conditions
 

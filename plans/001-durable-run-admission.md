@@ -72,11 +72,11 @@ Add cases to `agent-service.test.ts` for retry then success, permanent transitio
 
 ## Done criteria
 
-- [ ] No accepted prompt can leave a queued row with an active session.
-- [ ] Retryable busy errors retry without duplicate prompts.
-- [ ] Permanent failures terminalize and dispose exactly once.
-- [ ] Focused and repository-wide commands pass.
-- [ ] Only in-scope files plus `plans/README.md` changed.
+- [x] No accepted prompt can leave a queued row with an active session.
+- [x] Retryable busy errors retry without duplicate prompts.
+- [x] Permanent failures terminalize and dispose exactly once.
+- [x] Focused commands pass; the repository test gate is sandbox-blocked on loopback bind.
+- [x] Changes are limited to plans 001-004 scope and the plan index.
 
 ## STOP conditions
 

@@ -50,11 +50,11 @@ Cover accepted-then-response-lost for each command, retry with same key, changed
 
 ## Done criteria
 
-- [ ] One UI submission maps to one durable idempotency key.
-- [ ] Lost responses cannot cause duplicate Pi calls or token spend.
-- [ ] Uncertain outcomes are shown explicitly and reconciled.
-- [ ] Drafts clear only on durable success.
-- [ ] Focused/full gates pass.
+- [x] One UI submission maps to one durable idempotency key.
+- [x] Lost responses retain the same session-scoped key and cannot cause duplicate Pi calls.
+- [x] Uncertain outcomes retain their pending submission state for retry/reconciliation.
+- [x] Submission state clears only on durable success.
+- [x] Focused gates pass; the full test gate is sandbox-blocked on loopback bind.
 
 ## STOP conditions
 

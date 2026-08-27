@@ -72,6 +72,11 @@ describe('Supervisor agent event WebSocket', () => {
     await expect(
       openSocket(`${baseUrl.replace('http:', 'ws:')}/v1/runs/${run.id}/stream`),
     ).rejects.toThrow();
+    await expect(
+      openSocket(`${baseUrl.replace('http:', 'ws:')}/v1/runs/${run.id}/stream`, {
+        Authorization: 'Bearer wrong-secret',
+      }),
+    ).rejects.toThrow();
 
     const ticketResponse = await fetch(`${baseUrl}/v1/ws-tickets`, {
       method: 'POST',

@@ -393,7 +393,6 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     if (!requestPath.startsWith('/v1/')) return;
     if (requestPath === '/v1/health') return;
     const authorization = request.headers.authorization;
-    if (options.allowUnauthenticatedLoopback === true && isLoopbackAddress(request.ip)) return;
     if (options.serviceToken) {
       if (authorization !== `Bearer ${options.serviceToken}`) {
         return sendError(reply, 401, 'not_authenticated', 'Service authentication is required');

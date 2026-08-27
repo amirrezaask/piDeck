@@ -9,6 +9,16 @@ module.exports = {
     // Keep pnpm's workspace tree out of the archive entirely.
     prune: false,
     ignore: /(?:^|[\\/])(?:node_modules|out|\.turbo)(?:[\\/]|$)/,
+    ...(process.platform === 'darwin' && process.env.APPLE_ID
+      ? {
+          osxSign: {},
+          osxNotarize: {
+            appleId: process.env.APPLE_ID,
+            appleIdPassword: process.env.APPLE_APP_SPECIFIC_PASSWORD,
+            teamId: process.env.APPLE_TEAM_ID,
+          },
+        }
+      : {}),
   },
   makers: [{ name: '@electron-forge/maker-zip', platforms: ['darwin', 'win32', 'linux'] }],
   plugins: [

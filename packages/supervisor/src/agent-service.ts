@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import {
   type AgentImageAttachment,
@@ -67,6 +67,29 @@ export interface EventPayloadLimits {
   readonly maxItems: number;
 }
 
+export interface EventQueueLimits {
+  readonly maxCount: number;
+  readonly maxBytes: number;
+}
+
+export type SupervisorWriteClass = 'admission' | 'event' | 'terminal';
+
+export type SupervisorLifecyclePhase =
+  | 'before_run_insert'
+  | 'after_queued_commit'
+  | 'after_session_identity_commit'
+  | 'after_prompt_preflight'
+  | 'after_running_commit'
+  | 'during_event_write'
+  | 'after_provider_completion'
+  | 'during_graceful_shutdown';
+
+interface EventQueueState {
+  tail: Promise<unknown>;
+  count: number;
+  bytes: number;
+}
+
 interface ActiveRun {
   readonly runId: string;
   readonly agentId: string;
@@ -74,6 +97,8 @@ interface ActiveRun {
   readonly operations: Set<Promise<void>>;
   generation: number;
   settled: boolean;
+  acceptingEvents: boolean;
+  persistenceFailure?: Promise<void>;
   unsubscribed: boolean;
   disposePromise?: Promise<void>;
   unsubscribe: () => void;
@@ -158,6 +183,16 @@ export class ManagedAgentRunNotCancellableError extends Error {
   }
 }
 
+class EventBackpressureError extends Error {
+  constructor(
+    readonly queuedCount: number,
+    readonly queuedBytes: number,
+  ) {
+    super('event_backpressure_exceeded');
+    this.name = 'EventBackpressureError';
+  }
+}
+
 export interface ManagedAgentServiceOptions {
   readonly db: Kysely<SupervisorDatabase>;
   readonly sessionFactory: PiSessionFactory;
@@ -170,8 +205,16 @@ export interface ManagedAgentServiceOptions {
   readonly shutdownTimeoutMs?: number;
   readonly operationTimeoutMs?: number;
   readonly eventPayloadLimits?: Partial<EventPayloadLimits>;
+  readonly eventQueueLimits?: Partial<EventQueueLimits>;
   /** Optional explicit retention policy; undefined retains full history. */
   readonly eventRetentionDays?: number;
+  /** Test/integration fault boundary. Throw to simulate a failed durable write. */
+  readonly writeFaultInjector?: (writeClass: SupervisorWriteClass) => void | Promise<void>;
+  /** Test fixture observer for deterministic process-kill boundaries. */
+  readonly lifecycleObserver?: (
+    phase: SupervisorLifecyclePhase,
+    runId?: string,
+  ) => void | Promise<void>;
 }
 
 /**
@@ -194,12 +237,20 @@ export class ManagedAgentService {
   private readonly shutdownTimeoutMs: number;
   private readonly operationTimeoutMs: number;
   private readonly eventPayloadLimits: EventPayloadLimits;
+  private readonly eventQueueLimits: EventQueueLimits;
   private readonly eventRetentionDays: number | undefined;
+  private readonly writeFaultInjector:
+    | ((writeClass: SupervisorWriteClass) => void | Promise<void>)
+    | undefined;
+  private readonly lifecycleObserver:
+    | ((phase: SupervisorLifecyclePhase, runId?: string) => void | Promise<void>)
+    | undefined;
   private readonly activeRuns = new Map<string, ActiveRun>();
-  private readonly eventTails = new Map<string, Promise<unknown>>();
+  private readonly eventQueues = new Map<string, EventQueueState>();
   private readonly commandTails = new Map<string, Promise<void>>();
   private readonly startTasks = new Map<string, { agentId: string; task: Promise<void> }>();
   private readonly stoppingAgents = new Set<string>();
+  private readonly instanceId: string;
   private closePromise?: Promise<void>;
   private legacyAgentStatusColumn?: Promise<boolean>;
   private started = false;
@@ -212,6 +263,7 @@ export class ManagedAgentService {
     this.logger = options.logger ?? defaultLogger;
     this.now = options.now ?? nowIso;
     this.idFactory = options.idFactory ?? createId;
+    this.instanceId = randomUUID();
     this.projectService =
       options.projectService ?? new ProjectService({ db: options.db, now: this.now });
     this.shutdownTimeoutMs = Math.max(1, options.shutdownTimeoutMs ?? 5_000);
@@ -221,10 +273,16 @@ export class ManagedAgentService {
       maxDepth: Math.max(1, options.eventPayloadLimits?.maxDepth ?? 16),
       maxItems: Math.max(1, options.eventPayloadLimits?.maxItems ?? 10_000),
     };
+    this.eventQueueLimits = {
+      maxCount: Math.max(1, options.eventQueueLimits?.maxCount ?? 1_000),
+      maxBytes: Math.max(1, options.eventQueueLimits?.maxBytes ?? 8_000_000),
+    };
     this.eventRetentionDays =
       options.eventRetentionDays === undefined
         ? undefined
         : Math.max(1, Math.floor(options.eventRetentionDays));
+    this.writeFaultInjector = options.writeFaultInjector;
+    this.lifecycleObserver = options.lifecycleObserver;
   }
 
   async start(): Promise<void> {
@@ -234,11 +292,12 @@ export class ManagedAgentService {
     await this.projectService.initialize();
     await this.compactEventsIfConfigured();
 
-    // Sessions are process-local and are intentionally not reconstructed. A
-    // recovery event is written for every row whose reservation was lost.
+    // Pi cannot reattach an in-flight provider request after process death. We
+    // never replay it. Its saved session remains usable for an explicit later
+    // continuation, while completed sessions are reconstructed below.
     const interrupted = await this.db
       .selectFrom('supervisor_agent_runs')
-      .select(['id', 'agent_id'])
+      .selectAll()
       .where('status', 'in', ['queued', 'running'])
       .execute();
     for (const run of interrupted) {
@@ -247,11 +306,65 @@ export class ManagedAgentService {
         run.id,
         'failed',
         {
-          code: 'supervisor_restarted',
-          message: 'The run was interrupted when the Supervisor restarted',
+          code: run.pi_session_id ? 'run_interrupted' : 'supervisor_restarted',
+          message: 'The run was interrupted when the Supervisor restarted and was not replayed',
         },
         'supervisor.run_failed',
       );
+    }
+
+    if (this.sessionFactory.resume) {
+      const recoverable = await this.db
+        .selectFrom('supervisor_agent_runs')
+        .innerJoin('supervisor_agents', 'supervisor_agents.id', 'supervisor_agent_runs.agent_id')
+        .select([
+          'supervisor_agent_runs.id as run_id',
+          'supervisor_agent_runs.agent_id',
+          'supervisor_agent_runs.cwd',
+          'supervisor_agent_runs.pi_session_id',
+          'supervisor_agent_runs.pi_session_file',
+          'supervisor_agents.system_prompt',
+          'supervisor_agents.tools_json',
+        ])
+        .where('supervisor_agent_runs.status', '=', 'completed')
+        .where('supervisor_agent_runs.pi_session_id', 'is not', null)
+        .where('supervisor_agent_runs.pi_session_file', 'is not', null)
+        .execute();
+      for (const row of recoverable) {
+        try {
+          const sessionId = row.pi_session_id;
+          const sessionFile = row.pi_session_file;
+          if (!sessionId || !sessionFile) continue;
+          const session = await this.sessionFactory.resume({
+            sessionId,
+            sessionFile,
+            cwd: row.cwd,
+            systemPrompt: row.system_prompt,
+            ...(row.tools_json ? { tools: decodeJson(row.tools_json) as AgentToolName[] } : {}),
+          });
+          this.attachRecoveredSession(row.run_id, row.agent_id, session);
+          await this.db
+            .updateTable('supervisor_agent_runs')
+            .set({
+              pi_owner_instance: this.instanceId,
+              pi_recovery_state: 'recovered',
+              pi_recovered_at: this.now(),
+            })
+            .where('id', '=', row.run_id)
+            .execute();
+        } catch (error) {
+          await this.db
+            .updateTable('supervisor_agent_runs')
+            .set({ pi_recovery_state: 'unavailable', pi_recovered_at: this.now() })
+            .where('id', '=', row.run_id)
+            .execute();
+          this.logger.warn('Pi session recovery failed', {
+            agentId: row.agent_id,
+            runId: row.run_id,
+            error: sanitizeError(error),
+          });
+        }
+      }
     }
   }
 
@@ -273,6 +386,7 @@ export class ManagedAgentService {
   private async closeInternal(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    await this.observeLifecycle('during_graceful_shutdown');
     const activeRuns = [...this.activeRuns.values()];
     await Promise.allSettled(
       activeRuns.map(async (active) => {
@@ -296,7 +410,7 @@ export class ManagedAgentService {
     await Promise.allSettled(
       [...this.activeRuns.values()].map((active) => this.disposeActiveRun(active)),
     );
-    for (const agentId of new Set([...this.eventTails.keys()])) {
+    for (const agentId of new Set([...this.eventQueues.keys()])) {
       await this.withTimeout(
         this.waitForEvents(agentId),
         this.shutdownTimeoutMs,
@@ -308,7 +422,7 @@ export class ManagedAgentService {
         });
       });
     }
-    this.eventTails.clear();
+    this.eventQueues.clear();
     this.commandTails.clear();
     this.activeRuns.clear();
     this.startTasks.clear();
@@ -415,6 +529,8 @@ export class ManagedAgentService {
       const runId = this.idFactory();
       const createdAt = this.now();
       try {
+        await this.observeLifecycle('before_run_insert', runId);
+        await this.injectWriteFault('admission');
         await this.db.transaction().execute(async (transaction) => {
           await transaction
             .insertInto('supervisor_agent_runs')
@@ -453,6 +569,7 @@ export class ManagedAgentService {
               .execute();
           }
         });
+        await this.observeLifecycle('after_queued_commit', runId);
       } catch (error) {
         if (isUniqueConstraintError(error)) throw new ManagedAgentBusyError(agent.id);
         throw error;
@@ -976,13 +1093,37 @@ export class ManagedAgentService {
       operations: new Set(),
       generation: 1,
       settled: false,
+      acceptingEvents: true,
       unsubscribed: false,
       unsubscribe: () => undefined,
     };
     active.unsubscribe = session.subscribe((event) => {
-      this.enqueueSessionEvent(agent.id, runId, event);
+      if (active.acceptingEvents) this.enqueueSessionEvent(agent.id, runId, event);
     });
     this.activeRuns.set(runId, active);
+
+    try {
+      const sessionFile = session.sessionFile;
+      if (!sessionFile) throw new Error('pi_session_file_unavailable');
+      const identity = await withBusyRetry(() =>
+        this.db
+          .updateTable('supervisor_agent_runs')
+          .set({
+            pi_session_id: session.sessionId,
+            pi_session_file: sessionFile,
+            pi_owner_instance: this.instanceId,
+            pi_recovery_state: 'owned',
+          })
+          .where('id', '=', runId)
+          .where('status', '=', 'queued')
+          .executeTakeFirst(),
+      );
+      if (Number(identity.numUpdatedRows) === 0) throw new Error('run_admission_race_lost');
+      await this.observeLifecycle('after_session_identity_commit', runId);
+    } catch (error) {
+      await this.compensateAdmissionFailure(active, error);
+      return;
+    }
 
     let resolvePreflight: (accepted: boolean) => void = () => undefined;
     const preflight = new Promise<boolean>((resolveResult) => {
@@ -1007,17 +1148,26 @@ export class ManagedAgentService {
         () => false,
       ),
     ]);
+    await this.observeLifecycle('after_prompt_preflight', runId);
 
     if (accepted && active.generation === generation) {
-      const result = await this.db
-        .updateTable('supervisor_agent_runs')
-        .set({ status: 'running', started_at: this.now() })
-        .where('id', '=', runId)
-        .where('status', '=', 'queued')
-        .executeTakeFirst();
-      if (Number(result.numUpdatedRows) > 0) {
+      try {
+        const result = await withBusyRetry(() =>
+          this.db
+            .updateTable('supervisor_agent_runs')
+            .set({ status: 'running', started_at: this.now() })
+            .where('id', '=', runId)
+            .where('status', '=', 'queued')
+            .executeTakeFirst(),
+        );
+        if (Number(result.numUpdatedRows) === 0) throw new Error('run_admission_race_lost');
+        await this.observeLifecycle('after_running_commit', runId);
         resolveRunAcceptance(true);
         await this.enqueueCustomEvent(agent.id, runId, 'supervisor.prompt_accepted', {});
+        return;
+      } catch (error) {
+        resolveRunAcceptance(false);
+        await this.compensateAdmissionFailure(active, error);
         return;
       }
     }
@@ -1083,8 +1233,9 @@ export class ManagedAgentService {
   }
 
   private enqueueSessionEvent(agentId: string, runId: string, rawEvent: unknown): void {
-    void this.enqueueEventWork(agentId, async () => {
-      const event = normalizeSessionEvent(rawEvent, this.eventPayloadLimits);
+    const event = normalizeSessionEvent(rawEvent, this.eventPayloadLimits);
+    const queuedBytes = event.encodedBytes;
+    void this.enqueueEventWork(agentId, queuedBytes, async () => {
       await this.persistEvent(
         agentId,
         runId,
@@ -1097,7 +1248,21 @@ export class ManagedAgentService {
             }
           : event.payload,
       );
-    });
+    })
+      .catch((error: unknown) => {
+        if (error instanceof EventBackpressureError) {
+          return this.handleEventBackpressure(runId, error);
+        }
+        throw error;
+      })
+      .catch((error: unknown) => this.handleEventPersistenceFailure(runId, error))
+      .catch((error: unknown) => {
+        this.logger.error('Could not persist terminal event failure state', {
+          agentId,
+          runId,
+          error: sanitizeError(error),
+        });
+      });
   }
 
   private async enqueueCustomEvent(
@@ -1106,13 +1271,27 @@ export class ManagedAgentService {
     type: string,
     payload: JsonObject,
   ): Promise<void> {
-    await this.enqueueEventWork(agentId, async () => {
-      await this.persistEvent(agentId, runId, type, payload);
-    });
+    await this.enqueueEventWork(
+      agentId,
+      Buffer.byteLength(JSON.stringify(payload), 'utf8'),
+      async () => {
+        await this.persistEvent(agentId, runId, type, payload);
+      },
+    );
   }
 
-  private enqueueEventWork<T>(agentId: string, work: () => Promise<T>): Promise<T> {
-    const previous = this.eventTails.get(agentId) ?? Promise.resolve();
+  private enqueueEventWork<T>(
+    agentId: string,
+    queuedBytes: number,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    const current = this.eventQueues.get(agentId);
+    const previous = current?.tail ?? Promise.resolve();
+    const nextCount = (current?.count ?? 0) + 1;
+    const nextBytes = (current?.bytes ?? 0) + queuedBytes;
+    if (nextCount > this.eventQueueLimits.maxCount || nextBytes > this.eventQueueLimits.maxBytes) {
+      return Promise.reject(new EventBackpressureError(nextCount, nextBytes));
+    }
     const next = previous
       .catch(() => undefined)
       .then(work)
@@ -1123,17 +1302,128 @@ export class ManagedAgentService {
         });
         throw error;
       });
-    this.eventTails.set(agentId, next);
+    const state: EventQueueState = { tail: next, count: nextCount, bytes: nextBytes };
+    this.eventQueues.set(agentId, state);
     void next
       .finally(() => {
-        if (this.eventTails.get(agentId) === next) this.eventTails.delete(agentId);
+        const queued = this.eventQueues.get(agentId);
+        if (!queued) return;
+        queued.count -= 1;
+        queued.bytes -= queuedBytes;
+        if (queued.count === 0) this.eventQueues.delete(agentId);
       })
       .catch(() => undefined);
     return next;
   }
 
   private async waitForEvents(agentId: string): Promise<void> {
-    await this.eventTails.get(agentId)?.catch(() => undefined);
+    await this.eventQueues.get(agentId)?.tail;
+  }
+
+  private handleEventBackpressure(runId: string, cause: EventBackpressureError): Promise<void> {
+    const active = this.activeRuns.get(runId);
+    if (!active) return Promise.resolve();
+    active.persistenceFailure ??= (async () => {
+      active.generation += 1;
+      active.acceptingEvents = false;
+      active.unsubscribe();
+      active.unsubscribed = true;
+      await this.tryAbort(active, 'event ingestion backpressure');
+      await this.waitForOperations(active, 'event ingestion backpressure');
+      await this.waitForEvents(active.agentId).catch(() => undefined);
+      try {
+        await this.finalizeRunWithoutSession(
+          active.agentId,
+          active.runId,
+          'failed',
+          {
+            code: 'event_backpressure_exceeded',
+            message: 'Durable event ingestion could not keep up with the provider stream',
+          },
+          'supervisor.event_backpressure_exceeded',
+        );
+      } finally {
+        await this.disposeActiveRun(active);
+      }
+      this.logger.error('Run stopped after event ingestion backpressure', {
+        agentId: active.agentId,
+        runId,
+        queuedCount: cause.queuedCount,
+        queuedBytes: cause.queuedBytes,
+      });
+    })();
+    return active.persistenceFailure;
+  }
+
+  private attachRecoveredSession(runId: string, agentId: string, session: ManagedPiSession): void {
+    const active: ActiveRun = {
+      runId,
+      agentId,
+      session,
+      operations: new Set(),
+      generation: 1,
+      settled: true,
+      acceptingEvents: true,
+      unsubscribed: false,
+      unsubscribe: () => undefined,
+    };
+    active.unsubscribe = session.subscribe((event) => {
+      if (active.acceptingEvents) this.enqueueSessionEvent(agentId, runId, event);
+    });
+    this.activeRuns.set(runId, active);
+  }
+
+  private async compensateAdmissionFailure(active: ActiveRun, cause: unknown): Promise<void> {
+    active.generation += 1;
+    active.acceptingEvents = false;
+    await this.tryAbort(active, 'admission persistence failure');
+    await this.waitForOperations(active, 'admission persistence failure');
+    await this.waitForEvents(active.agentId).catch(() => undefined);
+    await this.finalizeRunWithoutSession(
+      active.agentId,
+      active.runId,
+      'failed',
+      {
+        code: 'run_admission_persistence_failed',
+        message: 'The run could not be admitted durably',
+      },
+      'supervisor.run_failed',
+    );
+    await this.disposeActiveRun(active);
+    this.logger.error('Run admission persistence failed', {
+      agentId: active.agentId,
+      runId: active.runId,
+      error: sanitizeError(cause),
+    });
+  }
+
+  private handleEventPersistenceFailure(runId: string, cause: unknown): Promise<void> {
+    const active = this.activeRuns.get(runId);
+    if (!active) return Promise.resolve();
+    active.persistenceFailure ??= (async () => {
+      active.generation += 1;
+      active.acceptingEvents = false;
+      await this.tryAbort(active, 'event persistence failure');
+      await this.waitForOperations(active, 'event persistence failure');
+      await this.waitForEvents(active.agentId).catch(() => undefined);
+      try {
+        await this.finalizeRunWithoutSession(
+          active.agentId,
+          active.runId,
+          'failed',
+          { code: 'event_persistence_failed', message: 'Durable event persistence failed' },
+          'supervisor.run_failed',
+        );
+      } finally {
+        await this.disposeActiveRun(active);
+      }
+      this.logger.error('Run stopped after durable event persistence failure', {
+        agentId: active.agentId,
+        runId: active.runId,
+        error: sanitizeError(cause),
+      });
+    })();
+    return active.persistenceFailure;
   }
 
   private async persistEvent(
@@ -1142,6 +1432,8 @@ export class ManagedAgentService {
     eventType: string,
     payload: JsonValue,
   ): Promise<void> {
+    await this.observeLifecycle('during_event_write', runId ?? undefined);
+    await this.injectWriteFault('event');
     const persisted = await withBusyRetry(() =>
       this.db.transaction().execute(async (transaction) => {
         const row = await transaction
@@ -1345,7 +1637,15 @@ export class ManagedAgentService {
 
   private async completeRun(active: ActiveRun, generation: number): Promise<boolean> {
     if (active.generation !== generation) return false;
-    await this.waitForEvents(active.agentId);
+    try {
+      await this.waitForEvents(active.agentId);
+    } catch {
+      // The event failure path owns aborting and terminalizing this run. A
+      // provider completion racing it must not surface the same write error or
+      // publish a successful terminal state.
+      return false;
+    }
+    await this.observeLifecycle('after_provider_completion', active.runId);
     return this.finalizeRun(
       active.agentId,
       active.runId,
@@ -1380,7 +1680,8 @@ export class ManagedAgentService {
     // fence. This makes observing the last SDK event a safe point: once the
     // event tail is drained, status and the authoritative terminal event have
     // committed together.
-    return this.enqueueEventWork(agentId, async () => {
+    return this.enqueueEventWork(agentId, 512, async () => {
+      await this.injectWriteFault('terminal');
       const persisted = await withBusyRetry(() =>
         this.db.transaction().execute(async (transaction) => {
           const result = await transaction
@@ -1412,6 +1713,14 @@ export class ManagedAgentService {
 
   private assertMutable(): void {
     if (this.closed) throw new Error('managed_agent_service_closed');
+  }
+
+  private async injectWriteFault(writeClass: SupervisorWriteClass): Promise<void> {
+    await this.writeFaultInjector?.(writeClass);
+  }
+
+  private async observeLifecycle(phase: SupervisorLifecyclePhase, runId?: string): Promise<void> {
+    await this.lifecycleObserver?.(phase, runId);
   }
 
   private async tryAbort(active: ActiveRun, reason: string): Promise<void> {
@@ -1654,13 +1963,14 @@ function decodeTools(value: string | null): AgentToolName[] | null {
 function normalizeSessionEvent(
   rawEvent: unknown,
   limits: EventPayloadLimits,
-): { type: string; payload: JsonValue; truncated?: string } {
-  const state: PayloadState = { items: 0, truncated: undefined };
+): { type: string; payload: JsonValue; encodedBytes: number; truncated?: string } {
+  const state: PayloadState = { items: 0, bytes: 2, truncated: undefined };
   if (typeof rawEvent !== 'object' || rawEvent === null || Array.isArray(rawEvent)) {
     const payload = toJsonValue(rawEvent, state, limits, new WeakSet<object>(), 0);
     return {
       type: 'unknown',
       payload,
+      encodedBytes: state.bytes,
       ...(state.truncated ? { truncated: state.truncated } : {}),
     };
   }
@@ -1668,16 +1978,37 @@ function normalizeSessionEvent(
   const type = typeof record.type === 'string' && record.type.length > 0 ? record.type : 'unknown';
   const payload: Record<string, JsonValue> = {};
   for (const [key, value] of Object.entries(record)) {
-    if (key !== 'type') payload[key] = toJsonValue(value, state, limits, new WeakSet<object>(), 0);
+    if (key === 'type') continue;
+    if (!reservePayloadBytes(state, limits, Buffer.byteLength(JSON.stringify(key), 'utf8') + 2)) {
+      break;
+    }
+    payload[key] = toJsonValue(value, state, limits, new WeakSet<object>(), 0);
   }
-  const encoded = JSON.stringify(payload);
-  if (Buffer.byteLength(encoded, 'utf8') > limits.maxBytes) state.truncated ??= 'payload_bytes';
-  return { type, payload, ...(state.truncated ? { truncated: state.truncated } : {}) };
+  return {
+    type,
+    payload,
+    encodedBytes: Math.min(state.bytes, limits.maxBytes),
+    ...(state.truncated ? { truncated: state.truncated } : {}),
+  };
 }
 
 interface PayloadState {
   items: number;
+  bytes: number;
   truncated: string | undefined;
+}
+
+function reservePayloadBytes(
+  state: PayloadState,
+  limits: EventPayloadLimits,
+  bytes: number,
+): boolean {
+  if (state.bytes + bytes <= limits.maxBytes) {
+    state.bytes += bytes;
+    return true;
+  }
+  state.truncated ??= 'payload_bytes';
+  return false;
 }
 
 function toJsonValue(
@@ -1696,14 +2027,25 @@ function toJsonValue(
     state.truncated ??= 'payload_depth';
     return '[truncated]';
   }
-  if (value === null || typeof value === 'boolean') return value;
-  if (typeof value === 'string') {
-    if (Buffer.byteLength(value, 'utf8') <= limits.maxBytes) return value;
-    state.truncated ??= 'payload_bytes';
-    return `${value.slice(0, Math.max(0, limits.maxBytes / 4))}…[truncated]`;
+  if (value === null || typeof value === 'boolean') {
+    reservePayloadBytes(state, limits, value === null ? 4 : value ? 4 : 5);
+    return value;
   }
-  if (typeof value === 'number') return Number.isFinite(value) ? value : String(value);
-  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'string') {
+    const encodedBytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
+    if (reservePayloadBytes(state, limits, encodedBytes)) return value;
+    return '[truncated]';
+  }
+  if (typeof value === 'number') {
+    const normalized = Number.isFinite(value) ? value : String(value);
+    reservePayloadBytes(state, limits, Buffer.byteLength(JSON.stringify(normalized), 'utf8'));
+    return normalized;
+  }
+  if (typeof value === 'bigint') {
+    const normalized = value.toString();
+    reservePayloadBytes(state, limits, Buffer.byteLength(JSON.stringify(normalized), 'utf8'));
+    return normalized;
+  }
   if (typeof value === 'undefined' || typeof value === 'function' || typeof value === 'symbol') {
     return null;
   }
@@ -1712,11 +2054,21 @@ function toJsonValue(
   if (seen.has(value)) return '[Circular]';
   seen.add(value);
   if (Array.isArray(value)) {
-    return value.map((entry) => toJsonValue(entry, state, limits, seen, depth + 1));
+    const result: JsonValue[] = [];
+    for (const entry of value) {
+      if (!reservePayloadBytes(state, limits, 1)) break;
+      result.push(toJsonValue(entry, state, limits, seen, depth + 1));
+      if (state.truncated === 'payload_bytes') break;
+    }
+    return result;
   }
   const result: Record<string, JsonValue> = {};
   for (const [key, entry] of Object.entries(value)) {
+    if (!reservePayloadBytes(state, limits, Buffer.byteLength(JSON.stringify(key), 'utf8') + 2)) {
+      break;
+    }
     result[key] = toJsonValue(entry, state, limits, seen, depth + 1);
+    if (state.truncated === 'payload_bytes') break;
   }
   return result;
 }

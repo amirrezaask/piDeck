@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -47,6 +50,24 @@ describe('database foundation', () => {
           unique: 1,
           partial: 1,
         }),
+      );
+      expect(indexes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'supervisor_runs_pi_session_id_unique', unique: 1 }),
+          expect.objectContaining({ name: 'supervisor_runs_pi_session_file_unique', unique: 1 }),
+        ]),
+      );
+      const columns = connection.sqlite
+        .prepare('PRAGMA table_info(supervisor_agent_runs)')
+        .all() as Array<{ name: string }>;
+      expect(columns.map(({ name }) => name)).toEqual(
+        expect.arrayContaining([
+          'pi_session_id',
+          'pi_session_file',
+          'pi_owner_instance',
+          'pi_recovery_state',
+          'pi_recovered_at',
+        ]),
       );
     } finally {
       await connection.close();
@@ -147,6 +168,141 @@ describe('database foundation', () => {
       ).toBe(true);
     } finally {
       await connection.close();
+    }
+  });
+
+  it('physically rolls migration 013 back and reapplies it on a populated disk database', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pideck-migration-013-'));
+    const filename = join(directory, 'migration.sqlite');
+    const connection = createMigrationDatabase(filename);
+    try {
+      await migrateToLatest(connection.db);
+      await rollbackLastMigration(connection.db); // 014 depends on columns added after 013.
+
+      const now = '2026-08-26T00:00:00.000Z';
+      connection.sqlite
+        .prepare(
+          `INSERT INTO supervisor_agents
+            (id, name, system_prompt, cwd, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(['agent-013', 'Migration agent', 'Preserve me', '/tmp', now, now]);
+      connection.sqlite
+        .prepare(
+          `INSERT INTO supervisor_projects
+            (id, name, path, created_at, updated_at, last_used_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(['project-013', 'Migration project', '/tmp/project-013', now, now, now]);
+      connection.sqlite
+        .prepare(
+          `INSERT INTO supervisor_agent_runs
+            (id, agent_id, prompt, status, created_at, cwd, execution_mode)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(['run-013', 'agent-013', 'Preserve this run', 'completed', now, '/tmp', 'local']);
+      connection.sqlite
+        .prepare(
+          `INSERT INTO supervisor_worktrees
+            (id, project_id, path, branch, base_ref, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run([
+          'worktree-013',
+          'project-013',
+          '/tmp/project-013-worktree',
+          'migration',
+          'main',
+          'ready',
+          now,
+          now,
+        ]);
+      connection.sqlite
+        .prepare(
+          `INSERT INTO supervisor_terminal_sessions
+            (id, cwd, command, args_json, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(['terminal-013', '/tmp', 'true', '[]', 'completed', now]);
+      connection.sqlite
+        .prepare(
+          `INSERT INTO supervisor_inbox_items
+            (id, kind, run_id, title, body, options_json, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(['inbox-013', 'question', 'run-013', 'Question', 'Body', '[]', 'pending', now]);
+
+      await expect(
+        connection.db.transaction().execute(async (transaction) => {
+          await transaction.schema
+            .alterTable('supervisor_agent_runs')
+            .addColumn('interrupted_migration_probe', 'text')
+            .execute();
+          throw new Error('simulated interrupted migration');
+        }),
+      ).rejects.toThrow('simulated interrupted migration');
+      expect(
+        (
+          connection.sqlite.prepare('PRAGMA table_info(supervisor_agent_runs)').all() as Array<{
+            name: string;
+          }>
+        ).map(({ name }) => name),
+      ).not.toContain('interrupted_migration_probe');
+
+      await rollbackLastMigration(connection.db);
+
+      const rolledBackColumns = connection.sqlite
+        .prepare('PRAGMA table_info(supervisor_agent_runs)')
+        .all() as Array<{ name: string }>;
+      expect(rolledBackColumns.map(({ name }) => name)).not.toEqual(
+        expect.arrayContaining(['execution_mode', 'worktree_id', 'parent_run_id']),
+      );
+      expect(
+        connection.sqlite
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'supervisor_%'",
+          )
+          .all(),
+      ).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'supervisor_worktrees' }),
+          expect.objectContaining({ name: 'supervisor_terminal_sessions' }),
+          expect.objectContaining({ name: 'supervisor_inbox_items' }),
+        ]),
+      );
+      expect(
+        connection.sqlite
+          .prepare('SELECT prompt FROM supervisor_agent_runs WHERE id = ?')
+          .all(['run-013']),
+      ).toEqual([{ prompt: 'Preserve this run' }]);
+      expect(
+        connection.sqlite
+          .prepare('SELECT name FROM supervisor_projects WHERE id = ?')
+          .all(['project-013']),
+      ).toEqual([{ name: 'Migration project' }]);
+
+      await migrateToLatest(connection.db);
+      const reappliedColumns = connection.sqlite
+        .prepare('PRAGMA table_info(supervisor_agent_runs)')
+        .all() as Array<{ name: string }>;
+      expect(reappliedColumns.map(({ name }) => name)).toEqual(
+        expect.arrayContaining(['execution_mode', 'worktree_id', 'parent_run_id']),
+      );
+      expect(connection.sqlite.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
+      expect(connection.sqlite.pragma('foreign_key_check')).toEqual([]);
+
+      while ((await getMigrationStatus(connection.db)).some((item) => item.status === 'Executed')) {
+        await rollbackLastMigration(connection.db);
+      }
+      await migrateToLatest(connection.db);
+      expect(
+        (await getMigrationStatus(connection.db)).every((item) => item.status === 'Executed'),
+      ).toBe(true);
+      expect(connection.sqlite.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
+      expect(connection.sqlite.pragma('foreign_key_check')).toEqual([]);
+    } finally {
+      await connection.close();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 

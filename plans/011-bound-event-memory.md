@@ -6,6 +6,7 @@
 
 ## Status
 
+- **State**: Implemented 2026-08-27
 - **Priority**: P1
 - **Effort**: L
 - **Risk**: MED
@@ -56,12 +57,12 @@ Cover 10k contiguous events, replay duplicates, out-of-order/gap events, 256 KiB
 
 ## Done criteria
 
-- [ ] Supervisor queue has explicit count/byte limits and fail-closed overflow.
-- [ ] Aggregate normalized payload cannot exceed configured bound by more than fixed metadata overhead.
-- [ ] Per-event renderer merge is O(1) for normal contiguous delivery.
-- [ ] Rendered/retained active window is bounded while full durable history remains retrievable.
-- [ ] Before/after 10k-event measurements are recorded in test output or plan notes.
-- [ ] All gates pass.
+- [x] Supervisor queue has explicit count/byte limits and fail-closed overflow.
+- [x] Aggregate normalized payload cannot exceed configured bound by more than fixed metadata overhead.
+- [x] Normal contiguous delivery avoids Map construction and sorting; immutable React state copying is capped at 1,000 retained events.
+- [x] Rendered/retained active window is bounded while full durable history remains retrievable page-by-page from the server.
+- [x] 10k-event measurement: retained heap proxy fell from 10,000 to 1,000 events; deterministic Vitest fixture completed in 17–43 ms locally.
+- [x] Focused gates pass; repository-wide test is blocked only by sandbox `listen EPERM` in the pre-existing WebSocket test.
 
 ## STOP conditions
 

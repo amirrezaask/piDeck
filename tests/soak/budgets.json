@@ -1,0 +1,11 @@
+{
+  "agents": 25,
+  "events": 100000,
+  "rendererRetainedPerAgent": 1000,
+  "maxQueuedEventsPerAgent": 256,
+  "maxHeapGrowthBytes": 268435456,
+  "maxReconnectMs": 5000,
+  "maxInterventionLatencyMs": 5000,
+  "maxDurationMs": 180000,
+  "maxOpenHandleGrowth": 4
+}

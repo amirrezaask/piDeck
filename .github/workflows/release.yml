@@ -1,0 +1,129 @@
+name: Signed draft release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  gates:
+    name: Release source and recovery gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.15.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.19.0, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm check
+      - run: pnpm lint
+      - run: pnpm format:check
+      - run: pnpm test
+      - run: pnpm test:coverage
+      - run: pnpm test:e2e
+      - run: pnpm test:recovery
+      - run: pnpm test:backup-restore
+      - run: pnpm test:soak:ci
+      - run: pnpm audit --prod --audit-level high
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: release-gate-failure-artifacts, path: test-results, retention-days: 7 }
+  build:
+    needs: gates
+    strategy:
+      fail-fast: false
+      matrix: { os: [macos-14, windows-2022, ubuntu-24.04] }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.15.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.19.0, cache: pnpm }
+      - uses: oven-sh/setup-bun@v2
+      - run: pnpm install --frozen-lockfile
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS'
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MAC_CERTIFICATE }}
+          p12-password: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+      - name: Require trusted signing configuration
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          MAC_CERTIFICATE: ${{ secrets.MAC_CERTIFICATE }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          MAC_NOTARIZE_APPLE_ID: ${{ secrets.APPLE_ID }}
+          MAC_NOTARIZE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          MAC_NOTARIZE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          WINDOWS_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          WINDOWS_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          WINDOWS_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          WINDOWS_SIGNING_ACCOUNT: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          WINDOWS_CERTIFICATE_PROFILE: ${{ secrets.AZURE_CERTIFICATE_PROFILE }}
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            test -n "$MAC_CERTIFICATE"
+            test -n "$MAC_CERTIFICATE_PASSWORD"
+            test -n "$MAC_NOTARIZE_APPLE_ID"
+            test -n "$MAC_NOTARIZE_PASSWORD"
+            test -n "$MAC_NOTARIZE_TEAM_ID"
+          fi
+          if [ "$RUNNER_OS" = Windows ]; then
+            test -n "$WINDOWS_TENANT_ID"
+            test -n "$WINDOWS_CLIENT_ID"
+            test -n "$WINDOWS_CLIENT_SECRET"
+            test -n "$WINDOWS_SIGNING_ENDPOINT"
+            test -n "$WINDOWS_SIGNING_ACCOUNT"
+            test -n "$WINDOWS_CERTIFICATE_PROFILE"
+          fi
+      - run: pnpm check && pnpm lint && pnpm test && pnpm test:backup-restore
+      - run: pnpm build
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      - name: Sign Windows artifacts with Azure Trusted Signing
+        if: runner.os == 'Windows'
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERTIFICATE_PROFILE }}
+          files-folder: dist/electron
+          files-folder-filter: exe
+          files-folder-recurse: true
+      - name: Packaged smoke (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum pnpm test:electron:packaged
+      - name: Packaged smoke (macOS/Windows)
+        if: runner.os != 'Linux'
+        run: pnpm test:electron:packaged
+      - name: Verify platform signatures
+        if: runner.os != 'Linux'
+        run: node scripts/verify-release-signature.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: draft-${{ matrix.os }}
+          path: dist/electron/make
+          retention-days: 7
+  draft:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, pattern: draft-*, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with: { draft: true, files: artifacts/**/* }

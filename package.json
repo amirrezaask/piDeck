@@ -20,10 +20,15 @@
     "check": "pnpm typecheck && pnpm lint:boundaries",
     "test": "turbo run test",
     "test:coverage": "pnpm --filter @pideck/web test:coverage",
+    "test:recovery": "pnpm --filter @nextflow/database test -- recovery.test.ts && pnpm --filter @pideck/supervisor test -- recovery-process.test.ts",
+    "test:soak": "node --expose-gc --import tsx --test tests/soak/event-stream-soak.test.mjs",
+    "test:soak:ci": "node --expose-gc --import tsx --test tests/soak/event-stream-soak.test.mjs",
+    "test:backup-restore": "node --test scripts/tests/backup-restore.test.mjs",
+    "test:electron:packaged": "node scripts/test-packaged-electron.mjs",
     "test:e2e": "playwright test",
-    "lint": "turbo run lint && biome check tests playwright.config.ts",
+    "lint": "turbo run lint && biome check tests scripts playwright.config.ts",
     "format": "biome format --write apps packages",
-    "format:check": "biome format apps packages"
+    "format:check": "biome format apps packages scripts tests"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.4",

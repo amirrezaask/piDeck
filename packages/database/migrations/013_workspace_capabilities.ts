@@ -1,4 +1,4 @@
-import { type Kysely, sql } from 'kysely';
+import { type Kysely } from 'kysely';
 import type { MigrationDatabase } from '../src/schema';
 
 export const workspaceCapabilitiesMigration = {
@@ -73,10 +73,12 @@ export const workspaceCapabilitiesMigration = {
       .execute();
   },
   async down(db: Kysely<MigrationDatabase>) {
+    await db.schema.dropIndex('supervisor_runs_parent_idx').ifExists().execute();
     await db.schema.dropTable('supervisor_inbox_items').ifExists().execute();
     await db.schema.dropTable('supervisor_terminal_sessions').ifExists().execute();
     await db.schema.dropTable('supervisor_worktrees').ifExists().execute();
-    // SQLite cannot safely drop these columns on every supported runtime.
-    await sql`SELECT 1`.execute(db);
+    await db.schema.alterTable('supervisor_agent_runs').dropColumn('parent_run_id').execute();
+    await db.schema.alterTable('supervisor_agent_runs').dropColumn('worktree_id').execute();
+    await db.schema.alterTable('supervisor_agent_runs').dropColumn('execution_mode').execute();
   },
 };

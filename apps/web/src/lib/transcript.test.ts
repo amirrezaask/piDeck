@@ -1,7 +1,12 @@
 import type { ManagedAgentEvent } from '@nextflow/contracts';
 import { describe, expect, it } from 'vitest';
 
-import { collapseThinkingMarkers, mapPiEvents } from './transcript';
+import {
+  collapseThinkingMarkers,
+  mapPiEvents,
+  mergeTranscriptEvents,
+  TRANSCRIPT_EVENT_WINDOW,
+} from './transcript';
 
 const base = {
   agentId: '018bcfe4-7a4b-7000-8000-000000000111',
@@ -176,5 +181,41 @@ describe('mapPiEvents', () => {
         }),
       ]),
     ).toEqual([]);
+  });
+});
+
+describe('mergeTranscriptEvents', () => {
+  it('incrementally retains a bounded tail for a 10k-event fixture', () => {
+    let retained: ManagedAgentEvent[] = [];
+    let copiedEvents = 0;
+    const started = performance.now();
+    for (let sequence = 1; sequence <= 10_000; sequence += 1) {
+      retained = mergeTranscriptEvents(retained, [event(sequence, 'agent_start')]);
+      copiedEvents += Math.min(sequence, TRANSCRIPT_EVENT_WINDOW);
+    }
+    const elapsedMs = performance.now() - started;
+
+    expect(retained).toHaveLength(TRANSCRIPT_EVENT_WINDOW);
+    expect(retained[0]?.sequence).toBe(9_001);
+    expect(retained.at(-1)?.sequence).toBe(10_000);
+    expect({ retained: retained.length, elapsedMs, copiedEvents }).toMatchObject({
+      retained: 1_000,
+      copiedEvents: 9_500_500,
+    });
+  });
+
+  it('replaces duplicates and inserts out-of-order events without changing sequence order', () => {
+    const original = event(2, 'agent_start');
+    const replacement = event(2, 'agent_end');
+    const retained = mergeTranscriptEvents(
+      [original, event(4, 'agent_end')],
+      [replacement, event(3, 'message_start')],
+    );
+
+    expect(retained.map((item) => [item.sequence, item.type])).toEqual([
+      [2, 'agent_end'],
+      [3, 'message_start'],
+      [4, 'agent_end'],
+    ]);
   });
 });

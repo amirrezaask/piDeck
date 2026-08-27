@@ -737,6 +737,7 @@ test('creates an agent and starts a managed run', async ({ page }, testInfo) => 
     model: { provider: 'fake', id: 'fake-model' },
     thinkingLevel: 'medium',
     cwd: '/workspace',
+    idempotencyKey: expect.any(String),
   });
   expect(errors).toEqual([]);
 });

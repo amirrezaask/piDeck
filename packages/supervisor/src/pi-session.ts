@@ -1,4 +1,5 @@
-import { resolve } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import { dirname, relative, resolve } from 'node:path';
 
 import type {
   AgentSession,
@@ -51,8 +52,15 @@ export interface CreatePiSessionOptions {
   readonly thinkingLevel?: AgentThinkingLevel;
 }
 
+export interface ResumePiSessionOptions extends CreatePiSessionOptions {
+  readonly sessionId: string;
+  readonly sessionFile: string;
+  readonly cwd: string;
+}
+
 export interface PiSessionFactory {
   create(options: CreatePiSessionOptions): Promise<ManagedPiSession>;
+  resume?(options: ResumePiSessionOptions): Promise<ManagedPiSession>;
   listModels?(): Promise<ManagedAgentModelsResponse>;
 }
 
@@ -201,6 +209,44 @@ export class SdkPiSessionFactory implements PiSessionFactory {
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
     });
 
+    return new SdkManagedPiSession(result.session);
+  }
+
+  async resume(options: ResumePiSessionOptions): Promise<ManagedPiSession> {
+    const cwd = resolveWorkingDirectory(options.cwd);
+    const sessionFile = await realpath(resolve(options.sessionFile));
+    const sessionRoot = await realpath(resolve(this.sessionDirectory ?? dirname(sessionFile)));
+    const pathFromRoot = relative(sessionRoot, sessionFile);
+    if (pathFromRoot.startsWith('..') || resolve(sessionRoot, pathFromRoot) !== sessionFile) {
+      throw new Error('pi_session_outside_configured_directory');
+    }
+
+    const pi = await this.getPiModule();
+    const sessionManager = pi.SessionManager.open(sessionFile, sessionRoot);
+    if (sessionManager.getSessionId() !== options.sessionId) {
+      throw new Error('pi_session_id_mismatch');
+    }
+    if (resolveWorkingDirectory(sessionManager.getCwd()) !== cwd) {
+      throw new Error('pi_session_cwd_mismatch');
+    }
+    const resourceLoader = new pi.DefaultResourceLoader({
+      cwd,
+      agentDir: pi.getAgentDir(),
+      appendSystemPromptOverride: (base) => [
+        ...base,
+        `## Agent instructions\n\n${options.systemPrompt}`,
+      ],
+    });
+    await resourceLoader.reload();
+    const result = await pi.createAgentSession({
+      cwd,
+      agentDir: pi.getAgentDir(),
+      modelRuntime: await this.getModelRuntime(),
+      resourceLoader,
+      sessionManager,
+      ...(options.tools ? { tools: options.tools } : {}),
+      ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+    });
     return new SdkManagedPiSession(result.session);
   }
 

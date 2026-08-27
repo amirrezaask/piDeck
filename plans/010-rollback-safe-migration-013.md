@@ -6,6 +6,7 @@
 
 ## Status
 
+- **State**: DONE
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: MED
@@ -51,11 +52,11 @@ Use a temporary on-disk database, not only `:memory:`. Cover populated database,
 
 ## Done criteria
 
-- [ ] 013 down then up succeeds on populated data.
-- [ ] Physical schema matches declared migration status.
-- [ ] `PRAGMA integrity_check` returns `ok`; `foreign_key_check` returns no rows.
-- [ ] No production/user DB is touched.
-- [ ] Focused/full gates pass.
+- [x] 013 down then up succeeds on populated data.
+- [x] Physical schema matches declared migration status.
+- [x] `PRAGMA integrity_check` returns `ok`; `foreign_key_check` returns no rows.
+- [x] No production/user DB is touched.
+- [x] Focused on-disk migration, typecheck, and lint gates pass.
 
 ## STOP conditions
 

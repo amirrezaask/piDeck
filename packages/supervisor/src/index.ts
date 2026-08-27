@@ -10,6 +10,8 @@ export {
   ManagedAgentRunNotFoundError,
   ManagedAgentService,
   type ManagedAgentServiceOptions,
+  type SupervisorLifecyclePhase,
+  type SupervisorWriteClass,
 } from './agent-service.js';
 export {
   buildSupervisorApp,
@@ -30,6 +32,7 @@ export {
   type ManagedPiSession,
   type PiImageContent,
   type PiSessionFactory,
+  type ResumePiSessionOptions,
   SdkPiSessionFactory,
   type SdkPiSessionFactoryOptions,
 } from './pi-session.js';

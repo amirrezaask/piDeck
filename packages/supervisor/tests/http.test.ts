@@ -16,6 +16,7 @@ async function withApp<T>(
     piSessionFactory?: PiSessionFactory;
     piExtensionService?: PiExtensionCatalog;
     enableLegacyExecutions?: boolean;
+    allowUnauthenticatedLoopback?: boolean;
   } = {},
 ): Promise<T> {
   const directory = mkdtempSync(join(tmpdir(), 'nextflow-supervisor-http-'));
@@ -58,6 +59,11 @@ describe('Supervisor HTTP API', () => {
       async (app) => {
         const health = await app.inject({ method: 'GET', url: '/v1/health' });
         const unauthorized = await app.inject({ method: 'GET', url: '/v1/executions' });
+        const wrongCredential = await app.inject({
+          method: 'GET',
+          url: '/v1/executions',
+          headers: { authorization: 'Bearer wrong-secret' },
+        });
         const authorized = await app.inject({
           method: 'GET',
           url: '/v1/executions',
@@ -66,9 +72,10 @@ describe('Supervisor HTTP API', () => {
 
         expect(health.statusCode).toBe(200);
         expect(unauthorized.statusCode).toBe(401);
+        expect(wrongCredential.statusCode).toBe(401);
         expect(authorized.statusCode).toBe(200);
       },
-      { serviceToken: 'service-secret' },
+      { serviceToken: 'service-secret', allowUnauthenticatedLoopback: true },
     );
   });
 

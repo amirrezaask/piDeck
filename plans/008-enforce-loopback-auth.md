@@ -6,6 +6,7 @@
 
 ## Status
 
+- **State**: DONE
 - **Priority**: P1
 - **Effort**: S
 - **Risk**: LOW
@@ -48,10 +49,10 @@ Test token+loopback, token+remote, no-token+explicit-loopback, no-token+remote, 
 
 ## Done criteria
 
-- [ ] Configured token is mandatory on loopback and remote peers.
-- [ ] HTTP and WebSocket policies match.
-- [ ] No token value appears in logs/tests/docs.
-- [ ] Focused/full gates pass.
+- [x] Configured token is mandatory on loopback and remote peers.
+- [x] HTTP and WebSocket policies match.
+- [x] No token value appears in logs/tests/docs.
+- [x] Focused non-socket gates pass; the sandbox blocks the WebSocket test's loopback bind with `EPERM`.
 
 ## STOP conditions
 

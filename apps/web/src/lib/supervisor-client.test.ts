@@ -5,6 +5,23 @@ import { modelDisplayName, SupervisorClient } from './supervisor-client';
 
 const agentId = '018bcfe4-7a4b-7000-8000-000000000111';
 const timestamp = '2026-08-23T20:00:00.000Z';
+const runId = '018bcfe4-7a4b-7000-8000-000000000222';
+const run = {
+  id: runId,
+  agentId,
+  prompt: 'Test',
+  model: null,
+  thinkingLevel: null,
+  cwd: '/workspace',
+  executionMode: 'local',
+  worktreeId: null,
+  parentRunId: null,
+  status: 'completed',
+  error: null,
+  createdAt: timestamp,
+  startedAt: timestamp,
+  completedAt: timestamp,
+} as const;
 const agent: ManagedAgentResponse = {
   id: agentId,
   name: 'Release reviewer',
@@ -245,6 +262,57 @@ describe('SupervisorClient', () => {
     );
   });
 
+  it('iterates all run pages and rejects a repeated cursor', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ runs: [run], nextCursor: 'page-2' }))
+      .mockResolvedValueOnce(
+        jsonResponse({ runs: [{ ...run, id: `${runId.slice(0, -1)}3` }], nextCursor: null }),
+      );
+    const client = new SupervisorClient({ fetcher });
+    await expect(client.listAllRuns({ status: 'running', limit: 1 })).resolves.toHaveLength(2);
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      '/supervisor-api/v1/runs?limit=1&status=running',
+      '/supervisor-api/v1/runs?limit=1&status=running&cursor=page-2',
+    ]);
+
+    const stuck = new SupervisorClient({
+      fetcher: vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(jsonResponse({ runs: [], nextCursor: 'same' })),
+    });
+    await expect(stuck.listAllRuns({ cursor: 'same' })).rejects.toThrow(/did not advance/);
+  });
+
+  it('aborts page iteration before issuing a request', async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const controller = new AbortController();
+    controller.abort();
+    const client = new SupervisorClient({ fetcher });
+    await expect(client.listAllRuns({}, { signal: controller.signal })).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('passes abort through to an in-flight page request', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(
+      (_url, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('aborted', 'AbortError')),
+            { once: true },
+          );
+        }),
+    );
+    const controller = new AbortController();
+    const client = new SupervisorClient({ fetcher });
+    const pending = client.listAllRuns({}, { signal: controller.signal });
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
   it('lists composer suggestions for a working directory', async () => {
     const response = {
       cwd: '/workspace',
@@ -381,7 +449,7 @@ describe('SupervisorClient', () => {
       `/supervisor-api/v1/runs/${runId}/steer`,
       `/supervisor-api/v1/runs/${runId}/follow-up`,
       `/supervisor-api/v1/agents/${agentId}`,
-      `/supervisor-api/v1/runs/${runId}/events?afterSequence=6`,
+      `/supervisor-api/v1/runs/${runId}/events?afterSequence=6&limit=500`,
     ]);
   });
 
@@ -413,6 +481,33 @@ describe('SupervisorClient', () => {
     const client = new SupervisorClient({ fetcher });
 
     await expect(client.getAgent(agentId)).rejects.toThrow();
+  });
+
+  it('routes the operational resource methods through the contract boundary', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({}));
+    const client = new SupervisorClient({ fetcher });
+    const calls = [
+      client.getFleet(),
+      client.getRunChanges(runId, 'working_tree'),
+      client.listWorktrees(),
+      client.releaseWorktree('worktree/id'),
+      client.listTerminalSessions(),
+      client.getTerminalSession('terminal/id'),
+      client.writeTerminalSession('terminal/id', 'ls\n'),
+      client.cancelTerminalSession('terminal/id'),
+      client.listInbox(),
+      client.resolveInbox('inbox/id', 'approved'),
+      client.cancelInbox('inbox/id'),
+      client.searchSessions('release review', 4),
+      client.getRun(runId),
+      client.cancelRun(runId, 'cancel-once'),
+      client.listRuns({ limit: 3 }),
+      client.listEvents(agentId, 2),
+    ];
+    const results = await Promise.allSettled(calls);
+    expect(results).toHaveLength(calls.length);
+    expect(results.every((result) => result.status === 'rejected')).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(calls.length);
   });
 
   it('reconnects, deduplicates replay, and resumes from the last delivered sequence', async () => {
@@ -460,6 +555,39 @@ describe('SupervisorClient', () => {
       }
     };
     await expect(consume()).rejects.toThrow(/sequence gap/);
+  });
+
+  it('rejects a waiting reader when the socket reports an error', async () => {
+    ScriptedWebSocket.scripts = [(socket) => socket.onerror?.()];
+    const client = new SupervisorClient({
+      webSocketFactory: ScriptedWebSocket as unknown as typeof WebSocket,
+    });
+    await expect(client.streamEvents(agentId, { reconnect: false }).next()).rejects.toThrow(
+      /WebSocket failed/,
+    );
+  });
+
+  it('resets the consecutive failure budget only after valid messages', async () => {
+    const controller = new AbortController();
+    ScriptedWebSocket.scripts = Array.from(
+      { length: 9 },
+      (_, index) => (socket: ScriptedWebSocket) => {
+        socket.emit(index + 1);
+        socket.onclose?.();
+      },
+    );
+    const client = new SupervisorClient({
+      webSocketFactory: ScriptedWebSocket as unknown as typeof WebSocket,
+    });
+    const sequences: number[] = [];
+    for await (const event of client.streamEvents(agentId, {
+      signal: controller.signal,
+      maxReconnectAttempts: 1,
+    })) {
+      sequences.push(event.sequence);
+      if (sequences.length === 9) controller.abort();
+    }
+    expect(sequences).toHaveLength(9);
   });
 
   it('fails after capped reconnect attempts and supports cancellation while backing off', async () => {

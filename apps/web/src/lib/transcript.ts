@@ -46,6 +46,49 @@ export type TranscriptItem =
       endSequence: number;
     };
 
+export const TRANSCRIPT_EVENT_WINDOW = 1_000;
+
+/**
+ * Incremental sequence-keyed merge. Contiguous live delivery appends without a
+ * full-history Map/sort and retention is capped; durable history stays server-side.
+ */
+export function mergeTranscriptEvents(
+  current: readonly ManagedAgentEvent[],
+  incoming: readonly ManagedAgentEvent[],
+  limit = TRANSCRIPT_EVENT_WINDOW,
+): ManagedAgentEvent[] {
+  if (incoming.length === 0) return current as ManagedAgentEvent[];
+  let next = current as ManagedAgentEvent[];
+  for (const event of incoming) {
+    const last = next.at(-1);
+    if (!last || event.sequence > last.sequence) {
+      next = next === current ? [...current, event] : [...next, event];
+    } else {
+      const index = binarySearchSequence(next, event.sequence);
+      if (index < next.length && next[index]?.sequence === event.sequence) {
+        if (next[index] === event) continue;
+        next = [...next];
+        next[index] = event;
+      } else {
+        next = [...next.slice(0, index), event, ...next.slice(index)];
+      }
+    }
+    if (next.length > limit) next = next.slice(next.length - limit);
+  }
+  return next;
+}
+
+function binarySearchSequence(events: readonly ManagedAgentEvent[], sequence: number): number {
+  let low = 0;
+  let high = events.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((events[middle]?.sequence ?? Number.POSITIVE_INFINITY) < sequence) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
 export function collapseThinkingMarkers(events: readonly TranscriptEvent[]): TranscriptEvent[] {
   const collapsed: TranscriptEvent[] = [];
   let hasThinkingMarker = false;

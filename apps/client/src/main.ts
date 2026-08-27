@@ -13,6 +13,7 @@ import {
   safeStorage,
   session,
 } from 'electron';
+import { normalizeServerOrigin } from './server-origin.js';
 
 interface StoredServer {
   readonly id: string;
@@ -86,17 +87,6 @@ async function stopBuiltinServer(): Promise<void> {
   builtinServer = undefined;
   builtinServiceToken = undefined;
   if (supervisor) await supervisor.server.close();
-}
-
-function normalizeAddress(address: string): string {
-  const url = new URL(address.trim());
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('Server address must use http:// or https://');
-  }
-  if (url.username || url.password || url.search || url.hash || url.pathname !== '/') {
-    throw new Error('Enter the server origin only, without credentials, query, or path');
-  }
-  return url.origin;
 }
 
 function publicServer(server: StoredServer) {
@@ -174,12 +164,13 @@ function registerIpc(): void {
     if (input.id === BUILTIN_SERVER_ID) throw new Error('The built-in server cannot be edited');
     const id = input.id ?? crypto.randomUUID();
     const existing = servers.find((server) => server.id === id);
+    const encryptedToken =
+      input.token === undefined ? existing?.encryptedToken : encryptToken(input.token.trim());
     const next: StoredServer = {
       id,
       name: input.name.trim(),
-      address: normalizeAddress(input.address),
-      encryptedToken:
-        input.token === undefined ? existing?.encryptedToken : encryptToken(input.token.trim()),
+      address: normalizeServerOrigin(input.address, Boolean(encryptedToken)),
+      encryptedToken,
     };
     servers = [next, ...servers.filter((server) => server.id !== id)];
     await persistServers();
@@ -217,6 +208,9 @@ function registerIpc(): void {
       if (value) headers.set(name, value);
     }
     const token = decryptToken(server);
+    const validatedOrigin = normalizeServerOrigin(server.address, Boolean(token));
+    if (validatedOrigin !== server.address)
+      throw new Error('Stored server origin is not canonical');
     if (token) headers.set('authorization', `Bearer ${token}`);
     const response = await net.fetch(target.toString(), {
       method,
@@ -258,6 +252,21 @@ function createWindow(): void {
     if (mainWindow === window) mainWindow = undefined;
   });
   void window.loadFile(resolve(import.meta.dirname, 'renderer/index.html'));
+  const smokeNonce = process.env.PIDECK_SMOKE_NONCE;
+  if (smokeNonce && /^[A-Za-z0-9_-]{20,128}$/.test(smokeNonce)) {
+    window.webContents.once('did-finish-load', async () => {
+      const preloadReady = await window.webContents.executeJavaScript(
+        "typeof window.piDeckServers?.list === 'function'",
+        true,
+      );
+      const marker = join(app.getPath('userData'), 'pideck-smoke-ready.json');
+      await writeFile(
+        marker,
+        `${JSON.stringify({ nonce: smokeNonce, preloadReady, pid: process.pid })}\n`,
+        { mode: 0o600 },
+      );
+    });
+  }
 }
 
 function isStoredServer(value: unknown): value is StoredServer {
@@ -306,7 +315,13 @@ function parseServerRequest(value: unknown): ServerRequest {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, argv) => {
+    const quitArgument = argv.find((argument) => argument.startsWith('--pideck-smoke-quit='));
+    const smokeNonce = process.env.PIDECK_SMOKE_NONCE;
+    if (smokeNonce && quitArgument === `--pideck-smoke-quit=${smokeNonce}`) {
+      app.quit();
+      return;
+    }
     if (!mainWindow) return;
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();

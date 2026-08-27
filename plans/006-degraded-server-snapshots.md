@@ -6,6 +6,8 @@
 
 ## Status
 
+- **Status**: DONE
+
 - **Priority**: P1
 - **Effort**: M
 - **Risk**: MED
@@ -58,11 +60,11 @@ Add table-driven tests for each single endpoint failing, runs failing while mode
 
 ## Done criteria
 
-- [ ] Auxiliary endpoint failure never removes known active runs.
-- [ ] Last-known data is visibly marked stale, not presented as live.
-- [ ] Resource retry can recover without app reload.
-- [ ] Duplicate bootstrap/refresh aggregation is removed.
-- [ ] Focused/full gates pass.
+- [x] Auxiliary endpoint failure never removes known active runs.
+- [x] Last-known data is visibly marked stale, not presented as live.
+- [x] Resource retry can recover without app reload.
+- [x] Duplicate bootstrap/refresh aggregation is removed.
+- [x] Focused gates pass; the full suite reaches one sandbox-blocked loopback-listen test.
 
 ## STOP conditions
 

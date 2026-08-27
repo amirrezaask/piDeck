@@ -24,7 +24,6 @@ const { server } = buildSupervisorApp({
   databasePath,
   logger: true,
   serviceToken,
-  allowUnauthenticatedLoopback: true,
   ...(agentDefaultCwd ? { agentDefaultCwd } : {}),
   ...(piSessionDirectory ? { piSessionDirectory } : {}),
 });

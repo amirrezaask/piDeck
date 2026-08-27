@@ -19,6 +19,9 @@ async function createService(
     createDeferred?: Deferred<void>;
     abortMode?: 'resolve' | 'reject' | 'hang';
     shutdownTimeoutMs?: number;
+    eventQueueLimits?: { maxCount: number; maxBytes: number };
+    eventPayloadLimits?: { maxBytes: number; maxDepth?: number; maxItems?: number };
+    writeFaultInjector?: (writeClass: 'admission' | 'event' | 'terminal') => void | Promise<void>;
   } = {},
 ) {
   const directory = mkdtempSync(join(tmpdir(), 'nextflow-managed-agent-'));
@@ -38,6 +41,9 @@ async function createService(
           shutdownTimeoutMs: options.shutdownTimeoutMs,
           operationTimeoutMs: options.shutdownTimeoutMs,
         }),
+    ...(options.eventQueueLimits ? { eventQueueLimits: options.eventQueueLimits } : {}),
+    ...(options.eventPayloadLimits ? { eventPayloadLimits: options.eventPayloadLimits } : {}),
+    ...(options.writeFaultInjector ? { writeFaultInjector: options.writeFaultInjector } : {}),
   });
   await service.start();
   return {
@@ -64,6 +70,136 @@ async function waitForEvent(service: ManagedAgentService, agentId: string, event
 }
 
 describe('ManagedAgentService', () => {
+  it('rejects an admission write fault before starting paid work', async () => {
+    let failAdmission = false;
+    const context = await createService({
+      writeFaultInjector(writeClass) {
+        if (failAdmission && writeClass === 'admission') throw new Error('injected_enospc');
+      },
+    });
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      failAdmission = true;
+      await expect(
+        context.service.createRun({ agentId: agent.id, prompt: 'Must not start.' }),
+      ).rejects.toThrow('injected_enospc');
+      expect(context.factory.sessions).toHaveLength(0);
+      expect(await context.service.listRuns({ agentId: agent.id, limit: 10 })).toMatchObject({
+        runs: [],
+      });
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('fails closed when an ordinary event write fails', async () => {
+    let failNextEvent = false;
+    const context = await createService({
+      writeFaultInjector(writeClass) {
+        if (failNextEvent && writeClass === 'event') {
+          failNextEvent = false;
+          throw new Error('injected_eio');
+        }
+      },
+    });
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Start.' });
+      const session = context.factory.sessions[0];
+      if (!session) throw new Error('Fake session was not created');
+      failNextEvent = true;
+      session.emitExternal({ type: 'message_update', delta: 'must not be acknowledged' });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await context.service.getRun(run.id))?.status === 'failed') break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(await context.service.getRun(run.id)).toMatchObject({
+        status: 'failed',
+        error: { code: 'event_persistence_failed' },
+      });
+      expect(session.abortCount).toBe(1);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('does not publish a terminal state when its atomic write fails', async () => {
+    let failTerminal = false;
+    const context = await createService({
+      writeFaultInjector(writeClass) {
+        if (failTerminal && writeClass === 'terminal') {
+          failTerminal = false;
+          throw new Error('injected_terminal_eio');
+        }
+      },
+    });
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Start.' });
+      const session = context.factory.sessions[0];
+      if (!session) throw new Error('Fake session was not created');
+      failTerminal = true;
+      session.settle();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(await context.service.getRun(run.id)).toMatchObject({
+        status: 'failed',
+        error: { code: 'agent_operation_failed' },
+      });
+      expect(
+        (await context.service.listRunEvents(run.id, { afterSequence: 0 })).some(
+          (event) => event.type === 'supervisor.run_completed',
+        ),
+      ).toBe(false);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('fails closed when the bounded event ingestion queue overflows', async () => {
+    const context = await createService({
+      eventQueueLimits: { maxCount: 3, maxBytes: 1_000_000 },
+    });
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Start.' });
+      const session = context.factory.sessions[0];
+      if (!session) throw new Error('Fake session was not created');
+
+      for (let index = 0; index < 50; index += 1) {
+        session.emitExternal({ type: 'message_update', index });
+      }
+      await waitForEvent(context.service, agent.id, 'supervisor.event_backpressure_exceeded');
+
+      expect(await context.service.getRun(run.id)).toMatchObject({
+        status: 'failed',
+        error: { code: 'event_backpressure_exceeded' },
+      });
+      expect(session.abortCount).toBe(1);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('bounds aggregate normalized payload bytes before persistence', async () => {
+    const context = await createService({ eventPayloadLimits: { maxBytes: 1_024 } });
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Be concise.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Start.' });
+      const session = context.factory.sessions[0];
+      if (!session) throw new Error('Fake session was not created');
+      session.emitExternal({
+        type: 'oversize',
+        chunks: Array.from({ length: 50 }, () => 'x'.repeat(200)),
+      });
+      await waitForEvent(context.service, agent.id, 'supervisor.event_truncated');
+      const events = await context.service.listRunEvents(run.id, { afterSequence: 0 });
+      const truncated = events.find((item) => item.type === 'supervisor.event_truncated');
+      expect(Buffer.byteLength(JSON.stringify(truncated?.payload), 'utf8')).toBeLessThan(1_024);
+      expect(truncated?.payload).toMatchObject({ reason: 'payload_bytes', maxBytes: 1_024 });
+    } finally {
+      await context.close();
+    }
+  });
   it('persists an inert definition without creating a Pi session', async () => {
     const context = await createService();
     try {
@@ -261,6 +397,44 @@ describe('ManagedAgentService', () => {
       expect(nextRun.status).toBe('running');
     } finally {
       await context.close();
+    }
+  });
+
+  it('recovers a completed Pi session without replaying its prompt', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Remember context.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Remember this.' });
+      context.factory.sessions[0]?.settle();
+      await waitForEvent(context.service, agent.id, 'supervisor.run_completed');
+      await context.service.close();
+      await context.connection.close();
+
+      const connection = createSupervisorDatabase(context.filename);
+      const factory = new FakePiSessionFactory();
+      const service = new ManagedAgentService({
+        db: connection.db,
+        sessionFactory: factory,
+        defaultCwd: context.directory,
+      });
+      await service.start();
+      try {
+        expect(factory.resumeRequests).toEqual([
+          expect.objectContaining({
+            sessionId: 'fake-pi-session-1',
+            sessionFile: '/tmp/fake-pi-session-1.jsonl',
+            cwd: context.directory,
+          }),
+        ]);
+        expect(factory.sessions[0]?.prompts).toEqual([]);
+        await service.followUpRun(run.id, { message: 'What did I say?' });
+        expect(factory.sessions[0]?.prompts).toEqual(['What did I say?']);
+      } finally {
+        await service.close();
+        await connection.close();
+      }
+    } finally {
+      rmSync(context.directory, { recursive: true, force: true });
     }
   });
 
