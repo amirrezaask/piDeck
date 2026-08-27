@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "dev": "NEXTFLOW_SUPERVISOR_TOKEN=${NEXTFLOW_SUPERVISOR_TOKEN:-pideck-local-dev-token} tsx watch src/main.ts",
+    "dev": "tsx watch src/main.ts",
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests",

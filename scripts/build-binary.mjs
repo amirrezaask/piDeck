@@ -62,7 +62,7 @@ async function main() {
     });
   });
 
-  console.log(`Built static server binary: ${output}`);
+  console.log(`Built standalone browser binary: ${output}`);
 }
 
 await main();

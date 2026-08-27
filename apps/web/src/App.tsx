@@ -4551,7 +4551,7 @@ function ServerEditorForm({
             <FieldDescription>
               {server?.hasToken
                 ? 'A token is already stored. Enter a new value only to replace it.'
-                : 'Use the NEXTFLOW_SUPERVISOR_TOKEN configured on this server.'}
+                : 'Optional for local servers; required for connections from another machine.'}
             </FieldDescription>
           </Field>
         </FieldGroup>

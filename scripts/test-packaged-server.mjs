@@ -14,7 +14,6 @@ const binary = resolve(
 const directory = await mkdtemp(join(tmpdir(), 'pideck packaged server '));
 const databasePath = join(directory, 'data with spaces', 'pideck.sqlite');
 const sessionDirectory = join(directory, 'pi sessions');
-const token = 'packaged-server-smoke-token';
 const smokeNonce = randomBytes(24).toString('base64url');
 const logs = [];
 let child;
@@ -70,7 +69,7 @@ try {
       NEXTFLOW_AGENT_CWD: directory,
       NEXTFLOW_SUPERVISOR_HOST: '127.0.0.1',
       NEXTFLOW_SUPERVISOR_PORT: String(port),
-      NEXTFLOW_SUPERVISOR_TOKEN: token,
+      NEXTFLOW_SUPERVISOR_TOKEN: '',
       PIDECK_SMOKE_NONCE: smokeNonce,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -82,13 +81,7 @@ try {
 
   const shell = await fetch(`${baseUrl}/`);
   const clientRoute = await fetch(`${baseUrl}/sessions/smoke-run`);
-  const unauthorized = await fetch(`${baseUrl}/v1/agents`);
-  const wrongCredential = await fetch(`${baseUrl}/v1/agents`, {
-    headers: { authorization: 'Bearer wrong-token' },
-  });
-  const authorized = await fetch(`${baseUrl}/v1/agents`, {
-    headers: { authorization: `Bearer ${token}` },
-  });
+  const loopbackApi = await fetch(`${baseUrl}/v1/agents`);
   const shellBody = await shell.text();
 
   if (shell.status !== 200 || !shellBody.includes('<title>piDeck</title>')) {
@@ -97,26 +90,20 @@ try {
   if (clientRoute.status !== 200 || !(await clientRoute.text()).includes('<title>piDeck</title>')) {
     throw new Error('Packaged server did not provide SPA route fallback');
   }
-  if (unauthorized.status !== 401 || wrongCredential.status !== 401 || authorized.status !== 200) {
-    throw new Error('Packaged server authentication policy failed');
+  if (loopbackApi.status !== 200) {
+    throw new Error('Packaged server did not allow unauthenticated loopback access');
   }
 
   const rejectedShutdown = await fetch(`${baseUrl}/v1/smoke/quit`, {
     method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'x-pideck-smoke-nonce': 'wrong-smoke-nonce-value',
-    },
+    headers: { 'x-pideck-smoke-nonce': 'wrong-smoke-nonce-value' },
   });
   if (rejectedShutdown.status !== 403) {
     throw new Error('Packaged server smoke shutdown accepted the wrong nonce');
   }
   const shutdown = await fetch(`${baseUrl}/v1/smoke/quit`, {
     method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'x-pideck-smoke-nonce': smokeNonce,
-    },
+    headers: { 'x-pideck-smoke-nonce': smokeNonce },
   });
   if (shutdown.status !== 200) throw new Error('Packaged server rejected graceful shutdown');
   await waitForExit();
@@ -132,7 +119,7 @@ try {
   console.log(
     JSON.stringify({
       embeddedWebApp: true,
-      authentication: 'enforced',
+      authentication: 'loopback-only',
       databaseIntegrity: 'ok',
       gracefulShutdown: true,
     }),

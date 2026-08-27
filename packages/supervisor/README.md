@@ -10,6 +10,7 @@ import { buildSupervisorApp } from '@pideck/supervisor';
 const { server } = buildSupervisorApp({
   databasePath: './data/pideck.sqlite',
   agentDefaultCwd: process.cwd(),
+  allowUnauthenticatedLoopback: true,
 });
 
 await server.listen({ host: '127.0.0.1', port: 4101 });
@@ -20,7 +21,9 @@ Call `server.close()` during shutdown. The package owns its database and PI sess
 ## Standalone process
 
 ```sh
-NEXTFLOW_SUPERVISOR_TOKEN=local-token pnpm --filter @pideck/supervisor dev
+pnpm --filter @pideck/supervisor start
 ```
+
+Loopback clients do not need a token. Set `NEXTFLOW_SUPERVISOR_TOKEN` before starting when remote clients need access.
 
 The source keeps the existing NextFlow contracts and supporting packages as local workspace dependencies. This makes piDeck self-contained instead of relying on an absolute `file:` link to the NextFlow checkout.

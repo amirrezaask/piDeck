@@ -62,9 +62,9 @@ Start the desktop app:
 pnpm dev:client
 ```
 
-The desktop app starts its built-in Supervisor on a loopback port. To run a standalone development server for another client or machine, use `pnpm dev:server`; it listens at `http://127.0.0.1:4101`. In piDeck, open **Settings → Servers**, add that address, and use the token from `NEXTFLOW_SUPERVISOR_TOKEN` in `.env`.
+The desktop app starts its built-in Supervisor on a loopback port. To run a standalone development server for browser access, use `pnpm dev:server`; it listens at `http://127.0.0.1:4101` without requiring a token. Set `NEXTFLOW_SUPERVISOR_TOKEN` when remote clients need to connect.
 
-To run Pi on another machine, start `pideck-server` there and add its HTTPS origin and token to the same settings page. Access tokens are required even for loopback requests when the server is configured with `NEXTFLOW_SUPERVISOR_TOKEN`. Plain HTTP is accepted only for exact loopback hosts (`localhost`, `127.0.0.1`, and `[::1]`); network deployments must terminate TLS and enforce host authentication in front of the service.
+To run Pi on another machine, start `pideck-server` there with `NEXTFLOW_SUPERVISOR_TOKEN` set, then add its HTTPS origin and token to the same settings page. Plain HTTP is accepted only for exact loopback hosts (`localhost`, `127.0.0.1`, and `[::1]`); network deployments must terminate TLS and enforce host authentication in front of the service.
 
 ## Development
 
@@ -94,7 +94,7 @@ pnpm lint
 pnpm format:check
 ```
 
-Vite proxies `/supervisor/*` to the local development server and supplies the development credential. Playwright uses the locally installed Google Chrome channel; install Chrome in CI or switch the project to a bundled Playwright browser.
+Vite proxies `/supervisor/*` to the configured local development server and sends an access token when one is configured. Playwright uses the locally installed Google Chrome channel; install Chrome in CI or switch the project to a bundled Playwright browser.
 
 ## Build artifacts
 
@@ -106,11 +106,18 @@ pnpm build
 
 The outputs are:
 
-- `dist/pideck-server` (`.exe` on Windows): static standalone server binary
-- `dist/electron/<app>/<app>.app/Contents/MacOS/piDeck` (macOS): static Electron executable
-- `dist/electron/make/zip/<platform>/<arch>/`: packaged Electron artifact
+- `dist/pideck-server` (`.exe` on Windows): standalone browser binary with the web client and Supervisor server embedded
+- `dist/electron/make/*.dmg` (macOS): Electron desktop installer
+- `dist/electron/make/zip/<platform>/<arch>/*.zip` (Windows/Linux): Electron desktop installer
 
-To build only the static server binary, run `pnpm build:binary`. To package the desktop app separately, run `pnpm --filter @pideck/client make`.
+Run the standalone browser build, then open its local address:
+
+```sh
+./dist/pideck-server
+# open http://127.0.0.1:4101
+```
+
+To build only the standalone browser binary, run `pnpm build:binary`. To package the desktop app separately, run `pnpm --filter @pideck/client make`.
 
 ## Embed the supervisor
 
@@ -119,10 +126,12 @@ To build only the static server binary, run `pnpm build:binary`. To package the 
 ```ts
 import { buildSupervisorApp } from '@pideck/supervisor';
 
+const serviceToken = process.env.NEXTFLOW_SUPERVISOR_TOKEN?.trim();
 const { server } = buildSupervisorApp({
   databasePath: './data/pideck.sqlite',
   agentDefaultCwd: process.cwd(),
-  serviceToken: process.env.NEXTFLOW_SUPERVISOR_TOKEN,
+  ...(serviceToken ? { serviceToken } : {}),
+  allowUnauthenticatedLoopback: !serviceToken,
 });
 
 await server.listen({ host: '127.0.0.1', port: 4101 });

@@ -20,7 +20,10 @@ module.exports = {
         }
       : {}),
   },
-  makers: [{ name: '@electron-forge/maker-zip', platforms: ['darwin', 'win32', 'linux'] }],
+  makers: [
+    { name: '@electron-forge/maker-dmg', platforms: ['darwin'] },
+    { name: '@electron-forge/maker-zip', platforms: ['win32', 'linux'] },
+  ],
   plugins: [
     {
       name: '@electron-forge/plugin-fuses',

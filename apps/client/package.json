@@ -10,20 +10,21 @@
     "dev": "pnpm --filter @pideck/web build && pnpm run build && electron .",
     "start": "electron .",
     "package": "pnpm --filter @pideck/web build && pnpm run build && electron-forge package",
-    "make": "pnpm --filter @pideck/web build && pnpm run build && electron-forge make",
-    "make:dist": "electron-forge make",
+    "make": "pnpm --filter @pideck/web build && pnpm run build && pnpm run make:dist",
+    "make:dist": "node ../../scripts/clean-electron-output.mjs && electron-forge make",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests",
     "lint": "biome check src forge.config.cjs"
   },
   "devDependencies": {
-    "@pideck/supervisor": "workspace:*",
-    "@pideck/web": "workspace:*",
     "@electron-forge/cli": "^7.11.2",
     "@electron-forge/core": "^7.11.2",
+    "@electron-forge/maker-dmg": "^7.11.2",
     "@electron-forge/maker-zip": "^7.11.2",
     "@electron-forge/plugin-fuses": "^7.11.2",
     "@electron/fuses": "^1.8.0",
+    "@pideck/supervisor": "workspace:*",
+    "@pideck/web": "workspace:*",
     "electron": "^43.4.0"
   }
 }

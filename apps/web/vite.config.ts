@@ -7,7 +7,10 @@ import { defineConfig, loadEnv } from 'vite';
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const supervisorUrl = env.VITE_SUPERVISOR_URL || 'http://127.0.0.1:4101';
-  const supervisorToken = env.NEXTFLOW_SUPERVISOR_TOKEN || 'pideck-local-dev-token';
+  const supervisorToken = env.NEXTFLOW_SUPERVISOR_TOKEN?.trim();
+  const supervisorHeaders = supervisorToken
+    ? { Authorization: `Bearer ${supervisorToken}` }
+    : {};
 
   return {
     base: './',
@@ -28,13 +31,13 @@ export default defineConfig(({ mode }) => {
           target: supervisorUrl,
           changeOrigin: true,
           ws: true,
-          headers: { Authorization: `Bearer ${supervisorToken}` },
+          headers: supervisorHeaders,
         },
         '/supervisor': {
           target: supervisorUrl,
           changeOrigin: true,
           ws: true,
-          headers: { Authorization: `Bearer ${supervisorToken}` },
+          headers: supervisorHeaders,
           rewrite: (requestPath) => requestPath.replace(/^\/supervisor/, ''),
         },
       },

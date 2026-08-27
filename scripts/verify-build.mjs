@@ -37,7 +37,17 @@ async function verifyAsarAndFuses(binary) {
 
 await assertStaticServerBinary();
 const electronOutputFiles = await findElectronArtifacts(electronOutput);
-console.log(`Verified static server binary: ${serverBinary}`);
+const expectedArtifactExtension = process.platform === 'darwin' ? '.dmg' : '.zip';
+if (
+  !electronOutputFiles.artifacts.some((artifact) =>
+    artifact.toLowerCase().endsWith(expectedArtifactExtension),
+  )
+) {
+  throw new Error(
+    `Expected Electron ${expectedArtifactExtension} artifact under ${electronOutput}`,
+  );
+}
+console.log(`Verified standalone browser binary: ${serverBinary}`);
 for (const binary of electronOutputFiles.binaries) {
   await verifyAsarAndFuses(binary);
   console.log(`Verified static Electron binary: ${binary}`);

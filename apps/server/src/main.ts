@@ -15,7 +15,6 @@ const databasePath = resolve(process.env.NEXTFLOW_DATABASE_PATH ?? './data/pidec
 const host = process.env.NEXTFLOW_SUPERVISOR_HOST ?? '127.0.0.1';
 const port = Number(process.env.NEXTFLOW_SUPERVISOR_PORT ?? 4101);
 const serviceToken = process.env.NEXTFLOW_SUPERVISOR_TOKEN?.trim();
-if (!serviceToken) throw new Error('NEXTFLOW_SUPERVISOR_TOKEN is required');
 
 mkdirSync(dirname(databasePath), { recursive: true });
 const agentDefaultCwd = process.env.NEXTFLOW_AGENT_CWD?.trim();
@@ -23,7 +22,8 @@ const piSessionDirectory = process.env.NEXTFLOW_PI_SESSION_DIR?.trim();
 const { server } = buildSupervisorApp({
   databasePath,
   logger: true,
-  serviceToken,
+  ...(serviceToken ? { serviceToken } : {}),
+  allowUnauthenticatedLoopback: !serviceToken,
   ...(agentDefaultCwd ? { agentDefaultCwd } : {}),
   ...(piSessionDirectory ? { piSessionDirectory } : {}),
 });
