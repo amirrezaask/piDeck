@@ -53,6 +53,7 @@ async function insertRun(value: Awaited<ReturnType<typeof context>>) {
       id: agentId,
       name: 'Agent',
       system_prompt: 'Test',
+      system_prompt_mode: 'append',
       cwd: value.workspace,
       tools_json: null,
       requested_model_provider: null,

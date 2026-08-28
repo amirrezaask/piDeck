@@ -1,7 +1,9 @@
 import type {
   AgentImageAttachment,
   AgentModel,
+  AgentSystemPromptMode,
   AgentThinkingLevel,
+  InboxItemResponse,
   JsonValue,
   ManagedAgentEvent,
   ManagedAgentExtension,
@@ -23,11 +25,15 @@ import {
   ChevronRightIcon,
   CircleStopIcon,
   DownloadIcon,
+  FileDiffIcon,
   FileIcon,
   FileTextIcon,
   FolderIcon,
   GitBranchIcon,
+  GitForkIcon,
   ImageIcon,
+  InboxIcon,
+  ListEndIcon,
   LoaderCircleIcon,
   MoonIcon,
   PanelLeftCloseIcon,
@@ -36,12 +42,10 @@ import {
   PencilIcon,
   PlusIcon,
   PuzzleIcon,
+  RouteIcon,
   SearchIcon,
   ServerIcon,
   SettingsIcon,
-  SparklesIcon,
-  GitForkIcon,
-  FileDiffIcon,
   SquareTerminalIcon,
   SunIcon,
   Trash2Icon,
@@ -62,16 +66,13 @@ import {
 } from 'react';
 
 import { ComposerInput } from '@/components/composer-input';
+import { MarkdownContent } from '@/components/markdown-content';
 import {
   ChangesPanel,
   CommandPalette,
-  FleetOverview,
-  InboxView,
-  TerminalPanel,
-  WorktreeManager,
   type ServerOperationsClient,
+  TerminalPanel,
 } from '@/components/operations';
-import { MarkdownContent } from '@/components/markdown-content';
 import {
   Accordion,
   AccordionContent,
@@ -119,7 +120,15 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty';
-import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+  FieldLegend,
+  FieldSet,
+} from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Marker, MarkerContent } from '@/components/ui/marker';
 import { Message, MessageContent, MessageFooter, MessageHeader } from '@/components/ui/message';
@@ -141,10 +150,15 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
+import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { activitySince, readCheckedActivity, writeCheckedActivity } from '@/lib/activity-state';
 import { ApiError } from '@/lib/api-error';
+import { useComposerDraft } from '@/lib/composer-draft';
+import { LruCache } from '@/lib/lru';
 import {
   type ServerConnectionManager,
   type ServerDefinition,
@@ -152,6 +166,16 @@ import {
   serverConnectionManager,
 } from '@/lib/server-connections';
 import { AVAILABLE_SKILLS } from '@/lib/skills';
+import {
+  beginSubmission,
+  completeSubmission,
+  isUncertainSubmissionError,
+  markSubmissionFailed,
+  markSubmissionUncertain,
+  readSubmissions,
+  rememberSubmissionReceipt,
+  type SubmissionRecord,
+} from '@/lib/submissions';
 import {
   modelDisplayName,
   type StreamConnectionState,
@@ -166,21 +190,17 @@ import {
   TRANSCRIPT_EVENT_WINDOW,
   type TranscriptEvent,
 } from '@/lib/transcript';
-import { LruCache } from '@/lib/lru';
-import {
-  beginSubmission,
-  completeSubmission,
-  isUncertainSubmissionError,
-  markSubmissionFailed,
-  markSubmissionUncertain,
-  readSubmissions,
-  rememberSubmissionReceipt,
-  type SubmissionRecord,
-} from '@/lib/submissions';
 import { cn } from '@/lib/utils';
 
 const DEFAULT_AGENT_INSTRUCTIONS =
   'Inspect the workspace carefully, explain consequential decisions, and verify your work before finishing.';
+
+interface AgentEditorSettings {
+  readonly name: string;
+  readonly systemPrompt: string;
+  readonly systemPromptMode: AgentSystemPromptMode;
+  readonly toolCallsEnabled: boolean;
+}
 const THINKING_LEVELS: readonly AgentThinkingLevel[] = [
   'off',
   'minimal',
@@ -219,12 +239,14 @@ const SIDEBAR_STORAGE_KEY = 'pideck-sidebar-collapsed';
 const ARCHIVED_RUNS_STORAGE_KEY = 'pideck-archived-runs';
 const RUN_ATTACHMENT_CACHE_LIMIT = 24;
 const LATEST_TRANSCRIPT_PAGE_SIZE = 500;
+const MAX_COMPOSER_CHARACTERS = 1_000_000;
+const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_IMAGE_ATTACHMENT_BYTES = 6_000_000;
+const SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const IMAGE_INPUT_ACCEPT = [...SUPPORTED_IMAGE_MIME_TYPES].join(',');
 
 type AppRoute =
   | { kind: 'default' }
-  | { kind: 'fleet' }
-  | { kind: 'inbox' }
-  | { kind: 'worktrees' }
   | { kind: 'new' }
   | { kind: 'session'; serverId?: string; runId: string };
 
@@ -276,9 +298,6 @@ function readAppRoute(): AppRoute {
     }
   }
 
-  if (window.location.pathname === '/fleet') return { kind: 'fleet' };
-  if (window.location.pathname === '/inbox') return { kind: 'inbox' };
-  if (window.location.pathname === '/worktrees') return { kind: 'worktrees' };
   return window.location.pathname === '/new' ? { kind: 'new' } : { kind: 'default' };
 }
 
@@ -292,13 +311,7 @@ function writeAppRoute(route: AppRoute, replace = false) {
         : `/sessions/${encodeURIComponent(route.runId)}`
       : route.kind === 'new'
         ? '/new'
-        : route.kind === 'fleet'
-          ? '/fleet'
-          : route.kind === 'inbox'
-            ? '/inbox'
-            : route.kind === 'worktrees'
-              ? '/worktrees'
-              : '/';
+        : '/';
   if (window.location.pathname === path) return;
 
   const method = replace ? 'replaceState' : 'pushState';
@@ -615,7 +628,6 @@ export default function App({
   );
   const [client, setClient] = useState<SupervisorClientApi>(injectedClient ?? supervisorClient);
   const [initialRoute] = useState(readAppRoute);
-  const [route, setRoute] = useState<AppRoute>(initialRoute);
   const initialRouteRef = useRef(initialRoute);
   const [servers, setServers] = useState<ServerDefinition[]>(() =>
     injectedClient ? [fallbackServer] : [],
@@ -656,7 +668,9 @@ export default function App({
   const [connectionState, setConnectionState] = useState<StreamConnectionState>('stale');
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string>();
-  const [attentionCount, setAttentionCount] = useState(0);
+  const [checkedActivity, setCheckedActivity] = useState(readCheckedActivity);
+  const [inboxBySession, setInboxBySession] = useState<Record<string, InboxItemResponse[]>>({});
+  const agentCommandLockRef = useRef(false);
 
   const sessions = useMemo<ServerSession[]>(
     () =>
@@ -688,6 +702,18 @@ export default function App({
   const activeServer = servers.find((server) => server.id === activeServerId);
   const selectedSessionKey =
     activeServerId && selectedRunId ? sessionKey(activeServerId, selectedRunId) : undefined;
+  const uncheckedSessionCount = useMemo(
+    () =>
+      visibleSessions.filter((session) => {
+        const key = sessionKey(session.serverId, session.run.id);
+        return (
+          key !== selectedSessionKey &&
+          (activitySince(session.run.latestEventSequence, checkedActivity[key] ?? 0) > 0 ||
+            (inboxBySession[key]?.length ?? 0) > 0)
+        );
+      }).length,
+    [checkedActivity, inboxBySession, selectedSessionKey, visibleSessions],
+  );
   const transcript = useMemo(() => mapPiEvents(events), [events]);
   const runIsActive = run?.status === 'queued' || run?.status === 'running';
   const operationsServers = useMemo<ServerOperationsClient[]>(
@@ -700,11 +726,7 @@ export default function App({
     [snapshots],
   );
   const workspaceTabValue =
-    activeServerId && selectedRunId
-      ? sessionKey(activeServerId, selectedRunId)
-      : route.kind === 'default'
-        ? 'new'
-        : route.kind;
+    activeServerId && selectedRunId ? sessionKey(activeServerId, selectedRunId) : 'new';
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
@@ -745,9 +767,12 @@ export default function App({
   }, [archivedRunIds]);
 
   useEffect(() => {
+    writeCheckedActivity(checkedActivity);
+  }, [checkedActivity]);
+
+  useEffect(() => {
     const handlePopState = () => {
       const route = readAppRoute();
-      setRoute(route);
       if (route.kind !== 'session') {
         setSelectedRunId(undefined);
         return;
@@ -883,7 +908,6 @@ export default function App({
               serverId: targetSnapshot.server.id,
               runId: nextRunId,
             } as const;
-            setRoute(nextRoute);
             writeAppRoute(nextRoute, true);
           }
         }
@@ -900,56 +924,111 @@ export default function App({
 
   useEffect(() => {
     let active = true;
-    const refresh = () => {
+    let timer: number | undefined;
+
+    const schedule = (delay: number) => {
+      if (!active) return;
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(() => void refresh(), delay);
+    };
+
+    const refresh = async () => {
+      if (!active) return;
+      if (document.hidden || window.navigator.onLine === false) {
+        schedule(document.hidden ? 30_000 : 10_000);
+        return;
+      }
       const currentSnapshots = Object.values(snapshotsRef.current);
-      if (currentSnapshots.length === 0) return;
-      void Promise.allSettled(
+      if (currentSnapshots.length === 0) {
+        schedule(5_000);
+        return;
+      }
+
+      const results = await Promise.all(
         currentSnapshots.map(async (snapshot) => {
-          const [runPage, inbox] = await Promise.all([
+          const [runPage, inbox] = await Promise.allSettled([
             snapshot.client.listRuns({ limit: 100 }),
             snapshot.client.listInbox(),
           ]);
           return { snapshot, runPage, inbox };
         }),
-      ).then((results) => {
-        if (!active) return;
-        let attention = 0;
-        const nextSnapshots = { ...snapshotsRef.current };
-        for (const result of results) {
-          if (result.status === 'rejected') {
-            attention += 1;
-            continue;
-          }
-          const { snapshot, runPage, inbox } = result.value;
-          const nextRuns = mergeRuns(runPage.runs, snapshot.runs);
-          attention +=
-            nextRuns.filter((candidate) => candidate.status === 'failed').length +
-            inbox.items.filter((item) => item.status === 'pending').length;
-          nextSnapshots[snapshot.server.id] = {
-            ...snapshot,
-            runs: nextRuns,
-            resources: {
-              ...snapshot.resources,
-              runs: { status: 'live', checkedAt: new Date().toISOString() },
-            },
-          };
-          if (snapshot.server.id === activeServerId) setRuns(nextRuns);
+      );
+      if (!active) return;
+
+      let failures = 0;
+      const refreshedInbox: Array<{ serverId: string; items: InboxItemResponse[] }> = [];
+      const nextSnapshots = { ...snapshotsRef.current };
+      for (const { snapshot, runPage, inbox } of results) {
+        if (runPage.status === 'rejected' || inbox.status === 'rejected') failures += 1;
+        const nextRuns =
+          runPage.status === 'fulfilled'
+            ? mergeRuns(runPage.value.runs, snapshot.runs)
+            : snapshot.runs;
+        if (inbox.status === 'fulfilled') {
+          refreshedInbox.push({
+            serverId: snapshot.server.id,
+            items: inbox.value.items.filter((item) => item.status === 'pending'),
+          });
         }
-        snapshotsRef.current = nextSnapshots;
-        setSnapshots(nextSnapshots);
-        setAttentionCount(attention);
+        nextSnapshots[snapshot.server.id] = {
+          ...snapshot,
+          runs: nextRuns,
+          resources: {
+            ...snapshot.resources,
+            runs:
+              runPage.status === 'fulfilled'
+                ? { status: 'live', checkedAt: new Date().toISOString() }
+                : {
+                    status: 'stale',
+                    checkedAt: new Date().toISOString(),
+                    error: errorMessage(runPage.reason),
+                  },
+          },
+        };
+        if (snapshot.server.id === activeServerId) setRuns(nextRuns);
+      }
+      snapshotsRef.current = nextSnapshots;
+      setSnapshots(nextSnapshots);
+      setInboxBySession((current) => {
+        const next = { ...current };
+        for (const { serverId, items } of refreshedInbox) {
+          for (const key of Object.keys(next)) {
+            if (key.startsWith(`${serverId}:`)) delete next[key];
+          }
+          for (const item of items) {
+            if (!item.runId) continue;
+            const key = sessionKey(serverId, item.runId);
+            next[key] = [...(next[key] ?? []), item];
+          }
+        }
+        return next;
       });
+      schedule(failures > 0 ? 8_000 : 4_000);
     };
-    const interval = window.setInterval(refresh, 3_000);
+
+    const handleVisibility = () => schedule(document.hidden ? 30_000 : 0);
+    document.addEventListener('visibilitychange', handleVisibility);
+    schedule(0);
     return () => {
       active = false;
-      window.clearInterval(interval);
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [activeServerId, servers]);
 
   useEffect(() => {
-    document.title = attentionCount > 0 ? `(${attentionCount}) piDeck` : 'piDeck';
-  }, [attentionCount]);
+    document.title = uncheckedSessionCount > 0 ? `(${uncheckedSessionCount}) piDeck` : 'piDeck';
+  }, [uncheckedSessionCount]);
+
+  useEffect(() => {
+    if (!selectedSessionKey || !run) return;
+    const latestSequence = Math.max(run.latestEventSequence ?? 0, events.at(-1)?.sequence ?? 0);
+    setCheckedActivity((current) =>
+      (current[selectedSessionKey] ?? 0) >= latestSequence
+        ? current
+        : { ...current, [selectedSessionKey]: latestSequence },
+    );
+  }, [events, run, selectedSessionKey]);
 
   useEffect(() => {
     if (!activeServerId || !snapshotsRef.current[activeServerId]) return;
@@ -1034,6 +1113,30 @@ export default function App({
     const controller = new AbortController();
     let active = true;
     let lastSequence = 0;
+    let flushTimer: number | undefined;
+    let pendingEvents: ManagedAgentEvent[] = [];
+    const flushPendingEvents = () => {
+      if (flushTimer !== undefined) window.clearTimeout(flushTimer);
+      flushTimer = undefined;
+      if (!active || pendingEvents.length === 0) return;
+      const batch = pendingEvents;
+      pendingEvents = [];
+      setEvents((current) =>
+        mergeTranscriptEvents(
+          current,
+          batch,
+          historyExpandedRef.current ? current.length + batch.length : TRANSCRIPT_EVENT_WINDOW,
+        ),
+      );
+    };
+    const queueEvent = (event: ManagedAgentEvent) => {
+      pendingEvents.push(event);
+      if (pendingEvents.length >= 50) {
+        flushPendingEvents();
+      } else if (flushTimer === undefined) {
+        flushTimer = window.setTimeout(flushPendingEvents, 16);
+      }
+    };
     setEvents([]);
     setHasOlderEvents(false);
     historyExpandedRef.current = false;
@@ -1082,13 +1185,7 @@ export default function App({
         })) {
           if (!active) return;
           lastSequence = Math.max(lastSequence, event.sequence);
-          setEvents((current) =>
-            mergeTranscriptEvents(
-              current,
-              [event],
-              historyExpandedRef.current ? current.length + 1 : TRANSCRIPT_EVENT_WINDOW,
-            ),
-          );
+          queueEvent(event);
         }
       } catch (reason) {
         if (active && !controller.signal.aborted) setError(errorMessage(reason));
@@ -1098,6 +1195,8 @@ export default function App({
     return () => {
       active = false;
       controller.abort();
+      if (flushTimer !== undefined) window.clearTimeout(flushTimer);
+      pendingEvents = [];
     };
   }, [client, run?.id]);
 
@@ -1128,21 +1227,6 @@ export default function App({
       setLoadingOlderEvents(false);
     }
   }, [client, events, hasOlderEvents, loadingOlderEvents, run?.id]);
-
-  useEffect(() => {
-    if (!runIsActive || !run) return;
-    const interval = window.setInterval(() => {
-      void client
-        .getRun(run.id)
-        .then((nextRun) => {
-          setRuns((current) =>
-            current.map((candidate) => (candidate.id === nextRun.id ? nextRun : candidate)),
-          );
-        })
-        .catch(() => undefined);
-    }, 1_000);
-    return () => window.clearInterval(interval);
-  }, [client, run, runIsActive]);
 
   function activateSnapshot(snapshot: ServerSnapshot, runId?: string) {
     setActiveServerId(snapshot.server.id);
@@ -1204,15 +1288,19 @@ export default function App({
     const snapshot = snapshotsRef.current[serverId];
     if (!snapshot) return;
     activateSnapshot(snapshot);
-    setRoute({ kind: 'new' });
     writeAppRoute({ kind: 'new' });
   }
 
-  async function createAgent(name: string, systemPrompt: string) {
+  async function createAgent(settings: AgentEditorSettings) {
     setSubmitting(true);
     setError(undefined);
     try {
-      const agent = await client.createAgent({ name, systemPrompt });
+      const agent = await client.createAgent({
+        name: settings.name,
+        systemPrompt: settings.systemPrompt,
+        systemPromptMode: settings.systemPromptMode,
+        ...(settings.toolCallsEnabled ? {} : { tools: [] }),
+      });
       setAgents((current) => [agent, ...current]);
       return agent;
     } catch (reason) {
@@ -1223,11 +1311,16 @@ export default function App({
     }
   }
 
-  async function updateAgent(agentId: string, name: string, systemPrompt: string) {
+  async function updateAgent(agentId: string, settings: AgentEditorSettings) {
     setSubmitting(true);
     setError(undefined);
     try {
-      const agent = await client.renameAgent(agentId, { name, systemPrompt });
+      const agent = await client.renameAgent(agentId, {
+        name: settings.name,
+        systemPrompt: settings.systemPrompt,
+        systemPromptMode: settings.systemPromptMode,
+        tools: settings.toolCallsEnabled ? null : [],
+      });
       setAgents((current) =>
         current.map((candidate) => (candidate.id === agent.id ? agent : candidate)),
       );
@@ -1261,6 +1354,10 @@ export default function App({
     executionMode?: 'local' | 'worktree';
     worktreeId?: string;
   }) {
+    if (agentCommandLockRef.current) {
+      throw new Error('Another Pi command is being submitted. Wait for its acknowledgement.');
+    }
+    agentCommandLockRef.current = true;
     setSubmitting(true);
     setError(undefined);
     let submission: SubmissionRecord | undefined;
@@ -1295,7 +1392,6 @@ export default function App({
       if (activeServerId) {
         setSelectedRunId(nextRun.id);
         const nextRoute = { kind: 'session' as const, serverId: activeServerId, runId: nextRun.id };
-        setRoute(nextRoute);
         writeAppRoute(nextRoute);
       }
       setEvents([]);
@@ -1310,6 +1406,7 @@ export default function App({
       setError(errorMessage(reason));
       throw reason;
     } finally {
+      agentCommandLockRef.current = false;
       setSubmitting(false);
     }
   }
@@ -1372,6 +1469,11 @@ export default function App({
 
   async function cancelRun() {
     if (!run) return;
+    if (agentCommandLockRef.current) {
+      setError('Another Pi command is waiting for acknowledgement. Cancel again after it settles.');
+      return;
+    }
+    agentCommandLockRef.current = true;
     setSubmitting(true);
     let submission: SubmissionRecord | undefined;
     try {
@@ -1389,12 +1491,17 @@ export default function App({
       }
       setError(errorMessage(reason));
     } finally {
+      agentCommandLockRef.current = false;
       setSubmitting(false);
     }
   }
 
   async function steerRun(message: string, attachments?: AgentImageAttachment[]) {
     if (!run) return;
+    if (agentCommandLockRef.current) {
+      throw new Error('Another Pi command is being submitted. Wait for its acknowledgement.');
+    }
+    agentCommandLockRef.current = true;
     setSubmitting(true);
     setError(undefined);
     let submission: SubmissionRecord | undefined;
@@ -1424,12 +1531,17 @@ export default function App({
       setError(errorMessage(reason));
       throw reason;
     } finally {
+      agentCommandLockRef.current = false;
       setSubmitting(false);
     }
   }
 
   async function followUpRun(message: string, attachments?: AgentImageAttachment[]) {
     if (!run) return;
+    if (agentCommandLockRef.current) {
+      throw new Error('Another Pi command is being submitted. Wait for its acknowledgement.');
+    }
+    agentCommandLockRef.current = true;
     setSubmitting(true);
     setError(undefined);
     let submission: SubmissionRecord | undefined;
@@ -1459,35 +1571,58 @@ export default function App({
       setError(errorMessage(reason));
       throw reason;
     } finally {
+      agentCommandLockRef.current = false;
       setSubmitting(false);
     }
+  }
+
+  function markSessionChecked(serverId: string, runId: string, observedSequence = 0) {
+    const key = sessionKey(serverId, runId);
+    const latestSequence = Math.max(
+      observedSequence,
+      snapshotsRef.current[serverId]?.runs.find((candidate) => candidate.id === runId)
+        ?.latestEventSequence ?? 0,
+    );
+    setCheckedActivity((current) =>
+      (current[key] ?? 0) >= latestSequence ? current : { ...current, [key]: latestSequence },
+    );
+  }
+
+  function handleInboxItem(sessionId: string, itemId: string) {
+    setInboxBySession((current) => {
+      const remaining = (current[sessionId] ?? []).filter((item) => item.id !== itemId);
+      if (remaining.length === (current[sessionId]?.length ?? 0)) return current;
+      const next = { ...current };
+      if (remaining.length > 0) next[sessionId] = remaining;
+      else delete next[sessionId];
+      return next;
+    });
   }
 
   function openRun(serverId: string, runId: string) {
     const snapshot = snapshotsRef.current[serverId];
     if (!snapshot) return;
+    if (activeServerId && selectedRunId) {
+      markSessionChecked(activeServerId, selectedRunId, events.at(-1)?.sequence);
+    }
+    const target = snapshot.runs.find((candidate) => candidate.id === runId);
+    markSessionChecked(serverId, runId, target?.latestEventSequence);
     activateSnapshot(snapshot, runId);
     const nextRoute = {
       kind: 'session' as const,
       serverId: injectedClient ? undefined : serverId,
       runId,
     };
-    setRoute(nextRoute);
     writeAppRoute(nextRoute);
   }
 
   function openNewSession() {
+    if (activeServerId && selectedRunId) {
+      markSessionChecked(activeServerId, selectedRunId, events.at(-1)?.sequence);
+    }
     setSelectedRunId(undefined);
     setEvents([]);
-    setRoute({ kind: 'new' });
     writeAppRoute({ kind: 'new' });
-  }
-
-  function openWorkspaceRoute(kind: 'fleet' | 'inbox' | 'worktrees') {
-    setSelectedRunId(undefined);
-    setEvents([]);
-    setRoute({ kind });
-    writeAppRoute({ kind });
   }
 
   function restoreRun(serverId: string, runId: string) {
@@ -1569,8 +1704,8 @@ export default function App({
                 >
                   <motion.div
                     className={cn(
-                      'flex w-full items-center justify-end gap-1 px-4 py-3 md:py-4',
-                      sidebarCollapsed && 'flex-col items-center gap-2 px-2 py-3',
+                      'flex min-h-12 w-full items-center gap-1.5 px-2.5 py-2',
+                      sidebarCollapsed && 'md:flex-col md:gap-2 md:px-2 md:py-3',
                     )}
                     initial={{ opacity: 0, y: -8 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -1583,9 +1718,38 @@ export default function App({
                     <Button
                       type="button"
                       variant="ghost"
-                      size="icon"
-                      aria-label="New session"
+                      size={sidebarCollapsed ? 'icon' : 'default'}
+                      className={cn(
+                        'mr-auto min-w-0 justify-start gap-2 px-1.5 font-semibold tracking-tight',
+                        sidebarCollapsed && 'md:mr-0 md:justify-center md:px-0',
+                      )}
+                      aria-label="piDeck — New session"
                       title="New session"
+                      onClick={openNewSession}
+                    >
+                      <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+                        <PiIcon className="size-4" />
+                      </span>
+                      <span className={cn('truncate', sidebarCollapsed && 'md:hidden')}>
+                        piDeck
+                      </span>
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Search and commands"
+                      title="Search and commands (⌘K)"
+                      onClick={() => setPaletteOpen(true)}
+                    >
+                      <SearchIcon aria-hidden="true" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="New session"
+                      title="New session (⌘N)"
                       onClick={openNewSession}
                     >
                       <PlusIcon aria-hidden="true" />
@@ -1593,7 +1757,18 @@ export default function App({
                     <Button
                       type="button"
                       variant="ghost"
-                      size="icon"
+                      size="icon-sm"
+                      className="md:hidden"
+                      aria-label="Open settings"
+                      onClick={() => setSettingsOpen(true)}
+                    >
+                      <SettingsIcon aria-hidden="true" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      className="hidden md:inline-flex"
                       aria-expanded={!sidebarCollapsed}
                       aria-controls="sidebar-sessions"
                       aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
@@ -1603,10 +1778,20 @@ export default function App({
                       {sidebarCollapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
                     </Button>
                   </motion.div>
+                  {!sidebarCollapsed ? (
+                    <div className="hidden items-center justify-between px-3 pb-1 pt-1 md:flex">
+                      <span className="text-[0.7rem] font-medium text-muted-foreground">
+                        Sessions
+                      </span>
+                      <span className="text-[0.65rem] tabular-nums text-muted-foreground">
+                        {visibleSessions.length}
+                      </span>
+                    </div>
+                  ) : null}
                   <nav
                     id="sidebar-sessions"
                     className={cn(
-                      'flex min-w-0 flex-1 gap-1 overflow-x-auto p-2 md:flex-col md:overflow-y-auto',
+                      'hidden min-w-0 flex-1 gap-1 overflow-y-auto p-2 md:flex md:flex-col',
                       sidebarCollapsed && 'items-center',
                     )}
                     aria-label="Sessions"
@@ -1637,6 +1822,18 @@ export default function App({
                           const agent = sessionAgents.find((item) => item.id === candidate.agentId);
                           const selected =
                             session.serverId === activeServerId && candidate.id === selectedRunId;
+                          const candidateKey = sessionKey(session.serverId, candidate.id);
+                          const pendingRequests = inboxBySession[candidateKey]?.length ?? 0;
+                          const uncheckedEvents = selected
+                            ? 0
+                            : activitySince(
+                                candidate.latestEventSequence,
+                                checkedActivity[candidateKey] ?? 0,
+                              );
+                          const notificationCount = pendingRequests || uncheckedEvents;
+                          const notificationLabel = pendingRequests
+                            ? `${pendingRequests} response${pendingRequests === 1 ? '' : 's'} needed`
+                            : `${uncheckedEvents} unchecked event${uncheckedEvents === 1 ? '' : 's'}`;
                           const modelName = modelDisplayName(candidate.model, sessionModels);
                           const thinkingLabel = candidate.thinkingLevel
                             ? titleCase(candidate.thinkingLevel)
@@ -1699,9 +1896,23 @@ export default function App({
                                                 model={candidate.model}
                                                 models={sessionModels}
                                               />
-                                              <span className="absolute -top-1 -right-1">
-                                                <RunDot status={candidate.status} />
-                                              </span>
+                                              {notificationCount > 0 ? (
+                                                <Badge
+                                                  variant={
+                                                    pendingRequests ? 'destructive' : 'default'
+                                                  }
+                                                  className="absolute -top-2 -right-2 h-4 min-w-4 px-1 text-[0.6rem] leading-4 tabular-nums"
+                                                  aria-label={notificationLabel}
+                                                >
+                                                  {notificationCount > 99
+                                                    ? '99+'
+                                                    : notificationCount}
+                                                </Badge>
+                                              ) : (
+                                                <span className="absolute -top-1 -right-1">
+                                                  <RunDot status={candidate.status} />
+                                                </span>
+                                              )}
                                             </span>
                                           ) : (
                                             <SessionAvatar
@@ -1724,8 +1935,23 @@ export default function App({
                                                   {server?.name ?? 'Server'} · {projectLabel}
                                                 </span>
                                               </span>
-                                              <span className="w-full truncate text-sm font-semibold leading-5 tracking-tight text-foreground">
-                                                {sessionTitle(candidate.prompt)}
+                                              <span className="flex w-full min-w-0 items-center gap-2">
+                                                <span className="min-w-0 flex-1 truncate text-sm font-semibold leading-5 tracking-tight text-foreground">
+                                                  {sessionTitle(candidate.prompt)}
+                                                </span>
+                                                {notificationCount > 0 ? (
+                                                  <Badge
+                                                    variant={
+                                                      pendingRequests ? 'destructive' : 'secondary'
+                                                    }
+                                                    className="h-5 min-w-5 justify-center px-1.5 text-[0.65rem] tabular-nums"
+                                                    aria-label={notificationLabel}
+                                                  >
+                                                    {notificationCount > 99
+                                                      ? '99+'
+                                                      : notificationCount}
+                                                  </Badge>
+                                                ) : null}
                                               </span>
                                               <span className="flex w-full min-w-0 items-center gap-1.5 pt-0.5 text-[0.68rem] font-normal leading-4 text-muted-foreground">
                                                 <GitBranchIcon
@@ -1811,9 +2037,9 @@ export default function App({
                       <p className="px-4 pb-2 text-xs text-destructive">{historyError}</p>
                     ) : null}
                   </nav>
-                  <Separator />
+                  <Separator className="hidden md:block" />
                   <motion.div
-                    className="p-2"
+                    className="hidden p-2 md:block"
                     initial={{ opacity: 0, y: 8 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ duration: 0.17, delay: 0.14 }}
@@ -1914,9 +2140,21 @@ export default function App({
                         exit={{ opacity: 0, y: -8, scale: 0.98 }}
                         transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
                       >
-                        <Alert variant="destructive" className="m-4 mb-0 w-auto">
-                          <AlertTitle>Supervisor request failed</AlertTitle>
-                          <AlertDescription>{error}</AlertDescription>
+                        <Alert variant="destructive" className="m-4 mb-0 w-auto pr-12">
+                          <AlertTitle>Request not completed</AlertTitle>
+                          <AlertDescription className="whitespace-pre-line">
+                            {error}
+                          </AlertDescription>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            className="absolute top-2.5 right-2.5"
+                            aria-label="Dismiss error"
+                            onClick={() => setError(undefined)}
+                          >
+                            <XIcon aria-hidden="true" />
+                          </Button>
                         </Alert>
                       </motion.div>
                     ) : null}
@@ -1925,14 +2163,6 @@ export default function App({
                   <AnimatePresence initial={false} mode="wait">
                     {loading ? (
                       <LoadingState key="loading" />
-                    ) : route.kind === 'fleet' ? (
-                      <FleetOverview key="fleet" servers={operationsServers} onOpenRun={openRun} />
-                    ) : route.kind === 'inbox' ? (
-                      <InboxView key="inbox" servers={operationsServers} />
-                    ) : route.kind === 'worktrees' ? (
-                      <div key="worktrees" className="min-h-0 flex-1 overflow-y-auto">
-                        <WorktreeManager client={client} projects={projects} />
-                      </div>
                     ) : run ? (
                       <motion.div
                         key={`conversation-${run.id}`}
@@ -1960,6 +2190,12 @@ export default function App({
                           submitting={submitting}
                           runIsActive={runIsActive}
                           connectionState={connectionState}
+                          inboxItems={
+                            selectedSessionKey ? (inboxBySession[selectedSessionKey] ?? []) : []
+                          }
+                          onInboxHandled={(itemId) => {
+                            if (selectedSessionKey) handleInboxItem(selectedSessionKey, itemId);
+                          }}
                           onCancel={cancelRun}
                           onSteer={steerRun}
                           onSendMessage={followUpRun}
@@ -1975,6 +2211,7 @@ export default function App({
                         transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
                       >
                         <NewSession
+                          key={`new-session-${activeServerId ?? 'unassigned'}`}
                           client={client}
                           servers={servers}
                           serverId={activeServerId}
@@ -2001,10 +2238,6 @@ export default function App({
               open={paletteOpen}
               onOpenChange={setPaletteOpen}
               servers={operationsServers}
-              onFleet={() => openWorkspaceRoute('fleet')}
-              onInbox={() => openWorkspaceRoute('inbox')}
-              onNew={openNewSession}
-              onSettings={() => setSettingsOpen(true)}
               onOpenRun={openRun}
             />
 
@@ -2241,7 +2474,8 @@ function NewSession({
   onServerChange(serverId: string): void;
   onOpenAgents(): void;
 }) {
-  const [prompt, setPrompt] = useState('');
+  const draftId = `new-session:${serverId ?? 'unassigned'}`;
+  const [prompt, setPrompt, clearPromptDraft] = useComposerDraft(draftId);
   const [agentId, setAgentId] = useState(agents[0]?.id ?? '');
   const [modelKey, setModelKey] = useState(() =>
     models?.defaultModel ? encodeModel(models.defaultModel) : '',
@@ -2258,6 +2492,7 @@ function NewSession({
   const dragDepthRef = useRef(0);
   const attachmentSequenceRef = useRef(0);
   const attachmentsRef = useRef(attachments);
+  const sendInFlightRef = useRef(false);
 
   useEffect(() => {
     attachmentsRef.current = attachments;
@@ -2279,7 +2514,14 @@ function NewSession({
   }, []);
 
   function addFiles(fileList: FileList | File[]) {
-    const nextAttachments = Array.from(fileList).map((file) => ({
+    const files = Array.from(fileList);
+    const validationError = imageAttachmentValidationError([
+      ...attachments.map((attachment) => attachment.file),
+      ...files,
+    ]);
+    setAttachmentError(validationError);
+    if (validationError) return;
+    const nextAttachments = files.map((file) => ({
       id: `attachment-${attachmentSequenceRef.current++}`,
       file,
       previewUrl: createAttachmentPreview(file),
@@ -2334,21 +2576,11 @@ function NewSession({
 
   async function prepareImageAttachments(): Promise<AgentImageAttachment[] | undefined> {
     if (attachments.length === 0) return undefined;
-    const unsupported = attachments.filter(
-      (attachment) =>
-        !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(attachment.file.type),
+    const validationError = imageAttachmentValidationError(
+      attachments.map((attachment) => attachment.file),
     );
-    if (unsupported.length > 0) {
-      setAttachmentError(
-        'Only PNG, JPEG, GIF, and WebP images can be sent to Pi. Remove other files first.',
-      );
-      return undefined;
-    }
-    if (
-      attachments.length > 4 ||
-      attachments.some((attachment) => attachment.file.size > 6_000_000)
-    ) {
-      setAttachmentError('Use at most four images, each smaller than 6 MB.');
+    if (validationError) {
+      setAttachmentError(validationError);
       return undefined;
     }
     return Promise.all(
@@ -2375,7 +2607,16 @@ function NewSession({
   async function submit(event: FormEvent) {
     event.preventDefault();
     const value = prompt.trim();
-    if ((!value && attachments.length === 0) || !agentId || !cwd.trim() || submitting) return;
+    if (
+      (!value && attachments.length === 0) ||
+      !agentId ||
+      !cwd.trim() ||
+      submitting ||
+      sendInFlightRef.current
+    ) {
+      return;
+    }
+    sendInFlightRef.current = true;
     try {
       const imageAttachments = await prepareImageAttachments();
       if (attachments.length > 0 && !imageAttachments) return;
@@ -2390,11 +2631,13 @@ function NewSession({
         ...(imageAttachments ? { attachments: imageAttachments } : {}),
         ...(executionMode === 'worktree' ? { executionMode, worktreeId } : {}),
       });
-      setPrompt('');
+      clearPromptDraft();
       setAttachmentError(undefined);
       clearAttachments();
     } catch {
       // Keep the draft and attachments visible while the app-level error explains what failed.
+    } finally {
+      sendInFlightRef.current = false;
     }
   }
 
@@ -2489,23 +2732,77 @@ function NewSession({
         <h1 className="text-sm font-semibold">New session</h1>
       </motion.header>
       <div className="flex flex-1 justify-center overflow-y-auto px-4 py-8 md:px-8 md:py-14">
-        <div className="w-full max-w-3xl">
+        <div className="w-full max-w-4xl">
           <motion.div
             className="mb-7"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.2, delay: 0.04 }}
           >
-            <h2 className="max-w-xl text-balance text-2xl font-semibold tracking-tight md:text-3xl">
+            <h2 className="max-w-xl text-balance text-2xl font-semibold tracking-tight">
               What should Pi work on?
             </h2>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
               Choose a workspace, describe the outcome, and let the run continue in the background.
             </p>
           </motion.div>
+          <div
+            className="mb-2 flex min-w-0 items-center gap-1 overflow-x-auto px-1 [scrollbar-width:none]"
+            aria-label="Run context"
+          >
+            <Select value={serverId} onValueChange={onServerChange}>
+              <SelectTrigger
+                aria-label="Server"
+                size="sm"
+                className="max-w-40 shrink-0 border-0 bg-transparent shadow-none"
+              >
+                <ServerIcon />
+                <SelectValue placeholder="Choose server" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {servers.map((server) => (
+                    <SelectItem key={server.id} value={server.id}>
+                      {server.name}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <span className="text-muted-foreground" aria-hidden="true">
+              /
+            </span>
+            <ProjectPicker
+              projects={projects}
+              path={cwd}
+              onPathChange={setCwd}
+              onDeleteProject={onDeleteProject}
+              disabled={submitting}
+            />
+            <Separator orientation="vertical" className="h-4 shrink-0" />
+            <Select value={agentId} onValueChange={setAgentId}>
+              <SelectTrigger
+                aria-label="Agent profile"
+                size="sm"
+                className="max-w-44 shrink-0 border-0 bg-transparent shadow-none"
+              >
+                <BotIcon />
+                <SelectValue placeholder="Choose agent" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {agents.map((agent) => (
+                    <SelectItem key={agent.id} value={agent.id}>
+                      {agent.name}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
           <motion.form
             aria-label="New session composer"
-            className="group/composer relative w-full overflow-hidden rounded-2xl border border-border/80 bg-card transition-[border-color,background-color] focus-within:border-foreground/30"
+            className="group/composer relative w-full overflow-hidden rounded-[1.75rem] border border-border/70 bg-card transition-colors focus-within:border-foreground/25"
             initial={{ opacity: 0, y: 18, scale: 0.985 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             transition={{ duration: 0.18, delay: 0.03, ease: [0.22, 1, 0.36, 1] }}
@@ -2525,9 +2822,9 @@ function NewSession({
                   exit={{ opacity: 0, scale: 0.98 }}
                 >
                   <div>
-                    <p className="font-medium">Drop files to attach</p>
+                    <p className="font-medium">Drop images to attach</p>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      Images and other file types are supported
+                      PNG, JPEG, GIF, or WebP · up to 4 images, 6 MB each
                     </p>
                   </div>
                 </motion.div>
@@ -2535,13 +2832,14 @@ function NewSession({
             </AnimatePresence>
             <ComposerInput
               ariaLabel="Session task"
-              placeholder="Ask Pi to inspect, build, fix, or explain…"
+              placeholder="Ask anything, @mention files, or type / for Pi commands"
               value={prompt}
               onChange={setPrompt}
               cwd={cwd}
               client={client}
               disabled={submitting}
-              className="min-h-28 resize-none rounded-none border-0 bg-transparent px-4 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-32 md:px-5 md:py-5"
+              maxLength={MAX_COMPOSER_CHARACTERS}
+              className="min-h-36 resize-none rounded-none border-0 bg-transparent px-5 py-5 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-40 md:px-6 md:py-6"
               placement="top"
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
@@ -2550,9 +2848,8 @@ function NewSession({
                 }
               }}
             />
-            <Separator />
             <motion.div
-              className="flex flex-col bg-muted/15"
+              className="flex flex-col"
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.18, delay: 0.14 }}
@@ -2614,86 +2911,14 @@ function NewSession({
                   })}
                 </AttachmentGroup>
               ) : null}
-              <div className="flex min-w-0 items-center gap-1 overflow-x-auto px-2.5 py-1.5 [scrollbar-width:none]">
-                <Select value={serverId} onValueChange={onServerChange}>
-                  <SelectTrigger
-                    aria-label="Server"
-                    size="sm"
-                    className="max-w-40 shrink-0 border-0 bg-transparent shadow-none"
-                  >
-                    <ServerIcon />
-                    <SelectValue placeholder="Choose server" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      {servers.map((server) => (
-                        <SelectItem key={server.id} value={server.id}>
-                          {server.name}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-                <Select
-                  value={executionMode}
-                  onValueChange={(value) => setExecutionMode(value as 'local' | 'worktree')}
-                >
-                  <SelectTrigger
-                    aria-label="Execution mode"
-                    size="sm"
-                    className="shrink-0 border-0 bg-transparent shadow-none"
-                  >
-                    <GitForkIcon />
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectItem value="local">Local</SelectItem>
-                      <SelectItem value="worktree" disabled={worktrees.length === 0}>
-                        Worktree
-                      </SelectItem>
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-                {executionMode === 'worktree' ? (
-                  <Select value={worktreeId} onValueChange={setWorktreeId}>
-                    <SelectTrigger
-                      aria-label="Worktree"
-                      size="sm"
-                      className="max-w-48 shrink-0 border-0 bg-transparent shadow-none"
-                    >
-                      <SelectValue placeholder="Choose worktree" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectGroup>
-                        {worktrees
-                          .filter((worktree) => worktree.status === 'ready')
-                          .map((worktree) => (
-                            <SelectItem key={worktree.id} value={worktree.id}>
-                              {worktree.branch}
-                            </SelectItem>
-                          ))}
-                      </SelectGroup>
-                    </SelectContent>
-                  </Select>
-                ) : null}
-                <Separator orientation="vertical" className="h-4 shrink-0" />
-                <ProjectPicker
-                  projects={projects}
-                  path={cwd}
-                  onPathChange={setCwd}
-                  onDeleteProject={onDeleteProject}
-                  disabled={submitting}
-                />
-              </div>
-              <Separator />
-              <div className="flex items-center gap-1 p-2">
+              <div className="flex items-center gap-1 px-4 pb-4 md:px-5">
                 <input
                   ref={fileInputRef}
                   type="file"
                   multiple
+                  accept={IMAGE_INPUT_ACCEPT}
                   className="sr-only"
-                  aria-label="Files to attach"
+                  aria-label="Images to attach"
                   onChange={handleFileInput}
                   tabIndex={-1}
                 />
@@ -2709,33 +2934,13 @@ function NewSession({
                   <PaperclipIcon />
                 </Button>
                 <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
-                  <Select value={agentId} onValueChange={setAgentId}>
-                    <SelectTrigger
-                      aria-label="Agent profile"
-                      size="sm"
-                      className="max-w-40 shrink-0 border-0 bg-transparent shadow-none"
-                    >
-                      <BotIcon />
-                      <SelectValue placeholder="Choose agent" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectGroup>
-                        {agents.map((agent) => (
-                          <SelectItem key={agent.id} value={agent.id}>
-                            {agent.name}
-                          </SelectItem>
-                        ))}
-                      </SelectGroup>
-                    </SelectContent>
-                  </Select>
-                  <Separator orientation="vertical" className="hidden h-4 shrink-0 sm:block" />
                   <Select value={modelKey} onValueChange={setModelKey}>
                     <SelectTrigger
                       aria-label="Model"
                       size="sm"
                       className="max-w-52 shrink-0 border-0 bg-transparent shadow-none"
                     >
-                      <SparklesIcon />
+                      <ModelLogo provider={decodeModel(modelKey)?.provider ?? ''} />
                       <SelectValue placeholder="Default model" />
                     </SelectTrigger>
                     <SelectContent>
@@ -2771,6 +2976,50 @@ function NewSession({
                       </SelectGroup>
                     </SelectContent>
                   </Select>
+                  <Separator orientation="vertical" className="hidden h-5 shrink-0 sm:block" />
+                  <Select
+                    value={executionMode}
+                    onValueChange={(value) => setExecutionMode(value as 'local' | 'worktree')}
+                  >
+                    <SelectTrigger
+                      aria-label="Execution mode"
+                      size="sm"
+                      className="shrink-0 border-0 bg-transparent shadow-none"
+                    >
+                      <GitForkIcon />
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectItem value="local">Local checkout</SelectItem>
+                        <SelectItem value="worktree" disabled={worktrees.length === 0}>
+                          Worktree
+                        </SelectItem>
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  {executionMode === 'worktree' ? (
+                    <Select value={worktreeId} onValueChange={setWorktreeId}>
+                      <SelectTrigger
+                        aria-label="Worktree"
+                        size="sm"
+                        className="max-w-48 shrink-0 border-0 bg-transparent shadow-none"
+                      >
+                        <SelectValue placeholder="Choose worktree" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          {worktrees
+                            .filter((worktree) => worktree.status === 'ready')
+                            .map((worktree) => (
+                              <SelectItem key={worktree.id} value={worktree.id}>
+                                {worktree.branch}
+                              </SelectItem>
+                            ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  ) : null}
                 </div>
                 <Button
                   type="submit"
@@ -3259,6 +3508,19 @@ function hasFileDragPayload(dataTransfer: DataTransfer): boolean {
   return Array.from(dataTransfer.types).includes('Files');
 }
 
+function imageAttachmentValidationError(files: readonly File[]): string | undefined {
+  if (files.some((file) => !SUPPORTED_IMAGE_MIME_TYPES.has(file.type))) {
+    return 'Pi accepts PNG, JPEG, GIF, and WebP images only.';
+  }
+  if (files.length > MAX_IMAGE_ATTACHMENTS) {
+    return `Attach at most ${MAX_IMAGE_ATTACHMENTS} images.`;
+  }
+  if (files.some((file) => file.size > MAX_IMAGE_ATTACHMENT_BYTES)) {
+    return 'Each image must be smaller than 6 MB.';
+  }
+  return undefined;
+}
+
 function ImageAttachmentCard({
   name,
   src,
@@ -3355,6 +3617,8 @@ function Conversation({
   submitting,
   runIsActive,
   connectionState,
+  inboxItems,
+  onInboxHandled,
   onCancel,
   onSteer,
   onSendMessage,
@@ -3374,11 +3638,17 @@ function Conversation({
   submitting: boolean;
   runIsActive: boolean;
   connectionState: StreamConnectionState;
+  inboxItems: InboxItemResponse[];
+  onInboxHandled(itemId: string): void;
   onCancel(): Promise<void>;
   onSteer(message: string, attachments?: AgentImageAttachment[]): Promise<void>;
   onSendMessage(message: string, attachments?: AgentImageAttachment[]): Promise<void>;
 }) {
-  const [message, setMessage] = useState('');
+  const [message, setMessage, clearMessageDraft] = useComposerDraft(`run:${run.id}`);
+  const [deliveryMode, setDeliveryMode] = useState<'follow-up' | 'steer'>('follow-up');
+  const [inboxResponse, setInboxResponse] = useState('');
+  const [inboxError, setInboxError] = useState<string>();
+  const [respondingToInbox, setRespondingToInbox] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [dragActive, setDragActive] = useState(false);
@@ -3388,7 +3658,10 @@ function Conversation({
   const dragDepthRef = useRef(0);
   const attachmentSequenceRef = useRef(0);
   const attachmentsRef = useRef(attachments);
+  const sendInFlightRef = useRef(false);
   const canChat = run.status === 'queued' || run.status === 'running' || run.status === 'completed';
+  const activeInboxItem = inboxItems[0];
+  const composerBlocked = activeInboxItem !== undefined;
 
   useEffect(() => {
     attachmentsRef.current = attachments;
@@ -3401,7 +3674,14 @@ function Conversation({
   }, []);
 
   function addFiles(fileList: FileList | File[]) {
-    const nextAttachments = Array.from(fileList).map((file) => ({
+    const files = Array.from(fileList);
+    const validationError = imageAttachmentValidationError([
+      ...attachments.map((attachment) => attachment.file),
+      ...files,
+    ]);
+    setAttachmentError(validationError);
+    if (validationError) return;
+    const nextAttachments = files.map((file) => ({
       id: `attachment-${attachmentSequenceRef.current++}`,
       file,
       previewUrl: createAttachmentPreview(file),
@@ -3456,21 +3736,11 @@ function Conversation({
 
   async function prepareImageAttachments(): Promise<AgentImageAttachment[] | undefined> {
     if (attachments.length === 0) return undefined;
-    const unsupported = attachments.filter(
-      (attachment) =>
-        !['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(attachment.file.type),
+    const validationError = imageAttachmentValidationError(
+      attachments.map((attachment) => attachment.file),
     );
-    if (unsupported.length > 0) {
-      setAttachmentError(
-        'Only PNG, JPEG, GIF, and WebP images can be sent to Pi. Remove other files first.',
-      );
-      return undefined;
-    }
-    if (
-      attachments.length > 4 ||
-      attachments.some((attachment) => attachment.file.size > 6_000_000)
-    ) {
-      setAttachmentError('Use at most four images, each smaller than 6 MB.');
+    if (validationError) {
+      setAttachmentError(validationError);
       return undefined;
     }
     return Promise.all(
@@ -3485,16 +3755,29 @@ function Conversation({
   async function submitMessage(event: FormEvent) {
     event.preventDefault();
     const value = message.trim();
-    if ((!value && attachments.length === 0) || submitting || !canChat) return;
+    if (
+      (!value && attachments.length === 0) ||
+      submitting ||
+      !canChat ||
+      composerBlocked ||
+      sendInFlightRef.current
+    ) {
+      return;
+    }
+    sendInFlightRef.current = true;
     try {
       const imageAttachments = await prepareImageAttachments();
       if (attachments.length > 0 && !imageAttachments) return;
-      await onSendMessage(value || 'Please inspect the attached image.', imageAttachments);
-      setMessage('');
+      const content = value || 'Please inspect the attached image.';
+      if (runIsActive && deliveryMode === 'steer') await onSteer(content, imageAttachments);
+      else await onSendMessage(content, imageAttachments);
+      clearMessageDraft();
       setAttachmentError(undefined);
       clearAttachments();
     } catch {
       // Keep the draft and attachments visible while the app-level error explains what failed.
+    } finally {
+      sendInFlightRef.current = false;
     }
   }
 
@@ -3510,18 +3793,33 @@ function Conversation({
     });
   }
 
-  async function submitSteer() {
-    const value = message.trim();
-    if (!value || submitting || !runIsActive) return;
+  async function respondToInbox(response: string) {
+    if (!activeInboxItem || !response.trim() || respondingToInbox) return;
+    setRespondingToInbox(true);
+    setInboxError(undefined);
     try {
-      const imageAttachments = await prepareImageAttachments();
-      if (attachments.length > 0 && !imageAttachments) return;
-      await onSteer(value, imageAttachments);
-      setMessage('');
-      setAttachmentError(undefined);
-      clearAttachments();
-    } catch {
-      // Keep the draft and attachments visible while the app-level error explains what failed.
+      await client.resolveInbox(activeInboxItem.id, response.trim());
+      onInboxHandled(activeInboxItem.id);
+      setInboxResponse('');
+    } catch (reason) {
+      setInboxError(errorMessage(reason));
+    } finally {
+      setRespondingToInbox(false);
+    }
+  }
+
+  async function cancelInboxItem() {
+    if (!activeInboxItem || respondingToInbox) return;
+    setRespondingToInbox(true);
+    setInboxError(undefined);
+    try {
+      await client.cancelInbox(activeInboxItem.id);
+      onInboxHandled(activeInboxItem.id);
+      setInboxResponse('');
+    } catch (reason) {
+      setInboxError(errorMessage(reason));
+    } finally {
+      setRespondingToInbox(false);
     }
   }
 
@@ -3672,9 +3970,9 @@ function Conversation({
             exit={{ opacity: 0, scale: 0.98 }}
           >
             <div>
-              <p className="font-medium">Drop files to attach</p>
+              <p className="font-medium">Drop images to attach</p>
               <p className="mt-1 text-sm text-muted-foreground">
-                Images and other file types are supported
+                PNG, JPEG, GIF, or WebP · up to 4 images, 6 MB each
               </p>
             </div>
           </motion.div>
@@ -3765,7 +4063,7 @@ function Conversation({
         {canChat ? (
           <motion.form
             aria-label="Chat with agent"
-            className="border-t bg-background/95 px-3 py-3 md:px-6"
+            className="bg-background px-3 pb-3 pt-2 md:px-6 md:pb-4"
             onSubmit={submitMessage}
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
@@ -3829,16 +4127,96 @@ function Conversation({
                   })}
                 </AttachmentGroup>
               ) : null}
-              <div className="overflow-hidden rounded-2xl border border-border/80 bg-card transition-[border-color] focus-within:border-foreground/30">
+              <div className="overflow-hidden rounded-[1.75rem] border border-border/70 bg-card transition-colors focus-within:border-foreground/25">
                 <input
                   ref={fileInputRef}
                   type="file"
                   multiple
+                  accept={IMAGE_INPUT_ACCEPT}
                   className="sr-only"
-                  aria-label="Files to attach"
+                  aria-label="Images to attach"
                   onChange={handleFileInput}
                   tabIndex={-1}
                 />
+                {activeInboxItem ? (
+                  <section className="border-b border-border/60 px-5 py-4" aria-live="polite">
+                    <div className="flex items-start gap-3">
+                      <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
+                        <InboxIcon className="size-3.5" aria-hidden="true" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-sm font-semibold">{activeInboxItem.title}</p>
+                          <Badge variant="outline">
+                            {inboxItems.length > 1
+                              ? `1 of ${inboxItems.length}`
+                              : activeInboxItem.kind}
+                          </Badge>
+                        </div>
+                        {activeInboxItem.body ? (
+                          <p className="mt-1.5 whitespace-pre-wrap text-sm leading-5 text-muted-foreground">
+                            {activeInboxItem.body}
+                          </p>
+                        ) : null}
+                        {inboxError ? (
+                          <p role="alert" className="mt-2 text-xs text-destructive">
+                            {inboxError}
+                          </p>
+                        ) : null}
+                        <div className="mt-3 flex flex-wrap items-center gap-2">
+                          {(activeInboxItem.options.length > 0
+                            ? activeInboxItem.options
+                            : activeInboxItem.kind === 'approval'
+                              ? ['Approve', 'Reject']
+                              : []
+                          ).map((option) => (
+                            <Button
+                              key={option}
+                              type="button"
+                              size="sm"
+                              variant={
+                                option.toLowerCase() === 'reject' ? 'destructive' : 'outline'
+                              }
+                              disabled={respondingToInbox}
+                              onClick={() => void respondToInbox(option)}
+                            >
+                              {option}
+                            </Button>
+                          ))}
+                          {activeInboxItem.kind === 'question' &&
+                          activeInboxItem.options.length === 0 ? (
+                            <>
+                              <Input
+                                aria-label={`Answer ${activeInboxItem.title}`}
+                                value={inboxResponse}
+                                onChange={(event) => setInboxResponse(event.target.value)}
+                                className="min-w-52 flex-1"
+                                placeholder="Type your answer"
+                              />
+                              <Button
+                                type="button"
+                                size="sm"
+                                disabled={respondingToInbox || !inboxResponse.trim()}
+                                onClick={() => void respondToInbox(inboxResponse)}
+                              >
+                                Answer
+                              </Button>
+                            </>
+                          ) : null}
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            disabled={respondingToInbox}
+                            onClick={() => void cancelInboxItem()}
+                          >
+                            Cancel request
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                ) : null}
                 <ComposerInput
                   ariaLabel="Message agent"
                   value={message}
@@ -3851,64 +4229,87 @@ function Conversation({
                       event.currentTarget.form?.requestSubmit();
                     }
                   }}
-                  placeholder="Send a message to Pi…"
-                  disabled={submitting}
+                  placeholder={
+                    composerBlocked
+                      ? 'Resolve the request above to continue'
+                      : runIsActive && deliveryMode === 'steer'
+                        ? 'Steer the active run at the next safe point'
+                        : 'Ask for follow-up changes or attach images'
+                  }
+                  disabled={submitting || composerBlocked}
                   rows={1}
+                  maxLength={MAX_COMPOSER_CHARACTERS}
                   placement="top"
-                  className="max-h-32 min-h-14 resize-none rounded-none border-0 bg-transparent px-3.5 py-3 shadow-none focus-visible:ring-0"
+                  className="max-h-48 min-h-24 resize-none rounded-none border-0 bg-transparent px-5 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-28"
                 />
-                <div className="flex items-center gap-1 px-2 pb-2">
+                <div className="flex min-w-0 items-center gap-1 px-4 pb-4 md:px-5">
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon-sm"
-                    aria-label="Attach files"
+                    aria-label="Attach images"
+                    title="Attach images"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={submitting}
+                    disabled={submitting || composerBlocked}
                     className="rounded-full"
                   >
                     <PaperclipIcon />
                   </Button>
-                  <span className="hidden text-xs text-muted-foreground sm:inline">
-                    {runIsActive ? 'Steer or queue a follow-up' : 'Continue this session'}
-                  </span>
-                  <div className="ml-auto flex items-center gap-1">
+                  <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
+                    <span className="hidden shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground sm:flex">
+                      <ModelLogo provider={modelProvider(run.model)} />
+                      <span>{modelDisplayName(run.model, models)}</span>
+                    </span>
+                    <Separator orientation="vertical" className="hidden h-5 shrink-0 sm:block" />
+                    <span className="hidden shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground sm:flex">
+                      <BrainIcon className="size-4" aria-hidden="true" />
+                      {titleCase(run.thinkingLevel ?? 'default')}
+                    </span>
+                    <Separator orientation="vertical" className="hidden h-5 shrink-0 sm:block" />
                     {runIsActive ? (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => void submitSteer()}
-                        disabled={submitting || !message.trim()}
-                        aria-label="Steer now"
-                        className="rounded-full"
+                      <Select
+                        value={deliveryMode}
+                        onValueChange={(value) => setDeliveryMode(value as 'follow-up' | 'steer')}
                       >
-                        Steer now
-                      </Button>
-                    ) : null}
-                    <Button
-                      type="submit"
-                      size="icon-lg"
-                      className="shrink-0 rounded-full"
-                      disabled={submitting || (!message.trim() && attachments.length === 0)}
-                    >
-                      <ArrowUpIcon />
-                      <span className="sr-only">Send message</span>
-                    </Button>
+                        <SelectTrigger
+                          aria-label="Message delivery"
+                          size="sm"
+                          className="shrink-0 border-0 bg-transparent shadow-none"
+                        >
+                          {deliveryMode === 'steer' ? <RouteIcon /> : <ListEndIcon />}
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectGroup>
+                            <SelectItem value="follow-up">Queue follow-up</SelectItem>
+                            <SelectItem value="steer">Steer now</SelectItem>
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <span className="flex shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground">
+                        <ListEndIcon className="size-4" aria-hidden="true" />
+                        Follow-up
+                      </span>
+                    )}
                   </div>
+                  <Button
+                    type="submit"
+                    size="icon-lg"
+                    className="ml-auto shrink-0 rounded-full"
+                    aria-label={
+                      deliveryMode === 'steer' && runIsActive ? 'Steer run' : 'Send follow-up'
+                    }
+                    title={deliveryMode === 'steer' && runIsActive ? 'Steer run' : 'Send follow-up'}
+                    disabled={
+                      submitting || composerBlocked || (!message.trim() && attachments.length === 0)
+                    }
+                  >
+                    <ArrowUpIcon />
+                  </Button>
                 </div>
               </div>
             </div>
-            <p className="mx-auto mt-1.5 flex max-w-4xl items-center justify-between gap-3 px-1 text-[11px] text-muted-foreground">
-              <span>
-                {runIsActive
-                  ? 'Send queues a follow-up · Steer interrupts at the next safe point'
-                  : 'Continue this session with a follow-up'}
-              </span>
-              <span className="hidden shrink-0 sm:inline">
-                Enter to send · Shift+Enter for a new line
-              </span>
-            </p>
           </motion.form>
         ) : null}
       </MessageScrollerProvider>
@@ -3956,8 +4357,8 @@ function AgentSettingsDialog({
   onDarkModeChange(darkMode: boolean): void;
   appLayout: AppLayout;
   onAppLayoutChange(layout: AppLayout): void;
-  onCreate(name: string, systemPrompt: string): Promise<ManagedAgentResponse | undefined>;
-  onUpdate(agentId: string, name: string, systemPrompt: string): Promise<void>;
+  onCreate(settings: AgentEditorSettings): Promise<ManagedAgentResponse | undefined>;
+  onUpdate(agentId: string, settings: AgentEditorSettings): Promise<void>;
   onDelete(agentId: string): Promise<void>;
   onCreateProject(input: {
     name?: string;
@@ -4097,7 +4498,7 @@ function AgentSettingsDialog({
                     <div>
                       <h3 className="text-xl font-semibold tracking-tight">Agents</h3>
                       <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                        Reusable instructions appended to Pi’s default coding-agent prompt.
+                        Reusable agent profiles with explicit prompt and tool-call behavior.
                       </p>
                     </div>
                     <Button onClick={() => setEditing('new')}>
@@ -4214,12 +4615,12 @@ function AgentSettingsDialog({
         }}
         agent={selectedAgent}
         submitting={submitting}
-        onCreate={async (name, systemPrompt) => {
-          const created = await onCreate(name, systemPrompt);
+        onCreate={async (settings) => {
+          const created = await onCreate(settings);
           if (created) setEditing(undefined);
         }}
-        onUpdate={async (agentId, name, systemPrompt) => {
-          await onUpdate(agentId, name, systemPrompt);
+        onUpdate={async (agentId, settings) => {
+          await onUpdate(agentId, settings);
           setEditing(undefined);
         }}
         onDelete={async (agentId) => {
@@ -5424,8 +5825,8 @@ function AgentEditorDialog({
   onOpenChange(open: boolean): void;
   agent: ManagedAgentResponse | undefined;
   submitting: boolean;
-  onCreate(name: string, systemPrompt: string): Promise<void>;
-  onUpdate(agentId: string, name: string, systemPrompt: string): Promise<void>;
+  onCreate(settings: AgentEditorSettings): Promise<void>;
+  onUpdate(agentId: string, settings: AgentEditorSettings): Promise<void>;
   onDelete(agentId: string): Promise<void>;
 }) {
   return (
@@ -5451,26 +5852,36 @@ function AgentEditorForm({
 }: {
   agent: ManagedAgentResponse | undefined;
   submitting: boolean;
-  onCreate(name: string, systemPrompt: string): Promise<void>;
-  onUpdate(agentId: string, name: string, systemPrompt: string): Promise<void>;
+  onCreate(settings: AgentEditorSettings): Promise<void>;
+  onUpdate(agentId: string, settings: AgentEditorSettings): Promise<void>;
   onDelete(agentId: string): Promise<void>;
 }) {
   const [name, setName] = useState(agent?.name ?? 'Coding agent');
   const [systemPrompt, setSystemPrompt] = useState(
     agent?.systemPrompt ?? DEFAULT_AGENT_INSTRUCTIONS,
   );
+  const [systemPromptMode, setSystemPromptMode] = useState<AgentSystemPromptMode>(
+    agent?.systemPromptMode ?? 'append',
+  );
+  const [toolCallsEnabled, setToolCallsEnabled] = useState(
+    agent ? agent.tools === null || agent.tools.length > 0 : true,
+  );
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    const nextName = name.trim();
-    const nextPrompt = systemPrompt.trim();
-    if (!nextName || !nextPrompt) return;
-    if (agent) await onUpdate(agent.id, nextName, nextPrompt);
-    else await onCreate(nextName, nextPrompt);
+    const settings: AgentEditorSettings = {
+      name: name.trim(),
+      systemPrompt: systemPrompt.trim(),
+      systemPromptMode,
+      toolCallsEnabled,
+    };
+    if (!settings.name || !settings.systemPrompt) return;
+    if (agent) await onUpdate(agent.id, settings);
+    else await onCreate(settings);
   }
 
   return (
-    <DialogContent className="sm:max-w-2xl">
+    <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-2xl">
       <motion.form
         onSubmit={submit}
         initial={{ opacity: 0, y: 12, scale: 0.98 }}
@@ -5480,8 +5891,7 @@ function AgentEditorForm({
         <DialogHeader>
           <DialogTitle>{agent ? 'Edit agent' : 'New agent'}</DialogTitle>
           <DialogDescription>
-            Add focused role instructions. Pi’s maintained coding prompt, tools, skills, and project
-            context remain intact.
+            Define exactly which prompt and capabilities this profile gives Pi.
           </DialogDescription>
         </DialogHeader>
         <FieldGroup className="py-6">
@@ -5506,20 +5916,68 @@ function AgentEditorForm({
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.14, delay: 0.09 }}
           >
-            <Field>
-              <FieldLabel htmlFor="agent-instructions">Additional instructions</FieldLabel>
-              <Textarea
-                id="agent-instructions"
-                value={systemPrompt}
-                onChange={(event) => setSystemPrompt(event.target.value)}
-                rows={10}
-                placeholder="Describe this agent’s role, priorities, and constraints."
-                required
-              />
-              <FieldDescription>
-                Do not repeat general coding or tool guidance already provided by Pi.
-              </FieldDescription>
-            </Field>
+            <FieldSet>
+              <FieldLegend>System prompt</FieldLegend>
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                spacing={0}
+                value={systemPromptMode}
+                onValueChange={(value) => {
+                  if (value === 'append' || value === 'replace') setSystemPromptMode(value);
+                }}
+                aria-label="System prompt behavior"
+                className="w-full"
+              >
+                <ToggleGroupItem value="append" className="flex-1">
+                  Pi default + this prompt
+                </ToggleGroupItem>
+                <ToggleGroupItem value="replace" className="flex-1">
+                  This prompt only
+                </ToggleGroupItem>
+              </ToggleGroup>
+              <Field>
+                <FieldLabel htmlFor="agent-instructions">Agent prompt</FieldLabel>
+                <Textarea
+                  id="agent-instructions"
+                  dir="auto"
+                  value={systemPrompt}
+                  onChange={(event) => setSystemPrompt(event.target.value)}
+                  rows={10}
+                  placeholder="Describe this agent’s role, priorities, and constraints."
+                  className="field-sizing-fixed min-h-48 max-h-[min(28rem,42dvh)] resize-y overflow-y-auto text-start"
+                  required
+                />
+                <FieldDescription>
+                  {systemPromptMode === 'append'
+                    ? 'Added after Pi’s maintained system prompt, including its coding guidance and context.'
+                    : 'Replaces Pi’s maintained system prompt. The text above becomes the complete system prompt.'}
+                </FieldDescription>
+              </Field>
+            </FieldSet>
+          </motion.div>
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.14, delay: 0.12 }}
+          >
+            <FieldSet>
+              <FieldLegend>Tools</FieldLegend>
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldLabel htmlFor="agent-tool-calls">Allow tool calls</FieldLabel>
+                  <FieldDescription>
+                    Let this agent inspect files, run commands, and use other available tools.
+                  </FieldDescription>
+                </FieldContent>
+                <Switch
+                  id="agent-tool-calls"
+                  checked={toolCallsEnabled}
+                  onCheckedChange={setToolCallsEnabled}
+                  aria-label="Allow tool calls"
+                />
+              </Field>
+            </FieldSet>
           </motion.div>
         </FieldGroup>
         <DialogFooter className="justify-between sm:justify-between">

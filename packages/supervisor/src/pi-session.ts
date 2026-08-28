@@ -9,6 +9,7 @@ import type {
 import type {
   AgentModel,
   AgentModelOption,
+  AgentSystemPromptMode,
   AgentThinkingLevel,
   AgentToolName,
   ManagedAgentModelsResponse,
@@ -46,6 +47,7 @@ export interface ManagedPiSession {
 
 export interface CreatePiSessionOptions {
   readonly systemPrompt: string;
+  readonly systemPromptMode: AgentSystemPromptMode;
   readonly cwd?: string;
   readonly tools?: AgentToolName[];
   readonly model?: AgentModel;
@@ -183,10 +185,14 @@ export class SdkPiSessionFactory implements PiSessionFactory {
     const resourceLoader = new pi.DefaultResourceLoader({
       cwd,
       agentDir,
-      appendSystemPromptOverride: (base) => [
-        ...base,
-        `## Agent instructions\n\n${options.systemPrompt}`,
-      ],
+      ...(options.systemPromptMode === 'replace'
+        ? { systemPromptOverride: () => options.systemPrompt }
+        : {
+            appendSystemPromptOverride: (base: string[]) => [
+              ...base,
+              `## Agent instructions\n\n${options.systemPrompt}`,
+            ],
+          }),
     });
     await resourceLoader.reload();
 
@@ -204,7 +210,8 @@ export class SdkPiSessionFactory implements PiSessionFactory {
       modelRuntime,
       resourceLoader,
       sessionManager: pi.SessionManager.create(cwd, this.sessionDirectory),
-      ...(options.tools ? { tools: options.tools } : {}),
+      ...(options.tools?.length ? { tools: options.tools } : {}),
+      ...(options.tools?.length === 0 ? { noTools: 'all' as const } : {}),
       ...(model ? { model } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
     });
@@ -232,10 +239,14 @@ export class SdkPiSessionFactory implements PiSessionFactory {
     const resourceLoader = new pi.DefaultResourceLoader({
       cwd,
       agentDir: pi.getAgentDir(),
-      appendSystemPromptOverride: (base) => [
-        ...base,
-        `## Agent instructions\n\n${options.systemPrompt}`,
-      ],
+      ...(options.systemPromptMode === 'replace'
+        ? { systemPromptOverride: () => options.systemPrompt }
+        : {
+            appendSystemPromptOverride: (base: string[]) => [
+              ...base,
+              `## Agent instructions\n\n${options.systemPrompt}`,
+            ],
+          }),
     });
     await resourceLoader.reload();
     const result = await pi.createAgentSession({
@@ -244,7 +255,8 @@ export class SdkPiSessionFactory implements PiSessionFactory {
       modelRuntime: await this.getModelRuntime(),
       resourceLoader,
       sessionManager,
-      ...(options.tools ? { tools: options.tools } : {}),
+      ...(options.tools?.length ? { tools: options.tools } : {}),
+      ...(options.tools?.length === 0 ? { noTools: 'all' as const } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
     });
     return new SdkManagedPiSession(result.session);

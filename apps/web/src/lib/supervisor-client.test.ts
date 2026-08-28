@@ -26,6 +26,7 @@ const agent: ManagedAgentResponse = {
   id: agentId,
   name: 'Release reviewer',
   systemPrompt: 'You are a careful software engineering agent.',
+  systemPromptMode: 'append',
   model: { provider: 'openai-codex', id: 'gpt-5.6-sol' },
   thinkingLevel: 'high',
   cwd: '/workspace',
@@ -129,14 +130,42 @@ describe('SupervisorClient', () => {
   });
 
   it('aborts stalled HTTP requests at the configured deadline', async () => {
-    const fetcher = vi.fn<typeof fetch>().mockImplementation((_input, init) =>
-      new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
-      }),
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(
+      (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+            once: true,
+          });
+        }),
     );
     const client = new SupervisorClient({ fetcher, requestTimeoutMs: 5 });
 
     await expect(client.listAgents()).rejects.toMatchObject({ name: 'TimeoutError' });
+  });
+
+  it('retries transient reads but never retries token-spending commands', async () => {
+    const readFetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({ error: { code: 'internal_error', message: 'busy' } }, 503),
+      )
+      .mockResolvedValueOnce(jsonResponse({ agents: [agent], nextCursor: null }));
+    const readClient = new SupervisorClient({ fetcher: readFetcher, maxRequestAttempts: 2 });
+
+    await expect(readClient.listAgents()).resolves.toMatchObject({ agents: [agent] });
+    expect(readFetcher).toHaveBeenCalledTimes(2);
+
+    const commandFetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ error: { code: 'internal_error', message: 'busy' } }, 503));
+    const commandClient = new SupervisorClient({
+      fetcher: commandFetcher,
+      maxRequestAttempts: 3,
+    });
+    await expect(
+      commandClient.createAgent({ systemPrompt: 'Do not duplicate this.' }),
+    ).rejects.toBeInstanceOf(ApiError);
+    expect(commandFetcher).toHaveBeenCalledTimes(1);
   });
 
   it('creates an agent with validated input and service authentication', async () => {
@@ -164,6 +193,7 @@ describe('SupervisorClient', () => {
         }),
         body: JSON.stringify({
           systemPrompt: 'You are a CI agent.',
+          systemPromptMode: 'append',
           tools: ['read', 'bash'],
         }),
       }),

@@ -84,6 +84,7 @@ describe('database foundation', () => {
           id: '018bcfe4-7a4b-7000-8000-000000000001',
           name: 'Agent',
           system_prompt: 'Prompt',
+          system_prompt_mode: 'append',
           cwd: '/tmp',
           tools_json: null,
           requested_model_provider: null,
@@ -100,6 +101,7 @@ describe('database foundation', () => {
           id: '018bcfe4-7a4b-7000-8000-000000000002',
           name: 'Agent 2',
           system_prompt: 'Prompt',
+          system_prompt_mode: 'append',
           cwd: '/tmp',
           tools_json: null,
           requested_model_provider: null,
@@ -249,7 +251,13 @@ describe('database foundation', () => {
         ).map(({ name }) => name),
       ).not.toContain('interrupted_migration_probe');
 
-      await rollbackLastMigration(connection.db);
+      while (
+        (await getMigrationStatus(connection.db)).find(
+          (migration) => migration.name === '013_workspace_capabilities',
+        )?.status === 'Executed'
+      ) {
+        await rollbackLastMigration(connection.db);
+      }
 
       const rolledBackColumns = connection.sqlite
         .prepare('PRAGMA table_info(supervisor_agent_runs)')

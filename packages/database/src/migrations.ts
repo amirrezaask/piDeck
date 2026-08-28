@@ -14,6 +14,7 @@ import { supervisorCommandReceiptTypesMigration } from '../migrations/011_superv
 import { supervisorAgentRunAttachmentsMigration } from '../migrations/012_supervisor_agent_run_attachments';
 import { workspaceCapabilitiesMigration } from '../migrations/013_workspace_capabilities';
 import { piSessionOwnershipMigration } from '../migrations/014_pi_session_ownership';
+import { supervisorAgentPromptSettingsMigration } from '../migrations/015_supervisor_agent_prompt_settings';
 import type { MigrationDatabase } from './schema';
 
 const migrations: Record<string, Migration> = {
@@ -31,6 +32,7 @@ const migrations: Record<string, Migration> = {
   '012_supervisor_agent_run_attachments': supervisorAgentRunAttachmentsMigration,
   '013_workspace_capabilities': workspaceCapabilitiesMigration,
   '014_pi_session_ownership': piSessionOwnershipMigration,
+  '015_supervisor_agent_prompt_settings': supervisorAgentPromptSettingsMigration,
 };
 
 const provider: MigrationProvider = {

@@ -5,7 +5,7 @@ import type {
   ManagedAgentRunResponse,
   ManagedProjectResponse,
 } from '@nextflow/contracts';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -22,6 +22,7 @@ const agent: ManagedAgentResponse = {
   id: '018bcfe4-7a4b-7000-8000-000000000111',
   name: 'Workspace agent',
   systemPrompt: 'Be careful.',
+  systemPromptMode: 'append',
   model: null,
   thinkingLevel: null,
   cwd: '/workspace',
@@ -65,12 +66,13 @@ function eventPages(events: ManagedAgentEvent[]) {
 }
 
 afterEach(() => {
+  cleanup();
   document.documentElement.classList.remove('dark');
   document.documentElement.style.colorScheme = '';
   window.localStorage.removeItem('pideck-theme');
   window.localStorage.removeItem('pideck-layout');
   window.localStorage.removeItem('pideck-sidebar-collapsed');
-  window.localStorage.removeItem('pideck-archived-runs');
+  window.localStorage.clear();
   window.sessionStorage.clear();
   window.history.replaceState({}, '', '/');
 });
@@ -224,8 +226,13 @@ describe('App', () => {
     };
     const listRuns = vi
       .fn()
-      .mockResolvedValueOnce({ runs: [run], nextCursor: 'next-page' })
-      .mockResolvedValueOnce({ runs: [olderRun, run], nextCursor: null });
+      .mockImplementation(({ cursor }: { cursor?: string }) =>
+        Promise.resolve(
+          cursor === 'next-page'
+            ? { runs: [olderRun, run], nextCursor: null }
+            : { runs: [run], nextCursor: 'next-page' },
+        ),
+      );
     const client = createClient({ listRuns });
     render(<App client={client} />);
 
@@ -265,6 +272,29 @@ describe('App', () => {
       expect(client.createAgent).toHaveBeenCalledWith({
         name: 'Coding agent',
         systemPrompt: expect.stringContaining('Inspect the workspace carefully'),
+        systemPromptMode: 'append',
+      }),
+    );
+  });
+
+  it('creates an agent with a replacement prompt and tool calls disabled', async () => {
+    const user = userEvent.setup();
+    const client = createClient();
+    render(<App client={client} />);
+
+    await screen.findByText('Create an agent profile first');
+    await user.click(screen.getByRole('button', { name: 'Open agent settings' }));
+    await user.click(screen.getByRole('button', { name: 'New agent' }));
+    await user.click(screen.getByRole('radio', { name: 'This prompt only' }));
+    await user.click(screen.getByRole('switch', { name: 'Allow tool calls' }));
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
+
+    await waitFor(() =>
+      expect(client.createAgent).toHaveBeenCalledWith({
+        name: 'Coding agent',
+        systemPrompt: expect.stringContaining('Inspect the workspace carefully'),
+        systemPromptMode: 'replace',
+        tools: [],
       }),
     );
   });
@@ -476,8 +506,8 @@ describe('App', () => {
     const collapseButton = await screen.findByRole('button', { name: 'Collapse sidebar' });
     const newSessionButton = screen.getByRole('button', { name: 'New session' });
     expect(collapseButton).toHaveAttribute('aria-expanded', 'true');
-    expect(newSessionButton).toHaveAttribute('data-size', 'icon');
-    expect(newSessionButton).toHaveAttribute('title', 'New session');
+    expect(newSessionButton).toHaveAttribute('data-size', 'icon-sm');
+    expect(newSessionButton).toHaveAttribute('title', 'New session (⌘N)');
     expect(newSessionButton.querySelector('svg')).not.toBeNull();
 
     await user.click(collapseButton);
@@ -491,8 +521,31 @@ describe('App', () => {
 
     await user.click(screen.getByRole('button', { name: 'Expand sidebar' }));
 
-    expect(screen.queryByText('Sessions')).not.toBeInTheDocument();
+    expect(screen.getByText('Sessions')).toBeInTheDocument();
     expect(window.localStorage.getItem('pideck-sidebar-collapsed')).toBe('false');
+  });
+
+  it('shows unchecked activity on each session and clears it when opened', async () => {
+    const user = userEvent.setup();
+    const secondRun = {
+      ...run,
+      id: '018bcfe4-7a4b-7000-8000-000000000778',
+      prompt: 'Inspect background activity.',
+      latestEventSequence: 8,
+      createdAt: '2026-08-22T20:00:00.000Z',
+    };
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({
+        runs: [{ ...run, latestEventSequence: 4 }, secondRun],
+        nextCursor: null,
+      }),
+    });
+    render(<App client={client} />);
+
+    expect(await screen.findByLabelText('8 unchecked events')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /Inspect background activity/ }));
+    expect(screen.queryByLabelText('8 unchecked events')).not.toBeInTheDocument();
   });
 
   it('updates the URL when selecting a session', async () => {
@@ -623,9 +676,7 @@ describe('App', () => {
     await user.hover(sessionButton);
     expect(await screen.findByRole('tooltip')).toHaveTextContent('Fake model');
     expect(screen.getByRole('tooltip')).toHaveTextContent('Medium thinking');
-    const thinkingMarker = await screen.findByText('Thinking...');
-    expect(thinkingMarker).toBeVisible();
-    expect(thinkingMarker).toHaveClass('shimmer');
+    expect(await screen.findByText('Agent started')).toBeVisible();
     expect(await screen.findByText('Looks good.')).toBeVisible();
     expect(screen.getByLabelText('Workspace agent conversation')).toBeInTheDocument();
   });
@@ -766,8 +817,8 @@ describe('App', () => {
     resolveReplay({ events: [persistedEvent] });
     await waitFor(() => expect(streamRunEvents).toHaveBeenCalled());
 
-    expect(await screen.findByText('Thinking...')).toBeVisible();
-    expect(screen.getByText('Streamed first.')).toBeVisible();
+    expect(await screen.findByText('Agent started')).toBeVisible();
+    expect(await screen.findByText('Streamed first.')).toBeVisible();
   });
 
   it('continues a completed run through the chat composer', async () => {
@@ -780,7 +831,7 @@ describe('App', () => {
 
     const composer = await screen.findByRole('textbox', { name: 'Message agent' });
     await user.type(composer, 'Keep going.');
-    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await user.click(screen.getByRole('button', { name: 'Send follow-up' }));
 
     await waitFor(() =>
       expect(client.followUpRun).toHaveBeenCalledWith(
@@ -843,7 +894,7 @@ describe('App', () => {
     fireEvent.dragOver(composer, {
       dataTransfer: { types: ['Files'], files: [image], dropEffect: 'none' },
     });
-    expect(screen.getByText('Drop files to attach')).toBeVisible();
+    expect(screen.getByText('Drop images to attach')).toBeVisible();
 
     fireEvent.drop(composer, {
       dataTransfer: { types: ['Files'], files: [image], dropEffect: 'copy' },
@@ -881,8 +932,7 @@ describe('App', () => {
     expect(screen.queryByRole('dialog', { name: 'screen.png' })).not.toBeInTheDocument();
   });
 
-  it('accepts dropped images and other files above the composer', async () => {
-    const user = userEvent.setup();
+  it('rejects unsupported dropped files before they reach Pi', async () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
@@ -896,21 +946,23 @@ describe('App', () => {
     fireEvent.dragOver(chatArea, {
       dataTransfer: { types: ['Files'], files: [image, document], dropEffect: 'none' },
     });
-    expect(screen.getByText('Drop files to attach')).toBeVisible();
+    expect(screen.getByText('Drop images to attach')).toBeVisible();
 
     fireEvent.drop(chatArea, {
       dataTransfer: { types: ['Files'], files: [image, document], dropEffect: 'copy' },
     });
 
-    expect(await screen.findByText('screen.png')).toBeVisible();
-    expect(screen.getByText('notes.txt')).toBeVisible();
-    expect(screen.getByText(/PNG/)).toBeVisible();
-    expect(screen.getByText(/TXT/)).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Remove screen.png' })).toBeVisible();
-
-    await user.click(screen.getByRole('button', { name: 'Remove screen.png' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Pi accepts PNG, JPEG, GIF, and WebP images only.',
+    );
     expect(screen.queryByText('screen.png')).not.toBeInTheDocument();
-    expect(screen.getByText('notes.txt')).toBeVisible();
+    expect(screen.queryByText('notes.txt')).not.toBeInTheDocument();
+
+    fireEvent.drop(chatArea, {
+      dataTransfer: { types: ['Files'], files: [image], dropEffect: 'copy' },
+    });
+    expect(await screen.findByText('screen.png')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Remove screen.png' })).toBeVisible();
   });
 
   it('chooses a saved project or stages a new project from the composer', async () => {
@@ -1049,7 +1101,7 @@ describe('App', () => {
     const serverSelect = screen.getByRole('combobox', { name: 'Server' });
     fireEvent.keyDown(serverSelect, { key: 'Enter' });
     await user.click(await screen.findByRole('option', { name: 'Build host' }));
-    expect(serverSelect).toHaveTextContent('Build host');
+    expect(screen.getByRole('combobox', { name: 'Server' })).toHaveTextContent('Build host');
     expect(screen.getByRole('combobox', { name: 'Agent profile' })).toHaveTextContent(
       'Remote agent',
     );
@@ -1073,48 +1125,71 @@ describe('App', () => {
     expect(screen.getByRole('textbox', { name: 'Terminal command' })).toBeVisible();
   });
 
-  it('hides workspace navigation while keeping fleet and inbox in the command palette', async () => {
+  it('keeps command-k focused exclusively on switching sessions', async () => {
     const user = userEvent.setup();
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
-      getFleet: vi.fn().mockResolvedValue({
-        health: {
-          status: 'healthy',
-          database: 'connected',
-          runtime: 'ready',
-          checkedAt: timestamp,
-        },
-        runs: [
+      searchSessions: vi.fn().mockResolvedValue({
+        results: [
           {
-            ...run,
-            parentRunId: null,
-            executionMode: 'local',
-            worktreeId: null,
-            agentName: agent.name,
-            children: [],
+            runId: run.id,
+            agentId: agent.id,
+            title: run.prompt,
+            cwd: run.cwd,
+            status: run.status,
+            createdAt: run.createdAt,
           },
         ],
-        counts: { active: 0, attention: 0, total: 1 },
-        complete: true,
       }),
     });
     render(<App client={client} />);
 
-    expect(screen.queryByRole('button', { name: 'Fleet' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Inbox' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Worktrees' })).not.toBeInTheDocument();
-
     await user.keyboard('{Control>}k{/Control}');
-    expect(await screen.findByRole('dialog', { name: 'Command palette' })).toBeVisible();
-    await user.click(screen.getByRole('option', { name: 'Fleet' }));
-    expect(await screen.findByRole('heading', { name: 'Fleet overview' })).toBeVisible();
-    expect(window.location.pathname).toBe('/fleet');
+    const palette = await screen.findByRole('dialog', { name: 'Switch session' });
+    await user.type(within(palette).getByPlaceholderText('Switch to a session…'), 'Review');
+    expect(
+      await within(palette).findByRole('option', { name: /Review the changes/ }),
+    ).toBeVisible();
+    expect(within(palette).queryByText(/Fleet|Inbox|Worktrees|Settings/)).not.toBeInTheDocument();
+  });
 
-    await user.keyboard('{Control>}k{/Control}');
-    await user.click(screen.getByRole('option', { name: 'Inbox' }));
-    expect(await screen.findByRole('heading', { name: 'Inbox' })).toBeVisible();
-    expect(window.location.pathname).toBe('/inbox');
+  it('surfaces agent requests inline and resolves them without a separate inbox', async () => {
+    const user = userEvent.setup();
+    const pendingRequest = {
+      id: '018bcfe4-7a4b-7000-8000-000000000999',
+      kind: 'approval' as const,
+      runId: run.id,
+      title: 'Allow command?',
+      body: 'pnpm test',
+      options: ['Approve', 'Reject'],
+      status: 'pending' as const,
+      response: null,
+      createdAt: timestamp,
+      resolvedAt: null,
+    };
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({
+        runs: [{ ...run, latestEventSequence: 12 }],
+        nextCursor: null,
+      }),
+      listInbox: vi.fn().mockResolvedValue({ items: [pendingRequest] }),
+      resolveInbox: vi.fn().mockResolvedValue({
+        ...pendingRequest,
+        status: 'resolved',
+        response: 'Approve',
+        resolvedAt: timestamp,
+      }),
+    });
+    render(<App client={client} />);
+
+    expect(await screen.findByText('Allow command?')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Approve' }));
+    await waitFor(() =>
+      expect(client.resolveInbox).toHaveBeenCalledWith(pendingRequest.id, 'Approve'),
+    );
+    expect(screen.queryByText('Allow command?')).not.toBeInTheDocument();
   });
 
   it('shows actionable supervisor failures', async () => {
@@ -1123,7 +1198,7 @@ describe('App', () => {
     });
     render(<App client={client} />);
 
-    expect(await screen.findByText('Supervisor request failed')).toBeVisible();
+    expect(await screen.findByText('Request not completed')).toBeVisible();
     expect(screen.getByText(/Supervisor is offline/)).toBeVisible();
   });
 });

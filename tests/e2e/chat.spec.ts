@@ -7,6 +7,7 @@ const agent = {
   id: '018bcfe4-7a4b-7000-8000-000000000111',
   name: 'Workspace agent',
   systemPrompt: 'Be careful.',
+  systemPromptMode: 'append',
   model: null,
   thinkingLevel: null,
   cwd: '/workspace',
@@ -50,6 +51,7 @@ test.beforeEach(async ({ page }) => {
     route.fulfill({ json: { projects: [project], nextCursor: null } }),
   );
   await page.route('**/v1/projects', (route) => route.fulfill({ status: 201, json: project }));
+  await page.route('**/v1/inbox', (route) => route.fulfill({ json: { items: [] } }));
   await page.route('**/v1/projects/*', async (route) => {
     if (route.request().method() === 'DELETE') {
       await route.fulfill({ status: 200, json: project });
@@ -187,7 +189,10 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   const activity = page.getByRole('button', { name: /5 events/ });
   await expect(activity).toBeVisible();
   await activity.click();
-  await expect(page.getByText('Thinking...', { exact: true })).toHaveCount(1);
+  await expect(page.getByText('Agent started', { exact: true })).toBeVisible();
+  await expect(page.getByText('Response started', { exact: true })).toBeVisible();
+  await expect(page.getByText('Response finished', { exact: true })).toBeVisible();
+  await expect(page.getByText('Turn started', { exact: true })).toBeVisible();
   const toolCall = page.getByRole('button', { name: 'Ran bash', exact: true });
   await expect(toolCall).toBeVisible();
   await toolCall.click();
@@ -238,6 +243,13 @@ test('renders persisted and streamed PI events with chat primitives', async ({
     document.documentElement.classList.add('dark');
     localStorage.setItem('pideck-theme', 'dark');
   });
+  await expect
+    .poll(() =>
+      page
+        .locator('form[aria-label="Chat with agent"] .bg-card')
+        .evaluate((element) => getComputedStyle(element).backgroundColor),
+    )
+    .toMatch(/oklch\(0\.205|rgb\((?:[0-6]?\d),/);
   await page.screenshot({
     path: `.impeccable/review/conversation-dark-${viewport}.png`,
     fullPage: true,
@@ -292,7 +304,7 @@ test('switches between sidebar and session tabs layouts', async ({ page }, testI
   });
 });
 
-test('accepts dropped images and documents in the chat composer', async ({ page }, testInfo) => {
+test('accepts dropped images in the chat composer', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
   await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [agent], nextCursor: null } }),
@@ -328,14 +340,12 @@ test('accepts dropped images and documents in the chat composer', async ({ page 
       (character) => character.charCodeAt(0),
     );
     transfer.items.add(new File([imageBytes], 'screen.png', { type: 'image/png' }));
-    transfer.items.add(new File(['notes'], 'notes.txt', { type: 'text/plain' }));
     chatArea.dispatchEvent(
       new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }),
     );
   });
 
   await expect(page.getByRole('img', { name: 'screen.png' })).toBeVisible();
-  await expect(page.getByText('notes.txt')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Remove screen.png' })).toBeVisible();
   expect(errors).toEqual([]);
 
@@ -612,7 +622,7 @@ test('completes Pi commands and @ file references in the new-session composer', 
   expect(errors).toEqual([]);
 });
 
-test('supervises the fleet and opens the global command palette', async ({ page }, testInfo) => {
+test('switches sessions from the global command palette', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
   await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [agent], nextCursor: null } }),
@@ -623,30 +633,10 @@ test('supervises the fleet and opens the global command palette', async ({ page 
   await page.route('**/v1/models', (route) =>
     route.fulfill({ json: { models: [], defaultModel: null } }),
   );
-  await page.route('**/v1/fleet', (route) =>
-    route.fulfill({
-      json: {
-        health: {
-          status: 'healthy',
-          database: 'connected',
-          runtime: 'ready',
-          checkedAt: timestamp,
-        },
-        runs: [
-          {
-            ...run,
-            parentRunId: null,
-            executionMode: 'local',
-            worktreeId: null,
-            agentName: agent.name,
-            children: [],
-          },
-        ],
-        counts: { active: 0, attention: 0, total: 1 },
-        complete: true,
-      },
-    }),
+  await page.route(`**/v1/runs/${run.id}/events?**`, (route) =>
+    route.fulfill({ json: { events: [] } }),
   );
+  await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, () => undefined);
   await page.route('**/v1/sessions/search?**', (route) =>
     route.fulfill({
       json: {
@@ -665,19 +655,27 @@ test('supervises the fleet and opens the global command palette', async ({ page 
   );
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/fleet');
-  await expect(page.getByRole('heading', { name: 'Fleet overview' })).toBeVisible();
-  await expect(page.getByText('Workspace agent · local')).toBeVisible();
+  await page.goto('/');
+  await page.keyboard.press('Control+K');
+  const palette = page.getByRole('dialog', { name: 'Switch session' });
+  await expect(palette).toBeVisible();
+  await palette.getByPlaceholder('Switch to a session…').fill('Review');
+  const result = palette.getByRole('option', { name: /Review the changes/ });
+  await expect(result).toBeVisible();
+  await expect(
+    palette.getByRole('option', { name: /Fleet|Inbox|Settings|New session/ }),
+  ).toHaveCount(0);
+  await result.click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${run.id}$`));
+  await expect(page.getByRole('heading', { name: 'Review the changes.' })).toBeVisible();
+  await expect(page.getByRole('form', { name: 'Chat with agent' })).toHaveCSS('opacity', '1');
+  expect(errors).toEqual([]);
   mkdirSync('.impeccable/review', { recursive: true });
   const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
-  await page.screenshot({ path: `.impeccable/review/fleet-${viewport}.png`, fullPage: true });
-  await page.keyboard.press('Control+K');
-  const palette = page.getByRole('dialog', { name: 'Command palette' });
-  await expect(palette).toBeVisible();
-  await palette.getByPlaceholder('Search commands and sessions').fill('Review');
-  await expect(palette.getByRole('option', { name: /Review the changes/ })).toBeVisible();
-  expect(errors).toEqual([]);
-  await page.screenshot({ path: `.impeccable/review/palette-${viewport}.png`, fullPage: true });
+  await page.screenshot({
+    path: `.impeccable/review/session-switcher-${viewport}.png`,
+    fullPage: true,
+  });
 });
 
 test('creates an agent and starts a managed run', async ({ page }, testInfo) => {
@@ -714,12 +712,46 @@ test('creates an agent and starts a managed run', async ({ page }, testInfo) => 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/');
   await page.getByRole('button', { name: 'Open agent settings' }).click();
-  await expect(page.getByRole('dialog', { name: 'Settings' })).toBeVisible();
+  const settingsDialog = page.getByRole('dialog', { name: 'Settings' });
+  await expect(settingsDialog).toBeVisible();
   await page.getByRole('button', { name: 'New agent' }).click();
-  await page.getByRole('button', { name: 'Create agent' }).click();
-  await expect(page.getByRole('dialog', { name: 'New agent' })).toBeHidden();
+  let agentEditor = page.getByRole('dialog', { name: 'New agent' });
+  await agentEditor.getByRole('radio', { name: 'This prompt only' }).click();
+  await agentEditor.getByRole('switch', { name: 'Allow tool calls' }).click();
+  await expect(agentEditor.getByText(/becomes the complete system prompt/)).toBeVisible();
+  await expect(agentEditor.locator('form')).toHaveCSS('opacity', '1');
+  await expect(agentEditor.getByRole('group', { name: 'Tools' }).locator('..')).toHaveCSS(
+    'opacity',
+    '1',
+  );
   const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
   mkdirSync('.impeccable/review', { recursive: true });
+  await page.screenshot({
+    path: `.impeccable/review/agent-editor-${viewport}.png`,
+    fullPage: true,
+  });
+  await agentEditor.getByRole('button', { name: 'Close' }).click();
+  await settingsDialog.getByRole('button', { name: 'Appearance' }).click();
+  await settingsDialog.getByRole('radio', { name: /Dark/ }).click();
+  await settingsDialog.getByRole('button', { name: /^Agents/ }).click();
+  await settingsDialog.getByRole('button', { name: 'New agent' }).click();
+  agentEditor = page.getByRole('dialog', { name: 'New agent' });
+  const replacementPrompt = agentEditor.getByRole('radio', { name: 'This prompt only' });
+  if ((await replacementPrompt.getAttribute('aria-checked')) !== 'true') {
+    await replacementPrompt.click();
+  }
+  const toolCalls = agentEditor.getByRole('switch', { name: 'Allow tool calls' });
+  if ((await toolCalls.getAttribute('aria-checked')) !== 'false') await toolCalls.click();
+  await expect(agentEditor.getByRole('group', { name: 'Tools' }).locator('..')).toHaveCSS(
+    'opacity',
+    '1',
+  );
+  await page.screenshot({
+    path: `.impeccable/review/agent-editor-dark-${viewport}.png`,
+    fullPage: true,
+  });
+  await agentEditor.getByRole('button', { name: 'Create agent' }).click();
+  await expect(agentEditor).toBeHidden();
   await page.screenshot({
     path: `.impeccable/review/settings-${viewport}.png`,
     fullPage: true,
@@ -738,7 +770,11 @@ test('creates an agent and starts a managed run', async ({ page }, testInfo) => 
   await expect(
     page.getByRole('heading', { name: 'Review the changes.', exact: true }),
   ).toBeVisible();
-  expect(createdAgentBody).toMatchObject({ name: 'Coding agent' });
+  expect(createdAgentBody).toMatchObject({
+    name: 'Coding agent',
+    systemPromptMode: 'replace',
+    tools: [],
+  });
   expect(createdRunBody).toEqual({
     agentId: agent.id,
     prompt: 'Review the changes.',

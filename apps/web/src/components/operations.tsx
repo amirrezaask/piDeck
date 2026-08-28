@@ -10,7 +10,6 @@ import type {
 import {
   AlertTriangleIcon,
   ChevronRightIcon,
-  CommandIcon,
   FileDiffIcon,
   GitBranchIcon,
   InboxIcon,
@@ -596,19 +595,11 @@ export function CommandPalette({
   open,
   onOpenChange,
   servers,
-  onFleet,
-  onInbox,
-  onNew,
-  onSettings,
   onOpenRun,
 }: {
   open: boolean;
   onOpenChange(open: boolean): void;
   servers: ServerOperationsClient[];
-  onFleet(): void;
-  onInbox(): void;
-  onNew(): void;
-  onSettings(): void;
   onOpenRun(serverId: string, runId: string): void;
 }) {
   const [query, setQuery] = useState('');
@@ -650,11 +641,17 @@ export function CommandPalette({
     setQuery('');
   };
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        onOpenChange(nextOpen);
+        if (!nextOpen) setQuery('');
+      }}
+    >
       <DialogContent className="overflow-hidden p-0 sm:max-w-xl">
-        <DialogTitle className="sr-only">Command palette</DialogTitle>
+        <DialogTitle className="sr-only">Switch session</DialogTitle>
         <DialogDescription className="sr-only">
-          Navigate piDeck and search sessions.
+          Search for a Pi session and switch to it.
         </DialogDescription>
         <div className="flex items-center border-b px-3">
           <SearchIcon className="size-4 text-muted-foreground" />
@@ -662,31 +659,15 @@ export function CommandPalette({
             autoFocus
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search commands and sessions"
+            placeholder="Switch to a session…"
             className="h-12 min-w-0 flex-1 bg-transparent px-3 text-sm outline-none"
           />
         </div>
         <Command shouldFilter={false}>
           <CommandList>
-            <CommandEmpty>No matching sessions.</CommandEmpty>
-            <CommandGroup heading="Navigate">
-              <CommandItem onSelect={() => run(onFleet)}>
-                <NetworkIcon />
-                Fleet
-              </CommandItem>
-              <CommandItem onSelect={() => run(onInbox)}>
-                <InboxIcon />
-                Inbox
-              </CommandItem>
-              <CommandItem onSelect={() => run(onNew)}>
-                <CommandIcon />
-                New session
-              </CommandItem>
-              <CommandItem onSelect={() => run(onSettings)}>
-                <ServerIcon />
-                Settings
-              </CommandItem>
-            </CommandGroup>
+            <CommandEmpty>
+              {query.trim().length < 2 ? 'Type at least two characters.' : 'No matching sessions.'}
+            </CommandEmpty>
             {results.length ? (
               <CommandGroup heading="Sessions">
                 {results.map((result) => (

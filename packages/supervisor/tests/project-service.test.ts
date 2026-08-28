@@ -95,6 +95,7 @@ describe('ProjectService', () => {
           id: '018bcfe4-7a4b-7000-8000-000000000001',
           name: 'Agent',
           system_prompt: 'Prompt',
+          system_prompt_mode: 'append',
           cwd: context.directory,
           tools_json: null,
           requested_model_provider: null,

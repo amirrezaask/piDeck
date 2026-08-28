@@ -340,6 +340,7 @@ export class ManagedAgentService {
           'supervisor_agent_runs.pi_session_id',
           'supervisor_agent_runs.pi_session_file',
           'supervisor_agents.system_prompt',
+          'supervisor_agents.system_prompt_mode',
           'supervisor_agents.tools_json',
         ])
         .where('supervisor_agent_runs.status', '=', 'completed')
@@ -356,6 +357,7 @@ export class ManagedAgentService {
             sessionFile,
             cwd: row.cwd,
             systemPrompt: row.system_prompt,
+            systemPromptMode: row.system_prompt_mode,
             ...(row.tools_json ? { tools: decodeJson(row.tools_json) as AgentToolName[] } : {}),
           });
           this.attachRecoveredSession(row.run_id, row.agent_id, session);
@@ -456,12 +458,12 @@ export class ManagedAgentService {
     if (await this.usesLegacyAgentRuntimeColumns()) {
       await sql`
         INSERT INTO supervisor_agents (
-          id, name, status, system_prompt, cwd, tools_json,
+          id, name, status, system_prompt, system_prompt_mode, cwd, tools_json,
           requested_model_provider, requested_model_id, model_provider, model_id,
           thinking_level, pi_session_id, pi_session_file, message_count,
           pending_message_count, error_code, error_message, created_at, updated_at, disposed_at
         ) VALUES (
-          ${id}, ${name}, 'defined', ${request.systemPrompt}, ${cwd}, ${toolsJson},
+          ${id}, ${name}, 'defined', ${request.systemPrompt}, ${request.systemPromptMode}, ${cwd}, ${toolsJson},
           ${request.model?.provider ?? null}, ${request.model?.id ?? null}, NULL, NULL,
           ${request.thinkingLevel ?? null}, NULL, NULL, 0, 0, NULL, NULL,
           ${createdAt}, ${createdAt}, NULL
@@ -474,6 +476,7 @@ export class ManagedAgentService {
           id,
           name,
           system_prompt: request.systemPrompt,
+          system_prompt_mode: request.systemPromptMode,
           cwd,
           tools_json: toolsJson,
           requested_model_provider: request.model?.provider ?? null,
@@ -739,7 +742,16 @@ export class ManagedAgentService {
     runs: ManagedAgentRunResponse[];
     nextCursor: string | null;
   }> {
-    let query = this.db.selectFrom('supervisor_agent_runs').selectAll();
+    let query = this.db
+      .selectFrom('supervisor_agent_runs')
+      .selectAll('supervisor_agent_runs')
+      .select((expression) =>
+        expression
+          .selectFrom('supervisor_agent_events as events')
+          .select((events) => events.fn.max<number>('events.sequence').as('latest_event_sequence'))
+          .whereRef('events.run_id', '=', 'supervisor_agent_runs.id')
+          .as('latest_event_sequence'),
+      );
     if (options.agentId) query = query.where('agent_id', '=', options.agentId);
     if (options.status) query = query.where('status', '=', options.status);
     if (options.cursor) {
@@ -863,6 +875,12 @@ export class ManagedAgentService {
         .set({
           ...(request.name === undefined ? {} : { name: request.name }),
           ...(request.systemPrompt === undefined ? {} : { system_prompt: request.systemPrompt }),
+          ...(request.systemPromptMode === undefined
+            ? {}
+            : { system_prompt_mode: request.systemPromptMode }),
+          ...(request.tools === undefined
+            ? {}
+            : { tools_json: request.tools === null ? null : encodeJson(request.tools) }),
           updated_at: updatedAt,
         })
         .where('id', '=', agentId)
@@ -2069,7 +2087,9 @@ export class ManagedAgentService {
     });
   }
 
-  private toRunResponse(row: AgentRunRow): ManagedAgentRunResponse {
+  private toRunResponse(
+    row: AgentRunRow & { latest_event_sequence?: number | null },
+  ): ManagedAgentRunResponse {
     return ManagedAgentRunResponseSchema.parse({
       id: row.id,
       agentId: row.agent_id,
@@ -2083,6 +2103,9 @@ export class ManagedAgentService {
       executionMode: row.execution_mode,
       worktreeId: row.worktree_id,
       parentRunId: row.parent_run_id,
+      ...(row.latest_event_sequence === undefined
+        ? {}
+        : { latestEventSequence: row.latest_event_sequence ?? 0 }),
       status: row.status,
       error:
         row.error_code === null || row.error_message === null
@@ -2114,6 +2137,7 @@ export class ManagedAgentService {
       id: row.id,
       name: row.name,
       systemPrompt: row.system_prompt,
+      systemPromptMode: row.system_prompt_mode,
       model:
         row.requested_model_provider && row.requested_model_id
           ? { provider: row.requested_model_provider, id: row.requested_model_id }
@@ -2195,6 +2219,7 @@ function createSessionOptions(
     (row.thinking_level ? (row.thinking_level as AgentThinkingLevel) : null);
   return {
     systemPrompt: row.system_prompt,
+    systemPromptMode: row.system_prompt_mode,
     cwd: resolveWorkingDirectory(request.cwd ?? row.cwd),
     ...(tools === null ? {} : { tools }),
     ...(model === null ? {} : { model }),

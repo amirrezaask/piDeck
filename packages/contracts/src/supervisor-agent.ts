@@ -24,6 +24,9 @@ export type AgentThinkingLevel = z.infer<typeof AgentThinkingLevelSchema>;
 export const AgentToolNameSchema = z.enum(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls']);
 export type AgentToolName = z.infer<typeof AgentToolNameSchema>;
 
+export const AgentSystemPromptModeSchema = z.enum(['append', 'replace']);
+export type AgentSystemPromptMode = z.infer<typeof AgentSystemPromptModeSchema>;
+
 export const AgentModelSchema = z.object({
   provider: z.string().trim().min(1).max(256),
   id: z.string().trim().min(1).max(512),
@@ -116,6 +119,7 @@ export type UpdateManagedExtensionsRequest = z.infer<typeof UpdateManagedExtensi
 export const CreateManagedAgentRequestSchema = z.object({
   name: z.string().trim().min(1).max(256).optional(),
   systemPrompt: z.string().min(1).max(250_000),
+  systemPromptMode: AgentSystemPromptModeSchema.default('append'),
   cwd: z.string().trim().min(1).max(4096).optional(),
   tools: z
     .array(AgentToolNameSchema)
@@ -125,22 +129,35 @@ export const CreateManagedAgentRequestSchema = z.object({
   model: AgentModelSchema.optional(),
   thinkingLevel: AgentThinkingLevelSchema.optional(),
 });
-export type CreateManagedAgentRequest = z.infer<typeof CreateManagedAgentRequestSchema>;
+export type CreateManagedAgentRequest = z.input<typeof CreateManagedAgentRequestSchema>;
 
 export const UpdateManagedAgentRequestSchema = z
   .object({
     name: z.string().trim().min(1).max(256).optional(),
     systemPrompt: z.string().min(1).max(250_000).optional(),
+    systemPromptMode: AgentSystemPromptModeSchema.optional(),
+    tools: z
+      .array(AgentToolNameSchema)
+      .max(7)
+      .refine((tools) => new Set(tools).size === tools.length, 'Tool names must be unique')
+      .nullable()
+      .optional(),
   })
-  .refine((request) => request.name !== undefined || request.systemPrompt !== undefined, {
-    message: 'At least one agent field must be provided',
-  });
+  .refine(
+    (request) =>
+      request.name !== undefined ||
+      request.systemPrompt !== undefined ||
+      request.systemPromptMode !== undefined ||
+      request.tools !== undefined,
+    { message: 'At least one agent field must be provided' },
+  );
 export type UpdateManagedAgentRequest = z.infer<typeof UpdateManagedAgentRequestSchema>;
 
 export const ManagedAgentResponseSchema = z.object({
   id: IdSchema,
   name: z.string().min(1).max(256),
   systemPrompt: z.string().min(1).max(250_000),
+  systemPromptMode: AgentSystemPromptModeSchema,
   model: AgentModelSchema.nullable(),
   thinkingLevel: AgentThinkingLevelSchema.nullable(),
   cwd: z.string().min(1),
@@ -209,6 +226,7 @@ export const ManagedAgentRunResponseSchema = z.object({
   executionMode: ExecutionModeSchema.optional(),
   worktreeId: IdSchema.nullable().optional(),
   parentRunId: IdSchema.nullable().optional(),
+  latestEventSequence: z.number().int().nonnegative().optional(),
   status: ManagedAgentRunStatusSchema,
   error: ManagedAgentRunErrorSchema.nullable(),
   createdAt: IsoTimestampSchema,

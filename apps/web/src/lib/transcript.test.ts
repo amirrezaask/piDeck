@@ -59,7 +59,7 @@ describe('mapPiEvents', () => {
         startSequence: 1,
         endSequence: 4,
         events: [
-          { kind: 'marker', label: 'Thinking...', tone: 'active' },
+          { kind: 'marker', label: 'Agent started', tone: 'active' },
           {
             kind: 'marker',
             label: 'Ran bash',
@@ -67,7 +67,7 @@ describe('mapPiEvents', () => {
             toolCall: true,
             toolArguments: { command: 'pwd' },
           },
-          { kind: 'marker', label: 'Thinking...', tone: 'active' },
+          { kind: 'marker', label: 'Agent finished', tone: 'success' },
         ],
       },
     ]);
@@ -109,7 +109,7 @@ describe('mapPiEvents', () => {
     ]);
   });
 
-  it('maps lifecycle noise to shimmer thinking markers', () => {
+  it('maps every lifecycle event to a visible label', () => {
     expect(
       mapPiEvents([
         event(1, 'message_start'),
@@ -121,16 +121,16 @@ describe('mapPiEvents', () => {
       {
         kind: 'event-group',
         events: [
-          { kind: 'marker', label: 'Thinking...', variant: 'default', shimmer: true },
-          { kind: 'marker', label: 'Thinking...', variant: 'default', shimmer: true },
-          { kind: 'marker', label: 'Thinking...', variant: 'default', shimmer: true },
-          { kind: 'marker', label: 'Thinking...', variant: 'default', shimmer: true },
+          { kind: 'marker', label: 'Response started', variant: 'default' },
+          { kind: 'marker', label: 'Response finished', variant: 'default' },
+          { kind: 'marker', label: 'Turn started', variant: 'default' },
+          { kind: 'marker', label: 'Turn finished', variant: 'default' },
         ],
       },
     ]);
   });
 
-  it('collapses repeated thinking markers while keeping the raw event count', () => {
+  it('preserves every lifecycle marker in expanded activity', () => {
     const [item] = mapPiEvents([
       event(1, 'agent_start'),
       event(2, 'message_start'),
@@ -143,7 +143,10 @@ describe('mapPiEvents', () => {
 
     expect(item.events).toHaveLength(4);
     expect(collapseThinkingMarkers(item.events)).toMatchObject([
-      { kind: 'marker', label: 'Thinking...', shimmer: true },
+      { kind: 'marker', label: 'Agent started' },
+      { kind: 'marker', label: 'Response started' },
+      { kind: 'marker', label: 'Response finished' },
+      { kind: 'marker', label: 'Agent finished' },
     ]);
   });
 

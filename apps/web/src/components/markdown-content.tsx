@@ -88,7 +88,7 @@ type ListMarker = {
   content: string;
 };
 
-type TableAlignment = 'left' | 'center' | 'right';
+type TableAlignment = 'start' | 'left' | 'center' | 'right';
 
 export function MarkdownContent({
   content,
@@ -98,8 +98,9 @@ export function MarkdownContent({
   return (
     <article
       data-slot="markdown-content"
+      dir="auto"
       className={cn(
-        'min-w-0 text-sm',
+        'min-w-0 text-start text-sm',
         variant === 'conversation'
           ? 'leading-6 [&>p:first-child]:mt-0 [&>p:last-child]:mb-0'
           : 'text-foreground',
@@ -184,6 +185,7 @@ function renderMarkdownBlocks(content: string, variant: MarkdownVariant): ReactN
       blocks.push(
         <blockquote
           key={`quote-${index}`}
+          dir={textDirection(quoteLines.join('\n'))}
           className={cn(
             'my-3 border-s border-border/80 ps-4 text-muted-foreground [&_[data-slot=markdown-content]]:my-0',
             variant === 'preview' && 'my-5',
@@ -236,6 +238,7 @@ function renderMarkdownBlocks(content: string, variant: MarkdownVariant): ReactN
     blocks.push(
       <p
         key={`paragraph-${index}`}
+        dir="auto"
         className={cn(
           variant === 'conversation'
             ? 'mb-3 max-w-[75ch] whitespace-pre-wrap text-current'
@@ -277,6 +280,7 @@ function renderHeading(
   return (
     <Heading
       key={key}
+      dir="auto"
       className={cn('font-semibold tracking-tight text-foreground', headingClasses)}
     >
       {renderMarkdownInline(content)}
@@ -349,6 +353,7 @@ function renderList(
     <List
       key={key}
       start={ordered ? start : undefined}
+      dir="auto"
       className={cn(
         ordered ? 'list-decimal' : 'list-disc',
         'my-3 space-y-1 ps-5 marker:text-muted-foreground',
@@ -364,7 +369,7 @@ function renderList(
         return items.map((item) => {
           const itemKey = itemKeys.shift() ?? `${key}-item`;
           return (
-            <li key={itemKey} className="ps-1">
+            <li key={itemKey} dir="auto" className="ps-1">
               {item.checked !== undefined ? (
                 <span className="inline-flex items-start gap-2">
                   <input
@@ -408,7 +413,7 @@ function renderTable(
         variant === 'preview' && 'my-6',
       )}
     >
-      <table className="w-full min-w-max border-collapse text-left text-sm">
+      <table dir="auto" className="w-full min-w-max border-collapse text-start text-sm">
         <thead className="bg-muted/50">
           <tr>
             {stableKeys(headers, `${key}-header`, (header) => header).map((headerKey, index) => (
@@ -468,8 +473,9 @@ function parseTable(
   const alignments = headers.map((_, index) => {
     const separator = separators[index] ?? '';
     if (separator.startsWith(':') && separator.endsWith(':')) return 'center';
+    if (separator.startsWith(':')) return 'left';
     if (separator.endsWith(':')) return 'right';
-    return 'left';
+    return 'start';
   });
   const rows: string[][] = [];
   let index = startIndex + 2;
@@ -501,7 +507,9 @@ function tableAlignmentClass(alignment: TableAlignment | undefined): string {
     ? 'text-center'
     : alignment === 'right'
       ? 'text-right'
-      : 'text-left';
+      : alignment === 'left'
+        ? 'text-left'
+        : 'text-start';
 }
 
 function isTableStart(lines: string[], index: number): boolean {
@@ -599,6 +607,7 @@ function MarkdownCodeBlock({ code, language }: CodeBlockProps) {
     <div
       data-slot="code-block"
       data-language={language || 'text'}
+      dir="ltr"
       className="my-4 min-w-0 max-w-full overflow-hidden rounded-lg border border-border/80 bg-[var(--code-surface)] shadow-sm"
     >
       <div className="flex h-8 items-center justify-between border-b border-border/60 bg-[var(--code-header)] px-3">
@@ -794,7 +803,8 @@ function renderMarkdownInline(value: string): ReactNode[] {
         pushToken(
           <code
             key={`code-${index}`}
-            className="rounded-md border border-border/60 bg-muted/80 px-1.5 py-0.5 font-mono text-[0.85em] text-current"
+            dir="ltr"
+            className="inline-block rounded-md border border-border/60 bg-muted/80 px-1.5 py-0.5 font-mono text-[0.85em] text-current [unicode-bidi:isolate]"
           >
             {code}
           </code>,
@@ -833,6 +843,7 @@ function renderMarkdownInline(value: string): ReactNode[] {
         <a
           key={`autolink-${index}`}
           href={href}
+          dir="ltr"
           target={href.startsWith('http') ? '_blank' : undefined}
           rel={href.startsWith('http') ? 'noreferrer' : undefined}
           className="font-medium text-primary underline decoration-primary/35 underline-offset-2 transition-colors hover:decoration-primary"
@@ -943,4 +954,12 @@ function isMarkdownPunctuation(value: string | undefined): value is string {
 
 function isWordCharacter(value: string | undefined): boolean {
   return value !== undefined && /[\p{L}\p{N}_]/u.test(value);
+}
+
+function textDirection(value: string): 'ltr' | 'rtl' | 'auto' {
+  for (const character of value) {
+    if (/[\p{Script=Arabic}\p{Script=Hebrew}]/u.test(character)) return 'rtl';
+    if (/\p{L}/u.test(character)) return 'ltr';
+  }
+  return 'auto';
 }

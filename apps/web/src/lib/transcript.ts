@@ -206,30 +206,16 @@ function groupConsecutiveEvents(items: readonly TranscriptItem[]): TranscriptIte
   return grouped;
 }
 
-const THINKING_EVENT_TYPES = new Set([
-  'agent_start',
-  'turn_start',
-  'message_start',
-  'message_end',
-  'turn_end',
-  'agent_end',
-  'agent_settled',
-]);
-
-function thinkingMarker(base: {
-  id: string;
-  createdAt: string;
-  sequence: number;
-}): TranscriptEvent {
-  return {
-    ...base,
-    kind: 'marker',
-    label: 'Thinking...',
-    tone: 'active',
-    variant: 'default',
-    shimmer: true,
+const LIFECYCLE_EVENTS: Record<string, { label: string; tone: 'neutral' | 'active' | 'success' }> =
+  {
+    agent_start: { label: 'Agent started', tone: 'active' },
+    turn_start: { label: 'Turn started', tone: 'active' },
+    message_start: { label: 'Response started', tone: 'active' },
+    message_end: { label: 'Response finished', tone: 'success' },
+    turn_end: { label: 'Turn finished', tone: 'success' },
+    agent_end: { label: 'Agent finished', tone: 'success' },
+    agent_settled: { label: 'Agent settled', tone: 'success' },
   };
-}
 
 function mapEvent(
   event: ManagedAgentEvent,
@@ -264,7 +250,16 @@ function mapEvent(
     };
   }
 
-  if (THINKING_EVENT_TYPES.has(event.type)) return thinkingMarker(base);
+  const lifecycle = LIFECYCLE_EVENTS[event.type];
+  if (lifecycle) {
+    return {
+      ...base,
+      kind: 'marker',
+      label: lifecycle.label,
+      tone: lifecycle.tone,
+      variant: 'default',
+    };
+  }
 
   if (event.type === 'message_update' || event.type === 'tool_execution_update') return undefined;
 

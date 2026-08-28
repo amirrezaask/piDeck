@@ -64,6 +64,7 @@ interface ComposerInputProps {
   readonly ariaLabel: string;
   readonly disabled?: boolean;
   readonly rows?: number;
+  readonly maxLength?: number;
   readonly className?: string;
   readonly placement?: 'top' | 'bottom';
   readonly onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
@@ -78,6 +79,7 @@ export function ComposerInput({
   ariaLabel,
   disabled,
   rows,
+  maxLength,
   className,
   placement = 'top',
   onKeyDown,
@@ -193,6 +195,7 @@ export function ComposerInput({
             value={value}
             disabled={disabled}
             rows={rows}
+            maxLength={maxLength}
             className={className}
             onChange={handleChange}
             onKeyDown={handleKeyDown}

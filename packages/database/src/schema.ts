@@ -195,6 +195,7 @@ export interface SupervisorAgentsTable {
   id: string;
   name: string;
   system_prompt: string;
+  system_prompt_mode: 'append' | 'replace';
   cwd: string;
   tools_json: Nullable<string>;
   requested_model_provider: Nullable<string>;

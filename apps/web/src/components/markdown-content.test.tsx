@@ -19,6 +19,26 @@ describe('MarkdownContent', () => {
     expect(container.querySelector('a')).toHaveAttribute('href', 'https://example.com/docs');
   });
 
+  it('uses each Markdown block’s natural direction while isolating code', () => {
+    const { container } = render(
+      <MarkdownContent
+        variant="preview"
+        content={`# خلاصه\n\nاین متن فارسی شامل \`npm run build\` است.\n\n- مورد اول\n- مورد دوم\n\n> متن نقل‌قول\n\n| نام | مقدار |\n| --- | ---: |\n| وضعیت | Ready |\n\n\`شناسه-42\`\n\n\`\`\`ts\nconst status = 'آماده';\n\`\`\``}
+      />,
+    );
+
+    expect(container.querySelector('article')).toHaveAttribute('dir', 'auto');
+    expect(container.querySelector('h1')).toHaveAttribute('dir', 'auto');
+    expect(container.querySelector('p')).toHaveAttribute('dir', 'auto');
+    expect(container.querySelector('ul')).toHaveAttribute('dir', 'auto');
+    expect(container.querySelector('li')).toHaveAttribute('dir', 'auto');
+    expect(container.querySelector('blockquote')).toHaveAttribute('dir', 'rtl');
+    expect(container.querySelector('table')).toHaveAttribute('dir', 'auto');
+    expect(container.querySelector('th')).toHaveClass('text-start');
+    expect(container.querySelector('code')).toHaveAttribute('dir', 'ltr');
+    expect(container.querySelector('[data-slot="code-block"]')).toHaveAttribute('dir', 'ltr');
+  });
+
   it('does not create unsafe links from Markdown', () => {
     const { container } = render(
       <MarkdownContent

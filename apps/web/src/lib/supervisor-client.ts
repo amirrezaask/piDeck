@@ -98,6 +98,8 @@ export interface SupervisorClientOptions {
   readonly fetcher?: typeof fetch;
   readonly webSocketFactory?: typeof WebSocket;
   readonly requestTimeoutMs?: number;
+  /** Total attempts for safe read requests. Mutating requests are never retried automatically. */
+  readonly maxRequestAttempts?: number;
 }
 
 export type StreamConnectionState = 'connected' | 'reconnecting' | 'stale' | 'failed';
@@ -122,6 +124,7 @@ export class SupervisorClient {
   private readonly fetcher: typeof fetch;
   private readonly webSocketFactory: typeof WebSocket | undefined;
   private readonly requestTimeoutMs: number;
+  private readonly maxRequestAttempts: number;
 
   constructor(options: SupervisorClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? '/supervisor-api').replace(/\/$/, '');
@@ -129,6 +132,7 @@ export class SupervisorClient {
     this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
     this.webSocketFactory = options.webSocketFactory ?? globalThis.WebSocket;
     this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? 30_000);
+    this.maxRequestAttempts = Math.max(1, Math.floor(options.maxRequestAttempts ?? 2));
   }
 
   createAgent(request: CreateManagedAgentRequest): Promise<ManagedAgentResponse> {
@@ -478,8 +482,9 @@ export class SupervisorClient {
 
     while (!signal?.aborted) {
       options.onConnectionState?.(reconnectAttempt === 0 ? 'stale' : 'reconnecting');
-      const queue = new AsyncEventQueue<ManagedAgentEvent>();
+      const queue = new AsyncEventQueue<ManagedAgentEvent>(500, 4_000_000);
       let socket: WebSocket | undefined;
+      let receivedSequence = lastSequence;
       let closedUnexpectedly = false;
       let demonstratedHealth = false;
       const abort = () => {
@@ -487,7 +492,7 @@ export class SupervisorClient {
         socket?.close();
       };
       const onOpen = () => {
-        options.onConnectionState?.('stale');
+        options.onConnectionState?.('connected');
       };
       signal?.addEventListener('abort', abort, { once: true });
 
@@ -500,28 +505,28 @@ export class SupervisorClient {
         socket.onopen = onOpen;
         socket.onmessage = (event) => {
           try {
-            const payload = ManagedAgentEventSchema.parse(
-              JSON.parse(
-                typeof event.data === 'string' ? event.data : String(event.data),
-              ) as unknown,
-            );
-            if (payload.sequence <= lastSequence) return;
-            if (options.detectGaps !== false && payload.sequence > lastSequence + 1) {
+            const encoded = typeof event.data === 'string' ? event.data : String(event.data);
+            const payload = ManagedAgentEventSchema.parse(JSON.parse(encoded) as unknown);
+            if (payload.sequence <= receivedSequence) return;
+            if (options.detectGaps !== false && payload.sequence > receivedSequence + 1) {
               queue.fail(
                 new Error(
-                  `Supervisor event sequence gap: expected ${lastSequence + 1}, received ${payload.sequence}`,
+                  `Supervisor event sequence gap: expected ${receivedSequence + 1}, received ${payload.sequence}`,
                 ),
               );
               socket?.close();
               return;
             }
-            lastSequence = payload.sequence;
+            if (!queue.push(payload, encoded.length)) {
+              socket?.close();
+              return;
+            }
+            receivedSequence = payload.sequence;
             if (!demonstratedHealth) {
               demonstratedHealth = true;
               reconnectAttempt = 0;
               options.onConnectionState?.('connected');
             }
-            queue.push(payload);
           } catch (reason) {
             queue.fail(reason instanceof Error ? reason : new Error('Invalid Supervisor event'));
             socket?.close();
@@ -538,6 +543,7 @@ export class SupervisorClient {
           if (result.done) {
             reading = false;
           } else {
+            lastSequence = result.value.sequence;
             yield result.value;
           }
         }
@@ -616,32 +622,59 @@ export class SupervisorClient {
     schema: RuntimeSchema<T>,
     init: RequestInit = {},
   ): Promise<T> {
-    const controller = new AbortController();
-    const timeout = globalThis.setTimeout(
-      () => controller.abort(new DOMException('Supervisor request timed out', 'TimeoutError')),
-      this.requestTimeoutMs,
-    );
-    const abort = () => controller.abort(init.signal?.reason);
-    init.signal?.addEventListener('abort', abort, { once: true });
-    if (init.signal?.aborted) abort();
-    try {
-      const response = await this.fetcher(`${this.baseUrl}${path}`, {
-        ...init,
-        signal: controller.signal,
-        headers: {
-          ...this.headers('application/json'),
-          ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-          ...init.headers,
-        },
-      });
-      if (!response.ok) {
-        throw await responseError(response);
+    const method = (init.method ?? 'GET').toUpperCase();
+    const attempts = method === 'GET' || method === 'HEAD' ? this.maxRequestAttempts : 1;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = globalThis.setTimeout(
+        () => controller.abort(new DOMException('Supervisor request timed out', 'TimeoutError')),
+        this.requestTimeoutMs,
+      );
+      const abort = () => controller.abort(init.signal?.reason);
+      init.signal?.addEventListener('abort', abort, { once: true });
+      if (init.signal?.aborted) abort();
+      try {
+        let response: Response;
+        try {
+          response = await this.fetcher(`${this.baseUrl}${path}`, {
+            ...init,
+            signal: controller.signal,
+            headers: {
+              ...this.headers('application/json'),
+              ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+              ...init.headers,
+            },
+          });
+        } catch (reason) {
+          if (
+            attempt + 1 < attempts &&
+            !init.signal?.aborted &&
+            !controller.signal.aborted &&
+            isRetryableReadFailure(reason)
+          ) {
+            await delayWithSignal(requestRetryDelay(attempt), init.signal ?? undefined);
+            continue;
+          }
+          throw reason;
+        }
+
+        if (!response.ok) {
+          const error = await responseError(response);
+          if (attempt + 1 < attempts && isRetryableReadStatus(response.status)) {
+            await delayWithSignal(requestRetryDelay(attempt), init.signal ?? undefined);
+            continue;
+          }
+          throw error;
+        }
+        return schema.parse(await response.json());
+      } finally {
+        globalThis.clearTimeout(timeout);
+        init.signal?.removeEventListener('abort', abort);
       }
-      return schema.parse(await response.json());
-    } finally {
-      globalThis.clearTimeout(timeout);
-      init.signal?.removeEventListener('abort', abort);
     }
+
+    throw new Error('Supervisor request attempts exhausted');
   }
 
   private headers(accept: string): Record<string, string> {
@@ -653,19 +686,36 @@ export class SupervisorClient {
 }
 
 class AsyncEventQueue<T> {
-  private readonly values: T[] = [];
+  private readonly values: Array<{ value: T; bytes: number }> = [];
   private readonly waiters: Array<{
     resolve(result: IteratorResult<T>): void;
     reject(error: Error): void;
   }> = [];
+  private readonly maxCount: number;
+  private readonly maxBytes: number;
+  private bufferedBytes = 0;
   private ended = false;
   private failure: Error | undefined;
 
-  push(value: T): void {
-    if (this.ended) return;
+  constructor(maxCount = Number.POSITIVE_INFINITY, maxBytes = Number.POSITIVE_INFINITY) {
+    this.maxCount = maxCount;
+    this.maxBytes = maxBytes;
+  }
+
+  push(value: T, bytes = 1): boolean {
+    if (this.ended) return false;
     const waiter = this.waiters.shift();
-    if (waiter) waiter.resolve({ done: false, value });
-    else this.values.push(value);
+    if (waiter) {
+      waiter.resolve({ done: false, value });
+      return true;
+    }
+    if (this.values.length >= this.maxCount || this.bufferedBytes + bytes > this.maxBytes) {
+      this.fail(new Error('Supervisor event buffer exceeded its safe limit'));
+      return false;
+    }
+    this.values.push({ value, bytes });
+    this.bufferedBytes += bytes;
+    return true;
   }
 
   fail(error: Error): void {
@@ -682,12 +732,34 @@ class AsyncEventQueue<T> {
   }
 
   next(): Promise<IteratorResult<T>> {
-    const value = this.values.shift();
-    if (value !== undefined) return Promise.resolve({ done: false, value });
+    const entry = this.values.shift();
+    if (entry !== undefined) {
+      this.bufferedBytes -= entry.bytes;
+      return Promise.resolve({ done: false, value: entry.value });
+    }
     if (this.failure) return Promise.reject(this.failure);
     if (this.ended) return Promise.resolve({ done: true, value: undefined });
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
+}
+
+function isRetryableReadFailure(reason: unknown): boolean {
+  return !(reason instanceof DOMException && ['AbortError', 'TimeoutError'].includes(reason.name));
+}
+
+function isRetryableReadStatus(status: number): boolean {
+  return (
+    status === 408 ||
+    status === 425 ||
+    status === 429 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  );
+}
+
+function requestRetryDelay(attempt: number): number {
+  return Math.min(1_000, 100 * 2 ** attempt);
 }
 
 function reconnectDelay(attempt: number): number {

@@ -154,6 +154,36 @@ describe('ManagedAgentService', () => {
     }
   });
 
+  it('projects the latest event sequence into run summaries', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Track activity.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Inspect this.' });
+      const latest = await context.connection.db
+        .selectFrom('supervisor_agent_events')
+        .select((expression) => expression.fn.max<number>('sequence').as('sequence'))
+        .where('agent_id', '=', agent.id)
+        .executeTakeFirstOrThrow();
+      const sequence = (latest.sequence ?? 0) + 1;
+      await context.connection.db
+        .insertInto('supervisor_agent_events')
+        .values({
+          agent_id: agent.id,
+          run_id: run.id,
+          sequence,
+          event_type: 'test.activity',
+          payload_json: '{}',
+          created_at: nowIso(),
+        })
+        .execute();
+
+      const listed = await context.service.listRuns({ agentId: agent.id, limit: 10 });
+      expect(listed.runs[0]).toMatchObject({ id: run.id, latestEventSequence: sequence });
+    } finally {
+      await context.close();
+    }
+  });
+
   it('rejects an admission write fault before starting paid work', async () => {
     let failAdmission = false;
     const context = await createService({
@@ -493,6 +523,34 @@ describe('ManagedAgentService', () => {
       const events = await context.service.listRunEvents(run.id, { afterSequence: 0 });
       expect(events.length).toBeGreaterThan(0);
       expect(events.every((event) => event.runId === run.id)).toBe(true);
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('applies updated prompt and tool-call settings to new runs', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({
+        systemPrompt: 'Answer only from the supplied prompt.',
+      });
+      const updated = await context.service.renameAgent(agent.id, {
+        systemPromptMode: 'replace',
+        tools: [],
+      });
+      expect(updated).toMatchObject({
+        systemPromptMode: 'replace',
+        tools: [],
+      });
+
+      await context.service.createRun({ agentId: updated.id, prompt: 'Start.' });
+      expect(context.factory.requests).toContainEqual(
+        expect.objectContaining({
+          systemPrompt: 'Answer only from the supplied prompt.',
+          systemPromptMode: 'replace',
+          tools: [],
+        }),
+      );
     } finally {
       await context.close();
     }
