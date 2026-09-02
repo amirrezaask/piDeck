@@ -15,14 +15,12 @@ import type {
 } from '@nextflow/contracts';
 import { ManagedAgentRunResponseSchema } from '@nextflow/contracts';
 import {
-  ArchiveIcon,
   ArrowUpIcon,
   BookOpenIcon,
   BotIcon,
   BrainIcon,
   BugIcon,
   CheckCircle2Icon,
-  ChevronDownIcon,
   ChevronRightIcon,
   CircleStopIcon,
   DownloadIcon,
@@ -31,14 +29,11 @@ import {
   FileTextIcon,
   FolderIcon,
   GitBranchIcon,
-  GitForkIcon,
   ImageIcon,
   InboxIcon,
   ListEndIcon,
   LoaderCircleIcon,
   MoonIcon,
-  PanelLeftCloseIcon,
-  PanelLeftOpenIcon,
   PaperclipIcon,
   PencilIcon,
   PlusIcon,
@@ -53,7 +48,6 @@ import {
   XIcon,
 } from 'lucide-react';
 import { AnimatePresence, LayoutGroup, MotionConfig, motion, useReducedMotion } from 'motion/react';
-import { ContextMenu as ContextMenuPrimitive } from 'radix-ui';
 import {
   type ChangeEvent,
   type DragEvent,
@@ -68,7 +62,7 @@ import {
   useState,
 } from 'react';
 
-import { ComposerInput } from '@/components/composer-input';
+import { type ComposerCommand, ComposerInput } from '@/components/composer-input';
 import { MarkdownContent } from '@/components/markdown-content';
 import { CommandPalette, type ServerOperationsClient } from '@/components/operations';
 import {
@@ -93,6 +87,15 @@ import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Bubble, BubbleContent } from '@/components/ui/bubble';
 import { Button } from '@/components/ui/button';
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
 import {
   Command,
   CommandEmpty,
@@ -169,10 +172,9 @@ import {
 } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { TooltipProvider } from '@/components/ui/tooltip';
 import { activitySince, readCheckedActivity, writeCheckedActivity } from '@/lib/activity-state';
 import { ApiError } from '@/lib/api-error';
 import { useComposerDraft } from '@/lib/composer-draft';
@@ -229,32 +231,9 @@ const THINKING_LEVELS: readonly AgentThinkingLevel[] = [
   'max',
 ];
 
-const TASK_STARTERS = [
-  {
-    label: 'Understand this codebase',
-    prompt:
-      'Inspect this codebase and explain its architecture, important modules, and current risks.',
-  },
-  {
-    label: 'Review current changes',
-    prompt:
-      'Review the current changes for correctness, regressions, and missing tests. Report findings before editing.',
-  },
-  {
-    label: 'Fix a failing check',
-    prompt:
-      'Run the relevant checks, diagnose the first failure, fix its root cause, and verify the result.',
-  },
-] as const;
-
 type SettingsSection = 'servers' | 'agents' | 'projects' | 'skills' | 'extensions' | 'appearance';
 
-type AppLayout = 'sidebar' | 'tabs';
-
 const THEME_STORAGE_KEY = 'pideck-theme';
-const LAYOUT_STORAGE_KEY = 'pideck-layout';
-const SIDEBAR_STORAGE_KEY = 'pideck-sidebar-collapsed';
-const ARCHIVED_RUNS_STORAGE_KEY = 'pideck-archived-runs';
 const CHANGES_PANEL_SIZE_STORAGE_KEY = 'pideck-changes-panel-size';
 const TERMINAL_PANEL_SIZE_STORAGE_KEY = 'pideck-terminal-panel-size';
 const RUN_ATTACHMENT_CACHE_LIMIT = 24;
@@ -503,39 +482,6 @@ function readDarkModePreference() {
   }
 }
 
-function readAppLayoutPreference(): AppLayout {
-  if (typeof window === 'undefined') return 'sidebar';
-
-  try {
-    return window.localStorage.getItem(LAYOUT_STORAGE_KEY) === 'tabs' ? 'tabs' : 'sidebar';
-  } catch {
-    return 'sidebar';
-  }
-}
-
-function readSidebarCollapsedPreference() {
-  if (typeof window === 'undefined') return false;
-
-  try {
-    return window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === 'true';
-  } catch {
-    return false;
-  }
-}
-
-function readArchivedRunIds(): string[] {
-  if (typeof window === 'undefined') return [];
-
-  try {
-    const value: unknown = JSON.parse(
-      window.localStorage.getItem(ARCHIVED_RUNS_STORAGE_KEY) ?? '[]',
-    );
-    return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : [];
-  } catch {
-    return [];
-  }
-}
-
 export type SupervisorClientApi = Pick<
   SupervisorClient,
   | 'listAgents'
@@ -654,6 +600,9 @@ export default function App({
   const [client, setClient] = useState<SupervisorClientApi>(injectedClient ?? supervisorClient);
   const [initialRoute] = useState(readAppRoute);
   const initialRouteRef = useRef(initialRoute);
+  const [workspaceView, setWorkspaceView] = useState<'overview' | 'new'>(() =>
+    initialRoute.kind === 'new' ? 'new' : 'overview',
+  );
   const [servers, setServers] = useState<ServerDefinition[]>(() =>
     injectedClient ? [fallbackServer] : [],
   );
@@ -669,8 +618,6 @@ export default function App({
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(() =>
     initialRoute.kind === 'session' ? initialRoute.runId : undefined,
   );
-  const [archivedRunIds, setArchivedRunIds] = useState<string[]>(readArchivedRunIds);
-  const initialArchivedRunIdsRef = useRef(archivedRunIds);
   const [events, setEvents] = useState<ManagedAgentEvent[]>([]);
   const [hasOlderEvents, setHasOlderEvents] = useState(false);
   const [loadingOlderEvents, setLoadingOlderEvents] = useState(false);
@@ -685,8 +632,6 @@ export default function App({
     injectedClient ? 'agents' : 'servers',
   );
   const [darkMode, setDarkMode] = useState(() => readDarkModePreference());
-  const [appLayout, setAppLayout] = useState<AppLayout>(readAppLayoutPreference);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readSidebarCollapsedPreference());
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string>();
@@ -704,24 +649,7 @@ export default function App({
       ),
     [snapshots],
   );
-  const visibleSessions = useMemo(
-    () =>
-      sessions.filter(
-        (session) =>
-          !archivedRunIds.includes(sessionKey(session.serverId, session.run.id)) &&
-          !archivedRunIds.includes(session.run.id),
-      ),
-    [archivedRunIds, sessions],
-  );
-  const archivedSessions = useMemo(
-    () =>
-      sessions.filter(
-        (session) =>
-          archivedRunIds.includes(sessionKey(session.serverId, session.run.id)) ||
-          archivedRunIds.includes(session.run.id),
-      ),
-    [archivedRunIds, sessions],
-  );
+  const visibleSessions = sessions;
   const run = runs.find((candidate) => candidate.id === selectedRunId);
   const selectedAgent = agents.find((agent) => agent.id === run?.agentId);
   const activeServer = servers.find((server) => server.id === activeServerId);
@@ -762,9 +690,6 @@ export default function App({
     }
     return undefined;
   }, [inboxBySession, selectedSessionKey, sessions, snapshots]);
-  const workspaceTabValue =
-    activeServerId && selectedRunId ? sessionKey(activeServerId, selectedRunId) : 'new';
-
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
     document.documentElement.style.colorScheme = darkMode ? 'dark' : 'light';
@@ -780,30 +705,6 @@ export default function App({
   }, [darkMode]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(LAYOUT_STORAGE_KEY, appLayout);
-    } catch {
-      // Preferences are a convenience; an unavailable storage API should not block the app.
-    }
-  }, [appLayout]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(sidebarCollapsed));
-    } catch {
-      // Preferences are a convenience; an unavailable storage API should not block the app.
-    }
-  }, [sidebarCollapsed]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(ARCHIVED_RUNS_STORAGE_KEY, JSON.stringify(archivedRunIds));
-    } catch {
-      // Preferences are a convenience; an unavailable storage API should not block the app.
-    }
-  }, [archivedRunIds]);
-
-  useEffect(() => {
     writeCheckedActivity(checkedActivity);
   }, [checkedActivity]);
 
@@ -812,6 +713,7 @@ export default function App({
       const route = readAppRoute();
       if (route.kind !== 'session') {
         setSelectedRunId(undefined);
+        setWorkspaceView(route.kind === 'new' ? 'new' : 'overview');
         return;
       }
       const snapshot = route.serverId
@@ -928,25 +830,11 @@ export default function App({
             : undefined;
         const firstSession = Object.values(nextSnapshots)
           .flatMap((snapshot) => snapshot.runs.map((candidate) => ({ snapshot, run: candidate })))
-          .find(
-            ({ snapshot, run: candidate }) =>
-              !initialArchivedRunIdsRef.current.includes(
-                sessionKey(snapshot.server.id, candidate.id),
-              ) && !initialArchivedRunIdsRef.current.includes(candidate.id),
-          );
+          .at(0);
         const targetSnapshot =
           routeSnapshot ?? firstSession?.snapshot ?? Object.values(nextSnapshots)[0];
         if (targetSnapshot) {
-          const nextRunId = route.kind === 'default' ? firstSession?.run.id : routeRunId;
-          activateSnapshot(targetSnapshot, nextRunId);
-          if (nextRunId && !routeRunId) {
-            const nextRoute = {
-              kind: 'session',
-              serverId: targetSnapshot.server.id,
-              runId: nextRunId,
-            } as const;
-            writeAppRoute(nextRoute, true);
-          }
+          activateSnapshot(targetSnapshot, routeRunId);
         }
       } catch (reason) {
         if (active) setError(errorMessage(reason));
@@ -1636,6 +1524,16 @@ export default function App({
     });
   }
 
+  function openOverview() {
+    if (activeServerId && selectedRunId) {
+      markSessionChecked(activeServerId, selectedRunId, events.at(-1)?.sequence);
+    }
+    setSelectedRunId(undefined);
+    setEvents([]);
+    setWorkspaceView('overview');
+    writeAppRoute({ kind: 'default' });
+  }
+
   function openRun(serverId: string, runId: string) {
     const snapshot = snapshotsRef.current[serverId];
     if (!snapshot) return;
@@ -1659,25 +1557,8 @@ export default function App({
     }
     setSelectedRunId(undefined);
     setEvents([]);
+    setWorkspaceView('new');
     writeAppRoute({ kind: 'new' });
-  }
-
-  function restoreRun(serverId: string, runId: string) {
-    const key = sessionKey(serverId, runId);
-    setArchivedRunIds((current) => current.filter((item) => item !== key && item !== runId));
-    openRun(serverId, runId);
-  }
-
-  function archiveRun(serverId: string, runId: string) {
-    const key = sessionKey(serverId, runId);
-    setArchivedRunIds((current) => (current.includes(key) ? current : [...current, key]));
-    if (activeServerId !== serverId || selectedRunId !== runId) return;
-
-    const nextSession = visibleSessions.find(
-      (candidate) => candidate.serverId !== serverId || candidate.run.id !== runId,
-    );
-    if (nextSession) openRun(nextSession.serverId, nextSession.run.id);
-    else openNewSession();
   }
 
   useEffect(() => {
@@ -1706,570 +1587,159 @@ export default function App({
         <LayoutGroup>
           <motion.main
             aria-label="piDeck agent workspace"
-            className={cn(
-              'grid h-svh grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-background text-foreground motion-safe:transition-[grid-template-columns] motion-safe:duration-120 motion-safe:ease-out',
-              appLayout === 'tabs'
-                ? 'grid-cols-1'
-                : sidebarCollapsed
-                  ? 'md:grid-cols-[4.5rem_minmax(0,1fr)] md:grid-rows-1'
-                  : 'md:grid-cols-[18rem_minmax(0,1fr)] md:grid-rows-1',
-            )}
+            className="grid h-svh grid-cols-1 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-background text-foreground"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.12, ease: [0.22, 1, 0.36, 1] }}
           >
-            <Tabs
-              value={workspaceTabValue}
-              className="contents"
-              onValueChange={(value) => {
-                const session = visibleSessions.find(
-                  (candidate) => sessionKey(candidate.serverId, candidate.run.id) === value,
-                );
-                if (session) openRun(session.serverId, session.run.id);
-              }}
-            >
-              {appLayout === 'sidebar' ? (
-                <motion.aside
-                  className="flex min-w-0 flex-col border-b bg-sidebar md:min-h-svh md:border-r md:border-b-0"
-                  initial={{ opacity: 0, x: -18 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{
-                    duration: 0.12,
-                    delay: 0.02,
-                    ease: [0.22, 1, 0.36, 1],
-                  }}
-                >
+            <AppToolbar
+              darkMode={darkMode}
+              onOverview={openOverview}
+              onNew={openNewSession}
+              onSearch={() => setPaletteOpen(true)}
+              onSettings={() => setSettingsOpen(true)}
+              onDarkModeChange={setDarkMode}
+            />
+            <section className="flex h-full min-h-0 min-w-0 flex-col">
+              {activeServerId &&
+              snapshots[activeServerId] &&
+              Object.values(snapshots[activeServerId].resources).some(
+                (resource) => resource.status !== 'live',
+              ) ? (
+                <Alert className="m-4 mb-0 w-auto">
+                  <AlertTitle>Server data is degraded</AlertTitle>
+                  <AlertDescription className="flex items-center justify-between gap-3">
+                    <span>
+                      {Object.entries(snapshots[activeServerId].resources)
+                        .filter(([, resource]) => resource.status !== 'live')
+                        .map(([name]) => name)
+                        .join(', ')}{' '}
+                      data is stale or unavailable. Known runs remain available.
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void retryServerSnapshot(activeServerId)}
+                    >
+                      Retry
+                    </Button>
+                  </AlertDescription>
+                </Alert>
+              ) : null}
+              <AnimatePresence initial={false}>
+                {error ? (
                   <motion.div
-                    className={cn(
-                      'flex min-h-12 w-full items-center gap-1.5 px-2.5 py-2',
-                      sidebarCollapsed && 'md:flex-col md:gap-2 md:px-2 md:py-3',
-                    )}
-                    initial={{ opacity: 0, y: -8 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{
-                      duration: 0.12,
-                      delay: 0.06,
-                      ease: [0.22, 1, 0.36, 1],
-                    }}
+                    key={error}
+                    initial={{ opacity: 0, y: -10, scale: 0.98 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: -8, scale: 0.98 }}
+                    transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
                   >
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size={sidebarCollapsed ? 'icon' : 'default'}
-                      className={cn(
-                        'mr-auto min-w-0 justify-start gap-2 px-1.5 font-semibold tracking-tight',
-                        sidebarCollapsed && 'md:mr-0 md:justify-center md:px-0',
-                      )}
-                      aria-label="piDeck — New session"
-                      title="New session"
-                      onClick={openNewSession}
-                    >
-                      <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-                        <PiIcon className="size-4" />
-                      </span>
-                      <span className={cn('truncate', sidebarCollapsed && 'md:hidden')}>
-                        piDeck
-                      </span>
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Search and commands"
-                      title="Search and commands (⌘K)"
-                      onClick={() => setPaletteOpen(true)}
-                    >
-                      <SearchIcon aria-hidden="true" />
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="New session"
-                      title="New session (⌘N)"
-                      onClick={openNewSession}
-                    >
-                      <PlusIcon aria-hidden="true" />
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      className="md:hidden"
-                      aria-label="Open settings"
-                      onClick={() => setSettingsOpen(true)}
-                    >
-                      <SettingsIcon aria-hidden="true" />
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      className="hidden md:inline-flex"
-                      aria-expanded={!sidebarCollapsed}
-                      aria-controls="sidebar-sessions"
-                      aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-                      title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-                      onClick={() => setSidebarCollapsed((current) => !current)}
-                    >
-                      {sidebarCollapsed ? <PanelLeftOpenIcon /> : <PanelLeftCloseIcon />}
-                    </Button>
-                  </motion.div>
-                  {!sidebarCollapsed ? (
-                    <div className="hidden items-center justify-between px-3 pb-1 pt-1 md:flex">
-                      <span className="text-[0.7rem] font-medium text-muted-foreground">
-                        Sessions
-                      </span>
-                      <span className="text-[0.65rem] tabular-nums text-muted-foreground">
-                        {visibleSessions.length}
-                      </span>
-                    </div>
-                  ) : null}
-                  <nav
-                    id="sidebar-sessions"
-                    className={cn(
-                      'hidden min-w-0 flex-1 gap-1 overflow-y-auto p-2 md:flex md:flex-col',
-                      sidebarCollapsed && 'items-center',
-                    )}
-                    aria-label="Sessions"
-                  >
-                    <AnimatePresence initial={false} mode="popLayout">
-                      {visibleSessions.length === 0 ? (
-                        <motion.p
-                          key="empty-runs"
-                          className={cn(
-                            'hidden px-2 py-3 text-xs leading-5 text-muted-foreground md:block',
-                            sidebarCollapsed && 'md:hidden',
-                          )}
-                          initial={{ opacity: 0, y: 8 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0, y: -8 }}
-                          transition={{ duration: 0.16 }}
-                        >
-                          Runs will appear here after you start a session.
-                        </motion.p>
-                      ) : (
-                        visibleSessions.map((session, index) => {
-                          const candidate = session.run;
-                          const snapshot = snapshots[session.serverId];
-                          const server = snapshot?.server;
-                          const sessionAgents = snapshot?.agents ?? [];
-                          const sessionModels = snapshot?.models;
-                          const sessionProjects = snapshot?.projects ?? [];
-                          const agent = sessionAgents.find((item) => item.id === candidate.agentId);
-                          const selected =
-                            session.serverId === activeServerId && candidate.id === selectedRunId;
-                          const candidateKey = sessionKey(session.serverId, candidate.id);
-                          const pendingRequests = inboxBySession[candidateKey]?.length ?? 0;
-                          const uncheckedEvents = selected
-                            ? 0
-                            : activitySince(
-                                candidate.latestEventSequence,
-                                checkedActivity[candidateKey] ?? 0,
-                              );
-                          const notificationCount = pendingRequests || uncheckedEvents;
-                          const notificationLabel = pendingRequests
-                            ? `${pendingRequests} response${pendingRequests === 1 ? '' : 's'} needed`
-                            : `${uncheckedEvents} unchecked event${uncheckedEvents === 1 ? '' : 's'}`;
-                          const modelName = modelDisplayName(candidate.model, sessionModels);
-                          const thinkingLabel = candidate.thinkingLevel
-                            ? titleCase(candidate.thinkingLevel)
-                            : 'Default';
-                          const projectLabel = sessionProjectLabel(candidate.cwd, sessionProjects);
-                          const branchLabel = sessionBranchLabel(candidate.cwd, sessionProjects);
-                          const sessionDetails = `${modelName} · ${thinkingLabel} thinking`;
-                          const serverDetail = injectedClient
-                            ? ''
-                            : ` · ${server?.name ?? 'Server'}`;
-                          const sessionTooltip = `${sessionTitle(candidate.prompt)}${serverDetail} · ${projectLabel} · ${branchLabel} · ${sessionDetails} · ${titleCase(candidate.status)}`;
-                          return (
-                            <motion.div
-                              key={sessionKey(session.serverId, candidate.id)}
-                              layout
-                              initial={{ opacity: 0, x: -12 }}
-                              animate={{ opacity: 1, x: 0 }}
-                              exit={{ opacity: 0, x: -12 }}
-                              transition={{
-                                duration: 0.16,
-                                delay: Math.min(index, 8) * 0.025,
-                              }}
-                              className={cn(
-                                'group/session-card relative min-w-52 md:min-w-0',
-                                sidebarCollapsed && 'min-w-0',
-                              )}
-                            >
-                              {selected ? (
-                                <motion.span
-                                  layoutId="active-session"
-                                  className="absolute inset-0 rounded-lg bg-secondary"
-                                  transition={{
-                                    type: 'spring',
-                                    stiffness: 500,
-                                    damping: 36,
-                                  }}
-                                />
-                              ) : null}
-                              <ContextMenuPrimitive.Root>
-                                <ContextMenuPrimitive.Trigger asChild>
-                                  <div className="min-w-0">
-                                    <Tooltip>
-                                      <TooltipTrigger asChild>
-                                        <Button
-                                          variant="ghost"
-                                          size={sidebarCollapsed ? 'icon' : 'default'}
-                                          className={cn(
-                                            'relative z-10 h-auto min-w-52 items-center justify-start gap-3 px-2 py-2 pr-10 text-left md:w-full md:min-w-0',
-                                            sidebarCollapsed &&
-                                              'min-w-0 items-center justify-center gap-0 px-0 py-1.5',
-                                          )}
-                                          aria-current={selected ? 'page' : undefined}
-                                          aria-label={sidebarCollapsed ? sessionTooltip : undefined}
-                                          title={sessionTooltip}
-                                          onClick={() => openRun(session.serverId, candidate.id)}
-                                        >
-                                          {sidebarCollapsed ? (
-                                            <span className="relative flex size-7 items-center justify-center">
-                                              <SessionAvatar
-                                                model={candidate.model}
-                                                models={sessionModels}
-                                              />
-                                              {notificationCount > 0 ? (
-                                                <Badge
-                                                  variant={
-                                                    pendingRequests ? 'destructive' : 'default'
-                                                  }
-                                                  className="absolute -top-2 -right-2 h-4 min-w-4 px-1 text-[0.6rem] leading-4 tabular-nums"
-                                                  aria-label={notificationLabel}
-                                                >
-                                                  {notificationCount > 99
-                                                    ? '99+'
-                                                    : notificationCount}
-                                                </Badge>
-                                              ) : (
-                                                <span className="absolute -top-1 -right-1">
-                                                  <RunDot status={candidate.status} />
-                                                </span>
-                                              )}
-                                            </span>
-                                          ) : (
-                                            <SessionAvatar
-                                              model={candidate.model}
-                                              models={sessionModels}
-                                              className="size-9 rounded-full ring-1 ring-border/70"
-                                            />
-                                          )}
-                                          {!sidebarCollapsed ? (
-                                            <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
-                                              <span
-                                                className="flex w-full min-w-0 items-center gap-1 truncate text-[0.68rem] font-medium leading-4 text-muted-foreground"
-                                                title={`Project: ${projectLabel}`}
-                                              >
-                                                <FolderIcon
-                                                  className="size-3 shrink-0"
-                                                  aria-hidden="true"
-                                                />
-                                                <span className="truncate">
-                                                  {server?.name ?? 'Server'} · {projectLabel}
-                                                </span>
-                                              </span>
-                                              <span className="flex w-full min-w-0 items-center gap-2">
-                                                <span className="min-w-0 flex-1 truncate text-sm font-semibold leading-5 tracking-tight text-foreground">
-                                                  {sessionTitle(candidate.prompt)}
-                                                </span>
-                                                {notificationCount > 0 ? (
-                                                  <Badge
-                                                    variant={
-                                                      pendingRequests ? 'destructive' : 'secondary'
-                                                    }
-                                                    className="h-5 min-w-5 justify-center px-1.5 text-[0.65rem] tabular-nums"
-                                                    aria-label={notificationLabel}
-                                                  >
-                                                    {notificationCount > 99
-                                                      ? '99+'
-                                                      : notificationCount}
-                                                  </Badge>
-                                                ) : null}
-                                              </span>
-                                              <span className="flex w-full min-w-0 items-center gap-1.5 pt-0.5 text-[0.68rem] font-normal leading-4 text-muted-foreground">
-                                                <GitBranchIcon
-                                                  className="size-3 shrink-0"
-                                                  aria-hidden="true"
-                                                />
-                                                <span
-                                                  className="min-w-0 truncate"
-                                                  title={`Branch: ${branchLabel}`}
-                                                >
-                                                  {branchLabel}
-                                                </span>
-                                                <RunDot status={candidate.status} />
-                                              </span>
-                                              <span className="sr-only">
-                                                {agent?.name ?? 'Agent'} · {sessionDetails} ·{' '}
-                                                {formatRelativeDate(candidate.createdAt)}
-                                              </span>
-                                            </span>
-                                          ) : null}
-                                        </Button>
-                                      </TooltipTrigger>
-                                      <TooltipContent side="right" align="start">
-                                        <p className="font-medium">{modelName}</p>
-                                        <p className="text-primary-foreground/70">
-                                          {thinkingLabel} thinking
-                                        </p>
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  </div>
-                                </ContextMenuPrimitive.Trigger>
-                                <ContextMenuPrimitive.Portal>
-                                  <ContextMenuPrimitive.Content className="z-50 min-w-44 overflow-hidden rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg outline-none data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95">
-                                    <ContextMenuPrimitive.Label className="max-w-60 truncate px-2 py-1.5 text-xs font-medium text-muted-foreground">
-                                      {sessionTitle(candidate.prompt)}
-                                    </ContextMenuPrimitive.Label>
-                                    <ContextMenuPrimitive.Separator className="-mx-1 my-1 h-px bg-border" />
-                                    <ContextMenuPrimitive.Item
-                                      className="relative flex cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50"
-                                      onSelect={() => archiveRun(session.serverId, candidate.id)}
-                                    >
-                                      <ArchiveIcon className="size-4" aria-hidden="true" />
-                                      Archive
-                                    </ContextMenuPrimitive.Item>
-                                  </ContextMenuPrimitive.Content>
-                                </ContextMenuPrimitive.Portal>
-                              </ContextMenuPrimitive.Root>
-                              {!sidebarCollapsed ? (
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-sm"
-                                  className="absolute top-1/2 right-2 z-20 -translate-y-1/2 bg-background text-foreground opacity-0 shadow-md ring-1 ring-border/80 transition-opacity hover:bg-background/80 group-hover/session-card:opacity-100 group-focus-within/session-card:opacity-100"
-                                  aria-label="Archive session"
-                                  title="Archive session"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    archiveRun(session.serverId, candidate.id);
-                                  }}
-                                >
-                                  <ArchiveIcon aria-hidden="true" />
-                                </Button>
-                              ) : null}
-                            </motion.div>
-                          );
-                        })
-                      )}
-                    </AnimatePresence>
-                    {!sidebarCollapsed &&
-                    Object.values(snapshots).some((snapshot) => snapshot.historyCursor) ? (
+                    <Alert variant="destructive" className="m-4 mb-0 w-auto pr-12">
+                      <AlertTitle>Request not completed</AlertTitle>
+                      <AlertDescription className="whitespace-pre-line">{error}</AlertDescription>
                       <Button
                         type="button"
                         variant="ghost"
-                        size="sm"
-                        className="mx-2 mb-2"
-                        disabled={historyLoading}
-                        onClick={() => void loadMoreHistory()}
+                        size="icon-sm"
+                        className="absolute top-2.5 right-2.5"
+                        aria-label="Dismiss error"
+                        onClick={() => setError(undefined)}
                       >
-                        {historyLoading ? 'Loading history…' : 'Load more history'}
+                        <XIcon aria-hidden="true" />
                       </Button>
-                    ) : null}
-                    {historyError ? (
-                      <p className="px-4 pb-2 text-xs text-destructive">{historyError}</p>
-                    ) : null}
-                  </nav>
-                  <Separator className="hidden md:block" />
-                  <motion.div
-                    className="hidden p-2 md:block"
-                    initial={{ opacity: 0, y: 8 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ duration: 0.17, delay: 0.14 }}
-                  >
-                    <div className={cn('flex gap-1', sidebarCollapsed && 'flex-col')}>
-                      <Button
-                        variant="ghost"
-                        size={sidebarCollapsed ? 'icon' : 'default'}
-                        className={cn(
-                          'relative min-w-0 flex-1 justify-start',
-                          sidebarCollapsed && 'w-full justify-center px-0',
-                        )}
-                        aria-label="Settings"
-                        title={sidebarCollapsed ? 'Settings' : undefined}
-                        onClick={() => setSettingsOpen(true)}
-                      >
-                        <SettingsIcon aria-hidden="true" />
-                        {sidebarCollapsed ? null : 'Settings'}
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        aria-pressed={darkMode}
-                        aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-                        title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-                        onClick={() => setDarkMode((current) => !current)}
-                      >
-                        {darkMode ? <SunIcon /> : <MoonIcon />}
-                      </Button>
-                    </div>
-                  </motion.div>
-                </motion.aside>
-              ) : (
-                <TabsWorkspaceHeader
-                  sessions={visibleSessions}
-                  snapshots={snapshots}
-                  darkMode={darkMode}
-                  onOpenRun={openRun}
-                  onArchiveRun={archiveRun}
-                  onNew={openNewSession}
-                  onSettings={() => setSettingsOpen(true)}
-                  onDarkModeChange={setDarkMode}
-                />
-              )}
-
-              <TabsContent value={workspaceTabValue} forceMount className="contents">
-                <section className="flex h-full min-h-0 min-w-0 flex-col">
-                  {archivedSessions.length > 0 ? (
-                    <div className="flex items-center gap-2 overflow-x-auto border-b px-3 py-2 text-xs">
-                      <span className="shrink-0 text-muted-foreground">Archived:</span>
-                      {archivedSessions.map((session) => (
-                        <Button
-                          key={sessionKey(session.serverId, session.run.id)}
-                          type="button"
-                          variant="outline"
-                          size="xs"
-                          onClick={() => restoreRun(session.serverId, session.run.id)}
-                        >
-                          <ArchiveIcon aria-hidden="true" />
-                          Restore {sessionTitle(session.run.prompt)}
-                        </Button>
-                      ))}
-                    </div>
-                  ) : null}
-                  {activeServerId &&
-                  snapshots[activeServerId] &&
-                  Object.values(snapshots[activeServerId].resources).some(
-                    (resource) => resource.status !== 'live',
-                  ) ? (
-                    <Alert className="m-4 mb-0 w-auto">
-                      <AlertTitle>Server data is degraded</AlertTitle>
-                      <AlertDescription className="flex items-center justify-between gap-3">
-                        <span>
-                          {Object.entries(snapshots[activeServerId].resources)
-                            .filter(([, resource]) => resource.status !== 'live')
-                            .map(([name]) => name)
-                            .join(', ')}{' '}
-                          data is stale or unavailable. Known runs remain available.
-                        </span>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => void retryServerSnapshot(activeServerId)}
-                        >
-                          Retry
-                        </Button>
-                      </AlertDescription>
                     </Alert>
-                  ) : null}
-                  <AnimatePresence initial={false}>
-                    {error ? (
-                      <motion.div
-                        key={error}
-                        initial={{ opacity: 0, y: -10, scale: 0.98 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        exit={{ opacity: 0, y: -8, scale: 0.98 }}
-                        transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
-                      >
-                        <Alert variant="destructive" className="m-4 mb-0 w-auto pr-12">
-                          <AlertTitle>Request not completed</AlertTitle>
-                          <AlertDescription className="whitespace-pre-line">
-                            {error}
-                          </AlertDescription>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-sm"
-                            className="absolute top-2.5 right-2.5"
-                            aria-label="Dismiss error"
-                            onClick={() => setError(undefined)}
-                          >
-                            <XIcon aria-hidden="true" />
-                          </Button>
-                        </Alert>
-                      </motion.div>
-                    ) : null}
-                  </AnimatePresence>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
 
-                  <AnimatePresence initial={false} mode="wait">
-                    {loading ? (
-                      <LoadingState key="loading" />
-                    ) : run ? (
-                      <motion.div
-                        key={`conversation-${run.id}`}
-                        className="flex min-h-0 min-w-0 flex-1"
-                        initial={{ opacity: 0, y: 14 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -10 }}
-                        transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
-                      >
-                        <Conversation
-                          client={client}
-                          agent={selectedAgent}
-                          run={run}
-                          models={models}
-                          serverName={activeServer?.name ?? 'Local'}
-                          projectLabel={sessionProjectLabel(run.cwd, projects)}
-                          branchLabel={sessionBranchLabel(run.cwd, projects)}
-                          transcript={transcript}
-                          hasOlderEvents={hasOlderEvents}
-                          loadingOlderEvents={loadingOlderEvents}
-                          onLoadOlderEvents={loadOlderEvents}
-                          promptAttachments={
-                            runAttachments[sessionKey(activeServerId ?? 'local', run.id)] ?? []
-                          }
-                          submitting={submitting}
-                          runIsActive={runIsActive}
-                          connectionState={connectionState}
-                          inboxItems={
-                            selectedSessionKey ? (inboxBySession[selectedSessionKey] ?? []) : []
-                          }
-                          onInboxHandled={(itemId) => {
-                            if (selectedSessionKey) handleInboxItem(selectedSessionKey, itemId);
-                          }}
-                          onCancel={cancelRun}
-                          onSteer={steerRun}
-                          onSendMessage={followUpRun}
-                        />
-                      </motion.div>
-                    ) : (
-                      <motion.div
-                        key="new-session"
-                        className="flex min-h-0 min-w-0 flex-1"
-                        initial={{ opacity: 0, y: 14 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -10 }}
-                        transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
-                      >
-                        <NewSession
-                          key={`new-session-${activeServerId ?? 'unassigned'}`}
-                          client={client}
-                          servers={servers}
-                          serverId={activeServerId}
-                          agents={agents}
-                          models={models}
-                          projects={projects}
-                          submitting={submitting}
-                          onStart={startRun}
-                          onDeleteProject={deleteProject}
-                          onServerChange={selectComposerServer}
-                          onOpenAgents={() => {
-                            setSettingsSection(servers.length === 0 ? 'servers' : 'agents');
-                            setSettingsOpen(true);
-                          }}
-                        />
-                      </motion.div>
+              <AnimatePresence initial={false} mode="wait">
+                {loading ? (
+                  <LoadingState key="loading" />
+                ) : run ? (
+                  <motion.div
+                    key={`conversation-${run.id}`}
+                    className="flex min-h-0 min-w-0 flex-1"
+                    initial={{ opacity: 0, y: 14 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
+                  >
+                    <Conversation
+                      client={client}
+                      agent={selectedAgent}
+                      run={run}
+                      models={models}
+                      serverName={activeServer?.name ?? 'Local'}
+                      projectLabel={sessionProjectLabel(run.cwd, projects)}
+                      branchLabel={sessionBranchLabel(run.cwd, projects)}
+                      transcript={transcript}
+                      hasOlderEvents={hasOlderEvents}
+                      loadingOlderEvents={loadingOlderEvents}
+                      onLoadOlderEvents={loadOlderEvents}
+                      promptAttachments={
+                        runAttachments[sessionKey(activeServerId ?? 'local', run.id)] ?? []
+                      }
+                      submitting={submitting}
+                      runIsActive={runIsActive}
+                      connectionState={connectionState}
+                      inboxItems={
+                        selectedSessionKey ? (inboxBySession[selectedSessionKey] ?? []) : []
+                      }
+                      onInboxHandled={(itemId) => {
+                        if (selectedSessionKey) handleInboxItem(selectedSessionKey, itemId);
+                      }}
+                      onCancel={cancelRun}
+                      onSteer={steerRun}
+                      onSendMessage={followUpRun}
+                    />
+                  </motion.div>
+                ) : workspaceView === 'overview' ? (
+                  <Overview
+                    sessions={visibleSessions}
+                    snapshots={snapshots}
+                    checkedActivity={checkedActivity}
+                    inboxBySession={inboxBySession}
+                    canLoadMore={Object.values(snapshots).some(
+                      (snapshot) => snapshot.historyCursor,
                     )}
-                  </AnimatePresence>
-                </section>
-              </TabsContent>
-            </Tabs>
+                    historyLoading={historyLoading}
+                    historyError={historyError}
+                    onLoadMore={() => void loadMoreHistory()}
+                    onOpenRun={openRun}
+                    onNew={openNewSession}
+                  />
+                ) : (
+                  <motion.div
+                    key="new-session"
+                    className="flex min-h-0 min-w-0 flex-1"
+                    initial={{ opacity: 0, y: 14 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
+                  >
+                    <NewSession
+                      key={`new-session-${activeServerId ?? 'unassigned'}`}
+                      client={client}
+                      servers={servers}
+                      serverId={activeServerId}
+                      agents={agents}
+                      models={models}
+                      projects={projects}
+                      submitting={submitting}
+                      onStart={startRun}
+                      onDeleteProject={deleteProject}
+                      onServerChange={selectComposerServer}
+                      onOpenAgents={() => {
+                        setSettingsSection(servers.length === 0 ? 'servers' : 'agents');
+                        setSettingsOpen(true);
+                      }}
+                    />
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </section>
 
             {globalInboxRequest ? (
               <ExtensionRequestDialog
@@ -2320,8 +1790,6 @@ export default function App({
               submitting={submitting}
               darkMode={darkMode}
               onDarkModeChange={setDarkMode}
-              appLayout={appLayout}
-              onAppLayoutChange={setAppLayout}
               onCreate={createAgent}
               onUpdate={updateAgent}
               onDelete={deleteAgent}
@@ -2446,97 +1914,47 @@ function ExtensionRequestDialog({
   );
 }
 
-function TabsWorkspaceHeader({
-  sessions,
-  snapshots,
+function AppToolbar({
   darkMode,
-  onOpenRun,
-  onArchiveRun,
+  onOverview,
   onNew,
+  onSearch,
   onSettings,
   onDarkModeChange,
 }: {
-  sessions: ServerSession[];
-  snapshots: Record<string, ServerSnapshot>;
   darkMode: boolean;
-  onOpenRun(serverId: string, runId: string): void;
-  onArchiveRun(serverId: string, runId: string): void;
+  onOverview(): void;
   onNew(): void;
+  onSearch(): void;
   onSettings(): void;
   onDarkModeChange(darkMode: boolean): void;
 }) {
   return (
     <motion.header
-      className="flex min-w-0 items-center gap-1 border-b bg-sidebar px-2 py-1.5"
-      initial={{ opacity: 0, y: -10 }}
+      className="flex h-11 min-w-0 items-center border-b px-2"
+      initial={{ opacity: 0, y: -8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
     >
       <Button
         type="button"
         variant="ghost"
-        className="shrink-0 gap-2 px-2 font-semibold tracking-tight"
-        aria-label="piDeck — New session"
-        title="New session"
-        onClick={onNew}
+        className="gap-2 px-2 font-semibold tracking-tight"
+        style={{ color: 'var(--foreground)' }}
+        aria-label="piDeck overview"
+        onClick={onOverview}
       >
         <span className="flex size-6 items-center justify-center rounded-md bg-primary text-primary-foreground">
           <PiIcon className="size-3.5" />
         </span>
-        <span className="hidden sm:inline">piDeck</span>
+        <span>piDeck</span>
       </Button>
-
-      <Separator orientation="vertical" className="mx-1 h-5" />
-
-      <TabsList
-        variant="default"
-        aria-label="Sessions"
-        className="h-9 max-w-full min-w-0 flex-1 justify-start overflow-x-auto overflow-y-hidden"
-      >
-        {sessions.map((session, index) => {
-          const candidate = session.run;
-          const snapshot = snapshots[session.serverId];
-          const tabValue = sessionKey(session.serverId, candidate.id);
-          const projectLabel = sessionProjectLabel(candidate.cwd, snapshot?.projects ?? []);
-          return (
-            <span key={tabValue} className="group/session-tab flex h-full shrink-0 items-center">
-              <TabsTrigger
-                value={tabValue}
-                className="max-w-56 min-w-32 justify-start px-2.5"
-                title={`${sessionTitle(candidate.prompt)} · ${projectLabel}`}
-                onKeyDown={(event) => {
-                  const offset =
-                    event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
-                  if (!offset) return;
-                  const nextSession =
-                    sessions[(index + offset + sessions.length) % sessions.length];
-                  if (nextSession) onOpenRun(nextSession.serverId, nextSession.run.id);
-                }}
-              >
-                <RunDot status={candidate.status} />
-                <span className="truncate">{sessionTitle(candidate.prompt)}</span>
-              </TabsTrigger>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                className="mr-1 shrink-0 opacity-60 hover:opacity-100"
-                aria-label={`Archive ${sessionTitle(candidate.prompt)}`}
-                title="Archive session"
-                onClick={() => onArchiveRun(session.serverId, candidate.id)}
-              >
-                <XIcon />
-              </Button>
-            </span>
-          );
-        })}
-      </TabsList>
-
-      <div className="flex shrink-0 items-center gap-0.5">
+      <div className="ml-auto flex items-center gap-0.5">
         <Button
           type="button"
           variant="ghost"
           size="icon-sm"
+          style={{ color: 'var(--foreground)' }}
           aria-label="New session"
           onClick={onNew}
         >
@@ -2546,6 +1964,18 @@ function TabsWorkspaceHeader({
           type="button"
           variant="ghost"
           size="icon-sm"
+          style={{ color: 'var(--foreground)' }}
+          aria-label="Search and commands"
+          title="Search and commands (⌘K)"
+          onClick={onSearch}
+        >
+          <SearchIcon />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          style={{ color: 'var(--foreground)' }}
           aria-label="Settings"
           onClick={onSettings}
         >
@@ -2555,6 +1985,8 @@ function TabsWorkspaceHeader({
           type="button"
           variant="ghost"
           size="icon-sm"
+          className="hidden sm:inline-flex"
+          style={{ color: 'var(--foreground)' }}
           aria-pressed={darkMode}
           aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
           onClick={() => onDarkModeChange(!darkMode)}
@@ -2563,6 +1995,212 @@ function TabsWorkspaceHeader({
         </Button>
       </div>
     </motion.header>
+  );
+}
+
+function Overview({
+  sessions,
+  snapshots,
+  checkedActivity,
+  inboxBySession,
+  canLoadMore,
+  historyLoading,
+  historyError,
+  onLoadMore,
+  onOpenRun,
+  onNew,
+}: {
+  sessions: ServerSession[];
+  snapshots: Record<string, ServerSnapshot>;
+  checkedActivity: Record<string, number>;
+  inboxBySession: Record<string, InboxItemResponse[]>;
+  canLoadMore: boolean;
+  historyLoading: boolean;
+  historyError: string | undefined;
+  onLoadMore(): void;
+  onOpenRun(serverId: string, runId: string): void;
+  onNew(): void;
+}) {
+  const activeSessions = sessions.filter(
+    ({ run: candidate }) => candidate.status === 'running' || candidate.status === 'queued',
+  );
+  const runningCount = activeSessions.filter(
+    ({ run: candidate }) => candidate.status === 'running',
+  ).length;
+  const attentionCount = activeSessions.filter(({ serverId, run: candidate }) => {
+    const key = sessionKey(serverId, candidate.id);
+    return (inboxBySession[key]?.length ?? 0) > 0;
+  }).length;
+
+  return (
+    <motion.div
+      key="overview"
+      className="min-h-0 min-w-0 flex-1 overflow-y-auto"
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -8 }}
+      transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+    >
+      <div className="mx-auto w-full max-w-[96rem] px-4 py-8 sm:px-6 lg:px-8 lg:py-10">
+        <header className="flex flex-col gap-5 border-b pb-7 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h1 className="text-balance text-3xl font-semibold tracking-[-0.03em]">
+              Running agents
+            </h1>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+              Scan active work, spot runs waiting on you, and open any agent without losing the
+              fleet view.
+            </p>
+          </div>
+          <div className="flex items-center gap-4">
+            <dl className="flex items-center gap-4 text-sm tabular-nums">
+              <div>
+                <dt className="text-xs text-muted-foreground">Running</dt>
+                <dd className="font-semibold">{runningCount}</dd>
+              </div>
+              <div>
+                <dt className="text-xs text-muted-foreground">Needs input</dt>
+                <dd className="font-semibold">{attentionCount}</dd>
+              </div>
+            </dl>
+            <Button onClick={onNew}>
+              <PlusIcon data-icon="inline-start" />
+              New session
+            </Button>
+          </div>
+        </header>
+
+        {activeSessions.length === 0 ? (
+          <Empty className="mt-8 min-h-80 border border-dashed">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <BotIcon />
+              </EmptyMedia>
+              <EmptyTitle>No agents are running</EmptyTitle>
+              <EmptyDescription>
+                Start a session and it will appear here while Pi is working or waiting to begin.
+              </EmptyDescription>
+            </EmptyHeader>
+            <EmptyContent>
+              <Button onClick={onNew}>
+                <PlusIcon data-icon="inline-start" />
+                Start a session
+              </Button>
+            </EmptyContent>
+          </Empty>
+        ) : (
+          <div
+            className="mt-7 grid grid-cols-[repeat(auto-fill,minmax(min(100%,19rem),1fr))] gap-4"
+            role="region"
+            aria-label="Running agents"
+          >
+            {activeSessions.map(({ serverId, run: candidate }, index) => {
+              const snapshot = snapshots[serverId];
+              const agent = snapshot?.agents.find((item) => item.id === candidate.agentId);
+              const projectLabel = sessionProjectLabel(candidate.cwd, snapshot?.projects ?? []);
+              const branchLabel = sessionBranchLabel(candidate.cwd, snapshot?.projects ?? []);
+              const key = sessionKey(serverId, candidate.id);
+              const requests = inboxBySession[key]?.length ?? 0;
+              const uncheckedEvents = activitySince(
+                candidate.latestEventSequence,
+                checkedActivity[key] ?? 0,
+              );
+              return (
+                <motion.div
+                  key={key}
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.16, delay: Math.min(index, 7) * 0.025 }}
+                >
+                  <Card className="relative h-full min-h-56 transition-[box-shadow,transform] hover:-translate-y-0.5 hover:shadow-lg hover:shadow-foreground/5 focus-within:ring-2 focus-within:ring-ring">
+                    <a
+                      className="absolute inset-0 rounded-xl focus:outline-none"
+                      href={`/servers/${encodeURIComponent(serverId)}/sessions/${encodeURIComponent(candidate.id)}`}
+                      aria-label={`Open ${sessionTitle(candidate.prompt)}`}
+                      onClick={(event) => {
+                        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+                          return;
+                        event.preventDefault();
+                        onOpenRun(serverId, candidate.id);
+                      }}
+                    />
+                    <CardHeader className="pointer-events-none">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <SessionAvatar
+                          model={candidate.model}
+                          models={snapshot?.models}
+                          className="size-9 rounded-lg"
+                        />
+                        <div className="min-w-0">
+                          <CardTitle className="truncate">{agent?.name ?? 'Agent'}</CardTitle>
+                          <CardDescription className="truncate">
+                            {snapshot?.server.name ?? 'Server'} · {projectLabel}
+                          </CardDescription>
+                        </div>
+                      </div>
+                      <CardAction>
+                        <Badge variant={requests > 0 ? 'destructive' : 'secondary'}>
+                          {requests > 0
+                            ? `${requests} need${requests === 1 ? 's' : ''} input`
+                            : titleCase(candidate.status)}
+                        </Badge>
+                      </CardAction>
+                    </CardHeader>
+                    <CardContent className="pointer-events-none flex flex-1 flex-col gap-4">
+                      <p className="line-clamp-3 text-base leading-6 font-medium tracking-[-0.01em]">
+                        {sessionTitle(candidate.prompt)}
+                      </p>
+                      <dl className="mt-auto grid gap-2 text-xs text-muted-foreground">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <GitBranchIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                          <dt className="sr-only">Branch</dt>
+                          <dd className="truncate" title={branchLabel}>
+                            {branchLabel}
+                          </dd>
+                        </div>
+                        <div className="flex min-w-0 items-center gap-2">
+                          <BrainIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                          <dt className="sr-only">Model</dt>
+                          <dd className="truncate">
+                            {modelDisplayName(candidate.model, snapshot?.models)} ·{' '}
+                            {titleCase(candidate.thinkingLevel ?? 'default')} thinking
+                          </dd>
+                        </div>
+                      </dl>
+                    </CardContent>
+                    <CardFooter className="pointer-events-none justify-between text-xs text-muted-foreground">
+                      <span className="flex items-center gap-2 font-medium text-foreground">
+                        <RunDot status={candidate.status} />
+                        {candidate.status === 'queued' ? 'Queued' : 'Working'}
+                      </span>
+                      <span className="tabular-nums">
+                        {uncheckedEvents > 0
+                          ? `${uncheckedEvents} new event${uncheckedEvents === 1 ? '' : 's'}`
+                          : `Started ${formatRelativeDate(candidate.startedAt ?? candidate.createdAt)}`}
+                      </span>
+                    </CardFooter>
+                  </Card>
+                </motion.div>
+              );
+            })}
+          </div>
+        )}
+        {canLoadMore || historyError ? (
+          <div className="mt-8 flex flex-col items-center gap-2">
+            {canLoadMore ? (
+              <Button variant="outline" disabled={historyLoading} onClick={onLoadMore}>
+                {historyLoading ? 'Loading sessions…' : 'Load older sessions'}
+              </Button>
+            ) : null}
+            {historyError ? (
+              <p className="text-sm text-destructive" role="alert">
+                {historyError}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </motion.div>
   );
 }
 
@@ -2762,6 +2400,139 @@ function NewSession({
     setModelKey(models?.defaultModel ? encodeModel(models.defaultModel) : '');
   }, [modelKey, models]);
 
+  const composerCommands = useMemo<readonly ComposerCommand[]>(() => {
+    const projectOptions = projects.map((project) => ({
+      value: project.path,
+      label: project.name,
+      description: project.path,
+    }));
+    if (!projectOptions.some((option) => option.value === cwd)) {
+      projectOptions.unshift({
+        value: cwd,
+        label: projectNameFromPath(cwd),
+        description: cwd,
+      });
+    }
+    const readyWorktrees = worktrees.filter((worktree) => worktree.status === 'ready');
+
+    return [
+      {
+        name: 'host',
+        label: 'Remote host',
+        description: 'Choose the supervisor that will run this session',
+        currentValue: serverId,
+        options: servers.map((server) => ({
+          value: server.id,
+          label: server.name,
+          description: server.address,
+        })),
+        onSelect: (value) => {
+          if (value !== serverId) {
+            clearPromptDraft();
+            onServerChange(value);
+          }
+        },
+      },
+      {
+        name: 'project',
+        label: 'Project',
+        description: 'Choose the working directory for this session',
+        currentValue: cwd,
+        options: projectOptions,
+        onSelect: setCwd,
+      },
+      {
+        name: 'agent',
+        label: 'Agent profile',
+        description: 'Choose the agent profile for this session',
+        currentValue: agentId,
+        options: agents.map((agent) => ({
+          value: agent.id,
+          label: agent.name,
+          description: agent.cwd,
+        })),
+        onSelect: setAgentId,
+      },
+      {
+        name: 'model',
+        label: 'Model',
+        description: 'Choose the model for this session',
+        currentValue: modelKey,
+        options:
+          models?.models.map((model) => ({
+            value: encodeModel(model),
+            label: model.name,
+            description: `${model.provider}/${model.id}`,
+          })) ?? [],
+        onSelect: setModelKey,
+      },
+      {
+        name: 'think',
+        label: 'Thinking level',
+        description: 'Choose how much reasoning effort Pi should use',
+        currentValue: thinkingLevel,
+        options: THINKING_LEVELS.map((level) => ({
+          value: level,
+          label: titleCase(level),
+        })),
+        onSelect: (value) => setThinkingLevel(value as AgentThinkingLevel),
+      },
+      {
+        name: 'checkout',
+        label: 'Execution mode',
+        description: 'Run in the current checkout or an isolated worktree',
+        currentValue: executionMode,
+        options: [
+          { value: 'local', label: 'Local checkout', description: cwd },
+          ...(readyWorktrees.length > 0
+            ? [
+                {
+                  value: 'worktree',
+                  label: 'Worktree',
+                  description: 'Use an isolated managed worktree',
+                },
+              ]
+            : []),
+        ],
+        onSelect: (value) => setExecutionMode(value as 'local' | 'worktree'),
+      },
+      ...(readyWorktrees.length > 0
+        ? [
+            {
+              name: 'worktree',
+              label: 'Worktree',
+              description: 'Choose the managed worktree for this session',
+              currentValue: worktreeId,
+              options: readyWorktrees.map((worktree) => ({
+                value: worktree.id,
+                label: worktree.branch,
+                description: worktree.path,
+              })),
+              onSelect: (value: string) => {
+                setWorktreeId(value);
+                setExecutionMode('worktree');
+              },
+            },
+          ]
+        : []),
+    ];
+  }, [
+    agentId,
+    agents,
+    clearPromptDraft,
+    cwd,
+    executionMode,
+    modelKey,
+    models,
+    onServerChange,
+    projects,
+    serverId,
+    servers,
+    thinkingLevel,
+    worktreeId,
+    worktrees,
+  ]);
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     const value = prompt.trim();
@@ -2881,86 +2652,11 @@ function NewSession({
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.14, ease: [0.22, 1, 0.36, 1] }}
     >
-      <motion.header
-        className="flex h-12 shrink-0 items-center justify-between border-b px-4"
-        initial={{ opacity: 0, y: -8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.18, delay: 0.06 }}
-      >
-        <h1 className="text-sm font-semibold">New session</h1>
-      </motion.header>
-      <div className="flex flex-1 justify-center overflow-y-auto px-4 py-8 md:px-8 md:py-14">
-        <div className="w-full max-w-4xl">
-          <motion.div
-            className="mb-7"
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.2, delay: 0.04 }}
-          >
-            <h2 className="max-w-xl text-balance text-2xl font-semibold tracking-tight">
-              What should Pi work on?
-            </h2>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-              Choose a workspace, describe the outcome, and let the run continue in the background.
-            </p>
-          </motion.div>
-          <div
-            className="mb-2 flex min-w-0 items-center gap-1 overflow-x-auto px-1 [scrollbar-width:none]"
-            aria-label="Run context"
-          >
-            <Select value={serverId} onValueChange={onServerChange}>
-              <SelectTrigger
-                aria-label="Server"
-                size="sm"
-                className="max-w-40 shrink-0 border-0 bg-transparent shadow-none"
-              >
-                <ServerIcon />
-                <SelectValue placeholder="Choose server" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  {servers.map((server) => (
-                    <SelectItem key={server.id} value={server.id}>
-                      {server.name}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-            <span className="text-muted-foreground" aria-hidden="true">
-              /
-            </span>
-            <ProjectPicker
-              projects={projects}
-              path={cwd}
-              onPathChange={setCwd}
-              onDeleteProject={onDeleteProject}
-              disabled={submitting}
-            />
-            <Separator orientation="vertical" className="h-4 shrink-0" />
-            <Select value={agentId} onValueChange={setAgentId}>
-              <SelectTrigger
-                aria-label="Agent profile"
-                size="sm"
-                className="max-w-44 shrink-0 border-0 bg-transparent shadow-none"
-              >
-                <BotIcon />
-                <SelectValue placeholder="Choose agent" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  {agents.map((agent) => (
-                    <SelectItem key={agent.id} value={agent.id}>
-                      {agent.name}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </div>
+      <div className="flex flex-1 items-center justify-center overflow-y-auto px-4 py-8 md:px-8">
+        <div className="w-full max-w-3xl">
           <motion.form
             aria-label="New session composer"
-            className="group/composer relative w-full overflow-hidden rounded-[1.75rem] border border-border/70 bg-card transition-colors focus-within:border-foreground/25"
+            className="group/composer relative w-full overflow-hidden rounded-2xl border border-border/70 bg-card shadow-sm transition-[border-color,box-shadow] focus-within:border-foreground/25 focus-within:shadow-md"
             initial={{ opacity: 0, y: 18, scale: 0.985 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             transition={{ duration: 0.18, delay: 0.03, ease: [0.22, 1, 0.36, 1] }}
@@ -2990,14 +2686,15 @@ function NewSession({
             </AnimatePresence>
             <ComposerInput
               ariaLabel="Session task"
-              placeholder="Ask anything, @mention files, or type / for Pi commands"
+              placeholder="Message Pi"
               value={prompt}
               onChange={setPrompt}
               cwd={cwd}
               client={client}
+              commands={composerCommands}
               disabled={submitting}
               maxLength={MAX_COMPOSER_CHARACTERS}
-              className="min-h-36 resize-none rounded-none border-0 bg-transparent px-5 py-5 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-40 md:px-6 md:py-6"
+              className="min-h-20 resize-none rounded-none border-0 bg-transparent px-5 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-24 md:px-6 md:py-5"
               placement="top"
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
@@ -3069,7 +2766,7 @@ function NewSession({
                   })}
                 </AttachmentGroup>
               ) : null}
-              <div className="flex items-center gap-1 px-4 pb-4 md:px-5">
+              <div className="flex items-end gap-1 px-4 pb-3 md:px-5 md:pb-4">
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -3091,15 +2788,69 @@ function NewSession({
                 >
                   <PaperclipIcon />
                 </Button>
-                <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
+                <fieldset
+                  aria-label="Session settings"
+                  className="flex min-w-0 flex-1 flex-wrap items-center gap-x-0.5 gap-y-1"
+                >
+                  <Select value={serverId} onValueChange={onServerChange}>
+                    <SelectTrigger
+                      aria-label="Remote host"
+                      size="sm"
+                      className="max-w-40 shrink-0 border-0 bg-transparent font-mono text-xs shadow-none"
+                    >
+                      <span className="text-muted-foreground" aria-hidden="true">
+                        /host
+                      </span>
+                      <SelectValue placeholder="select" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        {servers.map((server) => (
+                          <SelectItem key={server.id} value={server.id}>
+                            {server.name}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  <ProjectPicker
+                    projects={projects}
+                    path={cwd}
+                    onPathChange={setCwd}
+                    onDeleteProject={onDeleteProject}
+                    disabled={submitting}
+                  />
+                  <Select value={agentId} onValueChange={setAgentId}>
+                    <SelectTrigger
+                      aria-label="Agent profile"
+                      size="sm"
+                      className="max-w-44 shrink-0 border-0 bg-transparent font-mono text-xs shadow-none"
+                    >
+                      <span className="text-muted-foreground" aria-hidden="true">
+                        /agent
+                      </span>
+                      <SelectValue placeholder="select" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        {agents.map((agent) => (
+                          <SelectItem key={agent.id} value={agent.id}>
+                            {agent.name}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
                   <Select value={modelKey} onValueChange={setModelKey}>
                     <SelectTrigger
                       aria-label="Model"
                       size="sm"
-                      className="max-w-52 shrink-0 border-0 bg-transparent shadow-none"
+                      className="max-w-52 shrink-0 border-0 bg-transparent font-mono text-xs shadow-none"
                     >
-                      <ModelLogo provider={decodeModel(modelKey)?.provider ?? ''} />
-                      <SelectValue placeholder="Default model" />
+                      <span className="text-muted-foreground" aria-hidden="true">
+                        /model
+                      </span>
+                      <SelectValue placeholder="default" />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
@@ -3111,7 +2862,6 @@ function NewSession({
                       </SelectGroup>
                     </SelectContent>
                   </Select>
-                  <Separator orientation="vertical" className="hidden h-4 shrink-0 sm:block" />
                   <Select
                     value={thinkingLevel}
                     onValueChange={(value) => setThinkingLevel(value as AgentThinkingLevel)}
@@ -3119,9 +2869,11 @@ function NewSession({
                     <SelectTrigger
                       aria-label="Thinking level"
                       size="sm"
-                      className="shrink-0 border-0 bg-transparent shadow-none"
+                      className="shrink-0 border-0 bg-transparent font-mono text-xs shadow-none"
                     >
-                      <BrainIcon />
+                      <span className="text-muted-foreground" aria-hidden="true">
+                        /think
+                      </span>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -3134,7 +2886,6 @@ function NewSession({
                       </SelectGroup>
                     </SelectContent>
                   </Select>
-                  <Separator orientation="vertical" className="hidden h-5 shrink-0 sm:block" />
                   <Select
                     value={executionMode}
                     onValueChange={(value) => setExecutionMode(value as 'local' | 'worktree')}
@@ -3142,9 +2893,11 @@ function NewSession({
                     <SelectTrigger
                       aria-label="Execution mode"
                       size="sm"
-                      className="shrink-0 border-0 bg-transparent shadow-none"
+                      className="shrink-0 border-0 bg-transparent font-mono text-xs shadow-none"
                     >
-                      <GitForkIcon />
+                      <span className="text-muted-foreground" aria-hidden="true">
+                        /checkout
+                      </span>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -3161,9 +2914,12 @@ function NewSession({
                       <SelectTrigger
                         aria-label="Worktree"
                         size="sm"
-                        className="max-w-48 shrink-0 border-0 bg-transparent shadow-none"
+                        className="max-w-48 shrink-0 border-0 bg-transparent font-mono text-xs shadow-none"
                       >
-                        <SelectValue placeholder="Choose worktree" />
+                        <span className="text-muted-foreground" aria-hidden="true">
+                          /worktree
+                        </span>
+                        <SelectValue placeholder="select" />
                       </SelectTrigger>
                       <SelectContent>
                         <SelectGroup>
@@ -3178,7 +2934,7 @@ function NewSession({
                       </SelectContent>
                     </Select>
                   ) : null}
-                </div>
+                </fieldset>
                 <Button
                   type="submit"
                   size="icon-lg"
@@ -3198,20 +2954,6 @@ function NewSession({
               </div>
             </motion.div>
           </motion.form>
-          <div className="mt-4 flex flex-wrap items-center gap-1" aria-label="Task starters">
-            {TASK_STARTERS.map((starter) => (
-              <Button
-                key={starter.label}
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="rounded-full"
-                onClick={() => setPrompt(starter.prompt)}
-              >
-                {starter.label}
-              </Button>
-            ))}
-          </div>
         </div>
       </div>
     </motion.div>
@@ -3380,7 +3122,7 @@ function ProjectPicker({
   }
 
   return (
-    <div className="relative min-w-40 flex-1">
+    <div className="relative shrink-0">
       <Popover open={open} onOpenChange={setOpen} modal={false}>
         <PopoverTrigger asChild>
           <Button
@@ -3390,19 +3132,12 @@ function ProjectPicker({
             aria-haspopup="listbox"
             aria-expanded={open}
             aria-label="Choose project"
-            className="h-7 max-w-full justify-start gap-2 rounded-md bg-transparent px-2 text-left hover:bg-background/70 dark:bg-transparent dark:hover:bg-background/40"
+            className="h-8 max-w-48 justify-start gap-1.5 rounded-md bg-transparent px-2 font-mono text-xs hover:bg-background/70 dark:bg-transparent dark:hover:bg-background/40"
           >
-            <FolderIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <span className="min-w-0 truncate">
-              <span className="font-medium">{selectedName}</span>
-              <span className="ml-2 hidden font-mono text-[0.68rem] font-normal text-muted-foreground md:inline">
-                {path}
-              </span>
+            <span className="text-muted-foreground" aria-hidden="true">
+              /project
             </span>
-            <ChevronDownIcon
-              className="size-3.5 shrink-0 text-muted-foreground"
-              aria-hidden="true"
-            />
+            <span className="truncate">{selectedName}</span>
           </Button>
         </PopoverTrigger>
 
@@ -3412,7 +3147,7 @@ function ProjectPicker({
           aria-label="Choose project"
           side="bottom"
           align="start"
-          sideOffset={8}
+          sideOffset={18}
           collisionPadding={12}
           onInteractOutside={(event) => {
             const target = event.target;
@@ -4660,8 +4395,6 @@ function AgentSettingsDialog({
   submitting,
   darkMode,
   onDarkModeChange,
-  appLayout,
-  onAppLayoutChange,
   onCreate,
   onUpdate,
   onDelete,
@@ -4683,8 +4416,6 @@ function AgentSettingsDialog({
   submitting: boolean;
   darkMode: boolean;
   onDarkModeChange(darkMode: boolean): void;
-  appLayout: AppLayout;
-  onAppLayoutChange(layout: AppLayout): void;
   onCreate(settings: AgentEditorSettings): Promise<ManagedAgentResponse | undefined>;
   onUpdate(agentId: string, settings: AgentEditorSettings): Promise<void>;
   onDelete(agentId: string): Promise<void>;
@@ -4922,12 +4653,7 @@ function AgentSettingsDialog({
               ) : section === 'skills' ? (
                 <SkillsSettingsPage />
               ) : section === 'appearance' ? (
-                <AppearanceSettingsPage
-                  darkMode={darkMode}
-                  onDarkModeChange={onDarkModeChange}
-                  appLayout={appLayout}
-                  onAppLayoutChange={onAppLayoutChange}
-                />
+                <AppearanceSettingsPage darkMode={darkMode} onDarkModeChange={onDarkModeChange} />
               ) : (
                 <ExtensionsSettingsPage client={client} />
               )}
@@ -5043,7 +4769,7 @@ function ServersSettingsPage({
             <h3 className="text-xl font-semibold tracking-tight">Servers</h3>
             <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
               Connect piDeck to every supervisor you use. Sessions from connected servers appear
-              together in the sidebar.
+              together as agent tabs and in the overview.
             </p>
           </div>
           <Button className="shrink-0" onClick={() => setEditing('new')}>
@@ -5593,13 +5319,9 @@ function ProjectEditorForm({
 function AppearanceSettingsPage({
   darkMode,
   onDarkModeChange,
-  appLayout,
-  onAppLayoutChange,
 }: {
   darkMode: boolean;
   onDarkModeChange(darkMode: boolean): void;
-  appLayout: AppLayout;
-  onAppLayoutChange(layout: AppLayout): void;
 }) {
   return (
     <motion.div
@@ -5657,66 +5379,6 @@ function AppearanceSettingsPage({
               <span className="block font-medium">Dark</span>
               <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
                 Easier on the eyes at night
-              </span>
-            </span>
-          </Button>
-        </div>
-      </div>
-
-      <div className="rounded-xl border p-4">
-        <div>
-          <h4 className="font-medium">Workspace layout</h4>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Keep every session in a navigation rail, or move active work into a compact tab bar.
-          </p>
-        </div>
-        <div
-          className="mt-4 grid gap-2 sm:grid-cols-2"
-          role="radiogroup"
-          aria-label="Workspace layout"
-        >
-          <Button
-            type="button"
-            role="radio"
-            aria-checked={appLayout === 'sidebar'}
-            variant={appLayout === 'sidebar' ? 'secondary' : 'outline'}
-            className="h-auto justify-start gap-3 p-3 text-left"
-            onClick={() => onAppLayoutChange('sidebar')}
-          >
-            <span className="flex size-12 shrink-0 overflow-hidden rounded-lg border bg-background p-1.5">
-              <span className="w-3 rounded-sm bg-muted" />
-              <span className="ml-1 flex flex-1 flex-col gap-1 pt-0.5">
-                <span className="h-1 rounded-full bg-muted-foreground/35" />
-                <span className="h-1 w-3/4 rounded-full bg-muted-foreground/20" />
-              </span>
-            </span>
-            <span className="min-w-0">
-              <span className="block font-medium">Sidebar</span>
-              <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
-                Scan full session context
-              </span>
-            </span>
-          </Button>
-          <Button
-            type="button"
-            role="radio"
-            aria-checked={appLayout === 'tabs'}
-            variant={appLayout === 'tabs' ? 'secondary' : 'outline'}
-            className="h-auto justify-start gap-3 p-3 text-left"
-            onClick={() => onAppLayoutChange('tabs')}
-          >
-            <span className="flex size-12 shrink-0 flex-col overflow-hidden rounded-lg border bg-background p-1.5">
-              <span className="flex h-2 gap-1">
-                <span className="w-3 rounded-sm bg-muted-foreground/35" />
-                <span className="w-4 rounded-sm bg-muted" />
-                <span className="w-3 rounded-sm bg-muted" />
-              </span>
-              <span className="mt-1 flex-1 rounded-sm bg-muted/60" />
-            </span>
-            <span className="min-w-0">
-              <span className="block font-medium">Tabs</span>
-              <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
-                OpenCode-style compact sessions
               </span>
             </span>
           </Button>

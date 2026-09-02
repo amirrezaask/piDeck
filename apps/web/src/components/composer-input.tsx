@@ -1,5 +1,5 @@
 import type { ComposerSuggestion, ComposerSuggestionsRequest } from '@nextflow/contracts';
-import { ChevronRightIcon, FileIcon, FolderIcon, SlashIcon } from 'lucide-react';
+import { CheckIcon, ChevronRightIcon, FileIcon, FolderIcon, SlashIcon } from 'lucide-react';
 import {
   type ChangeEvent,
   type KeyboardEvent,
@@ -12,6 +12,8 @@ import {
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
+
+const EMPTY_COMPOSER_COMMANDS: readonly ComposerCommand[] = [];
 
 const FALLBACK_COMMANDS: readonly ComposerSuggestion[] = [
   ['settings', 'Open settings menu'],
@@ -50,10 +52,33 @@ interface ComposerSuggestionClient {
   ): Promise<{ suggestions: ComposerSuggestion[] }>;
 }
 
-interface CompletionContext {
-  readonly kind: 'file' | 'command';
-  readonly prefix: string;
+export interface ComposerCommandOption {
+  readonly value: string;
+  readonly label: string;
+  readonly description?: string;
 }
+
+export interface ComposerCommand {
+  readonly name: string;
+  readonly label: string;
+  readonly description: string;
+  readonly options: readonly ComposerCommandOption[];
+  readonly currentValue?: string;
+  readonly onSelect: (value: string) => void;
+}
+
+type CompletionContext =
+  | {
+      readonly kind: 'file' | 'command';
+      readonly prefix: string;
+      readonly start: number;
+    }
+  | {
+      readonly kind: 'command-option';
+      readonly prefix: string;
+      readonly start: number;
+      readonly command: ComposerCommand;
+    };
 
 interface ComposerInputProps {
   readonly value: string;
@@ -67,6 +92,7 @@ interface ComposerInputProps {
   readonly maxLength?: number;
   readonly className?: string;
   readonly placement?: 'top' | 'bottom';
+  readonly commands?: readonly ComposerCommand[];
   readonly onKeyDown?: (event: KeyboardEvent<HTMLTextAreaElement>) => void;
 }
 
@@ -82,20 +108,37 @@ export function ComposerInput({
   maxLength,
   className,
   placement = 'top',
+  commands = EMPTY_COMPOSER_COMMANDS,
   onKeyDown,
 }: ComposerInputProps) {
   const [cursor, setCursor] = useState(value.length);
   const [suggestions, setSuggestions] = useState<ComposerSuggestion[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [announcement, setAnnouncement] = useState('');
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const context = useMemo(() => completionContext(value, cursor), [cursor, value]);
+  const context = useMemo(
+    () => completionContext(value, cursor, commands),
+    [commands, cursor, value],
+  );
   const open = suggestions.length > 0 && context !== null && !disabled;
 
   useEffect(() => {
-    const fallback = context?.kind === 'command' ? filterCommands(context.prefix) : [];
+    const fallback =
+      context?.kind === 'command'
+        ? filterCommands(context.prefix, commands)
+        : context?.kind === 'command-option'
+          ? filterCommandOptions(context.command, context.prefix)
+          : [];
     setSuggestions(fallback);
     setActiveIndex(0);
-    if (!context || !cwd.trim() || !client?.listComposerSuggestions) return;
+    if (
+      !context ||
+      context.kind === 'command-option' ||
+      !cwd.trim() ||
+      !client?.listComposerSuggestions
+    ) {
+      return;
+    }
 
     const controller = new AbortController();
     let active = true;
@@ -103,7 +146,13 @@ export function ComposerInput({
       .listComposerSuggestions({ cwd: cwd.trim(), kind: context.kind, prefix: context.prefix })
       .then((response) => {
         if (active && !controller.signal.aborted) {
-          setSuggestions(response.suggestions.length > 0 ? response.suggestions : fallback);
+          setSuggestions(
+            context.kind === 'command'
+              ? mergeCommandSuggestions(fallback, response.suggestions)
+              : response.suggestions.length > 0
+                ? response.suggestions
+                : fallback,
+          );
           setActiveIndex(0);
         }
       })
@@ -115,7 +164,7 @@ export function ComposerInput({
       active = false;
       controller.abort();
     };
-  }, [client, context, cwd]);
+  }, [client, commands, context, cwd]);
 
   useEffect(() => {
     if (!open) return;
@@ -134,14 +183,24 @@ export function ComposerInput({
   function applySuggestion(suggestion: ComposerSuggestion) {
     if (!context) return;
     const safeCursor = Math.min(cursor, value.length);
-    const prefixStart = safeCursor - context.prefix.length;
-    if (prefixStart < 0) return;
-
-    const beforePrefix = value.slice(0, prefixStart);
+    const beforePrefix = value.slice(0, context.start);
     const afterCursor = value.slice(safeCursor);
+
+    if (context.kind === 'command-option') {
+      const option = context.command.options.find(
+        (candidate) => candidate.value === suggestion.value,
+      );
+      if (!option) return;
+      onChange(`${beforePrefix}${afterCursor}`);
+      setCursor(beforePrefix.length);
+      setSuggestions([]);
+      context.command.onSelect(option.value);
+      setAnnouncement(`${context.command.label} set to ${option.label}`);
+      return;
+    }
+
     let nextValue: string;
     let nextCursor: number;
-
     if (context.kind === 'command') {
       const command = suggestion.value.replace(/^\//, '');
       nextValue = `${beforePrefix}/${command} ${afterCursor}`;
@@ -187,6 +246,9 @@ export function ComposerInput({
 
   return (
     <Popover open={open} onOpenChange={(nextOpen) => !nextOpen && setSuggestions([])}>
+      <span className="sr-only" role="status" aria-live="polite">
+        {announcement}
+      </span>
       <PopoverAnchor asChild>
         <div className="min-w-0 flex-1">
           <Textarea
@@ -209,20 +271,21 @@ export function ComposerInput({
         side={placement}
         align="start"
         sideOffset={8}
+        collisionPadding={{ top: 56, right: 12, bottom: 12, left: 12 }}
         className="w-[min(36rem,calc(100vw-1.5rem))] max-w-[calc(100vw-1.5rem)] gap-0 overflow-hidden rounded-2xl p-1.5 shadow-xl ring-1 ring-foreground/10"
         onOpenAutoFocus={(event) => event.preventDefault()}
         onCloseAutoFocus={(event) => event.preventDefault()}
       >
         <div
           role="listbox"
-          aria-label={context?.kind === 'command' ? 'Pi commands' : 'Files'}
-          className="max-h-[min(22rem,calc(100dvh-8rem))] overflow-y-auto p-0.5"
+          aria-label={completionLabel(context)}
+          className="max-h-[min(22rem,calc(var(--radix-popover-content-available-height)-0.75rem))] overflow-y-auto p-0.5"
         >
           <div className="sticky top-0 flex items-center gap-1.5 bg-popover/95 px-2 py-2 text-xs font-medium text-muted-foreground backdrop-blur-sm">
-            {context?.kind === 'command' ? (
+            {context?.kind === 'command' || context?.kind === 'command-option' ? (
               <>
                 <SlashIcon className="size-3" aria-hidden="true" />
-                Pi commands
+                {context.kind === 'command-option' ? context.command.label : 'Composer commands'}
               </>
             ) : (
               <>
@@ -236,6 +299,7 @@ export function ComposerInput({
               key={`${suggestion.kind}:${suggestion.value}`}
               type="button"
               role="option"
+              aria-label={suggestionLabel(context, suggestion)}
               aria-selected={index === activeIndex}
               ref={(node) => {
                 optionRefs.current[index] = node;
@@ -251,9 +315,7 @@ export function ComposerInput({
               <SuggestionIcon kind={suggestion.kind} />
               <span className="min-w-0 flex-1">
                 <span className="block truncate font-medium">
-                  {context?.kind === 'command' && !suggestion.label.startsWith('/')
-                    ? `/${suggestion.label}`
-                    : suggestion.label}
+                  {suggestionLabel(context, suggestion)}
                 </span>
                 {suggestion.description ? (
                   <span className="block truncate font-mono text-xs text-muted-foreground">
@@ -261,7 +323,13 @@ export function ComposerInput({
                   </span>
                 ) : null}
               </span>
-              {suggestion.kind === 'directory' ? (
+              {context?.kind === 'command-option' &&
+              context.command.currentValue === suggestion.value ? (
+                <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
+                  <CheckIcon className="size-3.5" aria-hidden="true" />
+                  Current
+                </span>
+              ) : suggestion.kind === 'directory' ? (
                 <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
               ) : null}
             </button>
@@ -272,26 +340,95 @@ export function ComposerInput({
   );
 }
 
-function completionContext(value: string, cursor: number): CompletionContext | null {
+function completionContext(
+  value: string,
+  cursor: number,
+  commands: readonly ComposerCommand[],
+): CompletionContext | null {
   const safeCursor = Math.max(0, Math.min(cursor, value.length));
   const lineStart = value.lastIndexOf('\n', safeCursor - 1) + 1;
   const beforeCursor = value.slice(lineStart, safeCursor);
+  const optionMatch = beforeCursor.match(/^\/([^\s]+)\s+(.*)$/);
+  const command = optionMatch
+    ? commands.find((candidate) => candidate.name === optionMatch[1])
+    : undefined;
+
+  if (command && optionMatch) {
+    return { kind: 'command-option', prefix: optionMatch[2] ?? '', start: lineStart, command };
+  }
 
   if (/^\/[^\s]*$/.test(beforeCursor)) {
-    return { kind: 'command', prefix: beforeCursor };
+    return { kind: 'command', prefix: beforeCursor, start: lineStart };
   }
 
   const match = beforeCursor.match(/(?:^|[\s"'=])(@(?:"[^"\n]*|[^\s]*)?)$/);
-  if (match?.[1]) return { kind: 'file', prefix: match[1] };
+  if (match?.[1]) {
+    return { kind: 'file', prefix: match[1], start: safeCursor - match[1].length };
+  }
   return null;
 }
 
-function filterCommands(prefix: string): ComposerSuggestion[] {
+function filterCommands(
+  prefix: string,
+  commands: readonly ComposerCommand[],
+): ComposerSuggestion[] {
   const query = prefix.replace(/^\//, '').toLowerCase();
-  return FALLBACK_COMMANDS.filter((command) => {
-    const name = command.value.toLowerCase();
-    return !query || name.includes(query);
-  }).slice(0, 50);
+  const localCommands: ComposerSuggestion[] = commands.map((command) => ({
+    value: command.name,
+    label: `/${command.name}`,
+    description: command.description,
+    kind: 'command',
+  }));
+  return mergeCommandSuggestions(localCommands, FALLBACK_COMMANDS)
+    .filter((command) => {
+      const name = command.value.toLowerCase();
+      return !query || name.includes(query);
+    })
+    .slice(0, 50);
+}
+
+function filterCommandOptions(command: ComposerCommand, prefix: string): ComposerSuggestion[] {
+  const query = prefix.trim().toLowerCase();
+  return command.options
+    .filter((option) => {
+      if (!query) return true;
+      return (
+        option.value.toLowerCase().includes(query) || option.label.toLowerCase().includes(query)
+      );
+    })
+    .map((option) => ({
+      value: option.value,
+      label: option.label,
+      ...(option.description ? { description: option.description } : {}),
+      kind: 'command' as const,
+    }));
+}
+
+function mergeCommandSuggestions(
+  primary: readonly ComposerSuggestion[],
+  secondary: readonly ComposerSuggestion[],
+): ComposerSuggestion[] {
+  const merged = new Map<string, ComposerSuggestion>();
+  for (const suggestion of [...primary, ...secondary]) {
+    const key = `${suggestion.kind}:${suggestion.value.replace(/^\//, '')}`;
+    if (!merged.has(key)) merged.set(key, suggestion);
+  }
+  return [...merged.values()];
+}
+
+function completionLabel(context: CompletionContext | null): string {
+  if (context?.kind === 'command-option') return `${context.command.label} options`;
+  if (context?.kind === 'command') return 'Composer commands';
+  return 'Files';
+}
+
+function suggestionLabel(
+  context: CompletionContext | null,
+  suggestion: ComposerSuggestion,
+): string {
+  return context?.kind === 'command' && !suggestion.label.startsWith('/')
+    ? `/${suggestion.label}`
+    : suggestion.label;
 }
 
 function SuggestionIcon({ kind }: { kind: ComposerSuggestion['kind'] }) {

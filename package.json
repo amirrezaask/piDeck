@@ -7,6 +7,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
+    "prepare": "./scripts/prepare-effect.sh",
     "build": "pnpm build:binary && pnpm --filter @pideck/client make:dist && node scripts/verify-build.mjs",
     "build:binary": "turbo run build && node scripts/build-binary.mjs",
     "dev": "turbo run dev",

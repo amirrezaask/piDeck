@@ -1,0 +1,12 @@
+{
+  "semi": true,
+  "singleQuote": true,
+  "printWidth": 100,
+  "ignorePatterns": [
+    "build/**",
+    ".wxt/**",
+    "coverage/**",
+    "test-results/**",
+    "playwright-report/**"
+  ]
+}

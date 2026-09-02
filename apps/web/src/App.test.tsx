@@ -234,36 +234,23 @@ describe('App', () => {
     expect(screen.getByText(/models data is stale or unavailable/i)).toBeVisible();
   });
 
-  it('loads additional history without duplicating active runs', async () => {
-    const olderRun = {
+  it('shows only running and queued work in the overview grid', async () => {
+    const runningRun = { ...run, status: 'running' as const, completedAt: null };
+    const completedRun = {
       ...run,
       id: '018bcfe4-7a4b-7000-8000-000000000223',
       prompt: 'Older history.',
-      createdAt: '2026-08-22T20:00:00.000Z',
     };
-    const listRuns = vi
-      .fn()
-      .mockImplementation(({ cursor }: { cursor?: string }) =>
-        Promise.resolve(
-          cursor === 'next-page'
-            ? { runs: [olderRun, run], nextCursor: null }
-            : { runs: [run], nextCursor: 'next-page' },
-        ),
-      );
-    const client = createClient({ listRuns });
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [runningRun, completedRun], nextCursor: null }),
+    });
     render(<App client={client} />);
 
-    const loadMore = await screen.findByRole('button', { name: 'Load more history' });
-    await userEvent.click(loadMore);
-    expect(await screen.findByText('Older history.')).toBeVisible();
-    expect(
-      within(screen.getByRole('navigation', { name: 'Sessions' })).getAllByText(
-        'Review the changes.',
-      ),
-    ).toHaveLength(1);
-    expect(screen.queryByRole('button', { name: 'Load more history' })).not.toBeInTheDocument();
+    const grid = await screen.findByLabelText('Running agents');
+    expect(within(grid).getByText('Review the changes.')).toBeVisible();
+    expect(within(grid).queryByText('Older history.')).not.toBeInTheDocument();
   });
-
   it('restores a routed run that was not present in the initial history page', async () => {
     window.history.replaceState({}, '', `/servers/local/sessions/${run.id}`);
     const client = createClient({
@@ -278,6 +265,7 @@ describe('App', () => {
   it('creates the first persisted agent from the empty state', async () => {
     const user = userEvent.setup();
     const client = createClient();
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     expect(await screen.findByText('Create an agent profile first')).toBeVisible();
@@ -297,6 +285,7 @@ describe('App', () => {
   it('creates an agent with a replacement prompt and tool calls disabled', async () => {
     const user = userEvent.setup();
     const client = createClient();
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     await screen.findByText('Create an agent profile first');
@@ -318,6 +307,7 @@ describe('App', () => {
 
   it('shows searchable skills and extension update status in settings', async () => {
     const user = userEvent.setup();
+    window.history.replaceState({}, '', `/new`);
     render(<App client={createClient()} />);
 
     expect(await screen.findByText('Create an agent profile first')).toBeVisible();
@@ -356,6 +346,7 @@ describe('App', () => {
     const client = createClient({
       updateProject: vi.fn().mockResolvedValue(updatedProject),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     expect(await screen.findByText('Create an agent profile first')).toBeVisible();
@@ -401,6 +392,7 @@ describe('App', () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     await user.click(await screen.findByRole('button', { name: 'Choose project' }));
@@ -422,21 +414,28 @@ describe('App', () => {
     expect(settingsPath).toHaveValue('/workspace');
   });
 
-  it('completes Pi slash commands in the new-session composer', async () => {
+  it('applies composer slash command choices to new-session state immediately', async () => {
     const user = userEvent.setup();
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     const composer = await screen.findByRole('textbox', { name: 'Session task' });
-    await user.type(composer, '/mod');
+    await user.type(composer, '/');
+    for (const name of ['host', 'project', 'agent', 'model', 'think', 'checkout']) {
+      expect(screen.getByRole('option', { name: new RegExp(`^/${name}\\b`) })).toBeVisible();
+    }
 
-    const command = await screen.findByRole('option', { name: /\/model/ });
-    expect(command).toHaveTextContent('Select model');
-    await user.click(command);
+    await user.clear(composer);
+    await user.type(composer, '/think ');
+    expect(await screen.findByRole('listbox', { name: 'Thinking level options' })).toBeVisible();
+    await user.click(screen.getByRole('option', { name: 'High' }));
 
-    expect(composer).toHaveValue('/model ');
+    expect(composer).toHaveValue('');
+    expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveTextContent('High');
+    expect(screen.getByRole('status')).toHaveTextContent('Thinking level set to High');
   });
 
   it('completes @ file references from the active supervisor', async () => {
@@ -454,6 +453,7 @@ describe('App', () => {
         ],
       }),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     const composer = await screen.findByRole('textbox', { name: 'Session task' });
@@ -472,6 +472,7 @@ describe('App', () => {
 
   it('switches to dark mode and persists the preference', async () => {
     const user = userEvent.setup();
+    window.history.replaceState({}, '', `/new`);
     render(<App client={createClient()} />);
 
     expect(await screen.findByText('Create an agent profile first')).toBeVisible();
@@ -488,97 +489,73 @@ describe('App', () => {
     expect(screen.getByRole('radio', { name: /Dark/ })).toHaveAttribute('aria-checked', 'true');
   });
 
-  it('switches to the tab workspace layout and persists the preference', async () => {
-    const user = userEvent.setup();
+  it('removes the in-app tab bar and exposes active runs as browser links', async () => {
     const secondRun = {
       ...run,
       id: '018bcfe4-7a4b-7000-8000-000000000777',
       prompt: 'Fix the failing tests.',
-    };
-    const client = createClient({
-      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
-      listRuns: vi.fn().mockResolvedValue({ runs: [run, secondRun], nextCursor: null }),
-    });
-    render(<App client={client} />);
-
-    await user.click(await screen.findByRole('button', { name: 'Settings' }));
-    await user.click(screen.getByRole('button', { name: 'Appearance' }));
-    await user.click(screen.getByRole('radio', { name: /Tabs/ }));
-    await user.keyboard('{Escape}');
-
-    expect(window.localStorage.getItem('pideck-layout')).toBe('tabs');
-    const firstTab = screen.getByRole('tab', { name: /Review the changes\./ });
-    expect(firstTab).toBeVisible();
-    expect(screen.queryByRole('button', { name: 'Collapse sidebar' })).not.toBeInTheDocument();
-
-    firstTab.focus();
-    await user.keyboard('{ArrowRight}');
-    expect(window.location.pathname).toBe(`/sessions/${secondRun.id}`);
-  });
-
-  it('collapses the sidebar and remembers the preference', async () => {
-    const user = userEvent.setup();
-    render(<App client={createClient()} />);
-
-    const collapseButton = await screen.findByRole('button', { name: 'Collapse sidebar' });
-    const newSessionButton = screen.getByRole('button', { name: 'New session' });
-    expect(collapseButton).toHaveAttribute('aria-expanded', 'true');
-    expect(newSessionButton).toHaveAttribute('data-size', 'icon-sm');
-    expect(newSessionButton).toHaveAttribute('title', 'New session (⌘N)');
-    expect(newSessionButton.querySelector('svg')).not.toBeNull();
-
-    await user.click(collapseButton);
-
-    expect(screen.getByRole('button', { name: 'Expand sidebar' })).toHaveAttribute(
-      'aria-expanded',
-      'false',
-    );
-    expect(screen.queryByText('Sessions')).not.toBeInTheDocument();
-    expect(window.localStorage.getItem('pideck-sidebar-collapsed')).toBe('true');
-
-    await user.click(screen.getByRole('button', { name: 'Expand sidebar' }));
-
-    expect(screen.getByText('Sessions')).toBeInTheDocument();
-    expect(window.localStorage.getItem('pideck-sidebar-collapsed')).toBe('false');
-  });
-
-  it('shows unchecked activity on each session and clears it when opened', async () => {
-    const user = userEvent.setup();
-    const secondRun = {
-      ...run,
-      id: '018bcfe4-7a4b-7000-8000-000000000778',
-      prompt: 'Inspect background activity.',
-      latestEventSequence: 8,
-      createdAt: '2026-08-22T20:00:00.000Z',
+      status: 'running' as const,
+      completedAt: null,
     };
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({
-        runs: [{ ...run, latestEventSequence: 4 }, secondRun],
+        runs: [{ ...run, status: 'running', completedAt: null }, secondRun],
         nextCursor: null,
       }),
     });
     render(<App client={client} />);
 
-    expect(await screen.findByLabelText('8 unchecked events')).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /Inspect background activity/ }));
-    expect(screen.queryByLabelText('8 unchecked events')).not.toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Running agents' })).toBeVisible();
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Open Review the changes/ })).toHaveAttribute(
+      'href',
+      expect.stringContaining(`/sessions/${run.id}`),
+    );
+    expect(screen.getByRole('link', { name: /Open Fix the failing tests/ })).toBeVisible();
   });
-
-  it('updates the URL when selecting a session', async () => {
+  it('opens the new-session composer from the overview', async () => {
     const user = userEvent.setup();
-    window.history.replaceState({}, '', '/new');
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
-      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
     });
-
     render(<App client={client} />);
 
-    await user.click(await screen.findByRole('button', { name: /Review the changes\./ }));
+    await user.click(await screen.findByRole('button', { name: 'Start a session' }));
+    expect(screen.getByRole('textbox', { name: 'Session task' })).toBeVisible();
+    expect(window.location.pathname).toBe('/new');
+  });
+  it('shows unchecked activity on running agent cards and clears it when opened', async () => {
+    const user = userEvent.setup();
+    const activeRun = {
+      ...run,
+      status: 'running' as const,
+      completedAt: null,
+      latestEventSequence: 8,
+    };
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [activeRun], nextCursor: null }),
+    });
+    render(<App client={client} />);
+
+    const grid = await screen.findByLabelText('Running agents');
+    expect(within(grid).getByText('8 new events')).toBeVisible();
+    await user.click(within(grid).getByRole('link', { name: /Open Review the changes/ }));
+    expect(screen.getByRole('heading', { name: 'Review the changes.' })).toBeVisible();
+  });
+  it('updates the URL when opening a running agent', async () => {
+    const user = userEvent.setup();
+    const activeRun = { ...run, status: 'running' as const, completedAt: null };
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [activeRun], nextCursor: null }),
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole('link', { name: /Open Review the changes/ }));
     expect(window.location.pathname).toBe(`/sessions/${run.id}`);
   });
-
   it('restores the session selected by the URL', async () => {
     window.history.replaceState({}, '', `/sessions/${run.id}`);
     const client = createClient({
@@ -590,60 +567,35 @@ describe('App', () => {
 
     expect(await screen.findByRole('heading', { name: 'Review the changes.' })).toBeVisible();
     expect(window.location.pathname).toBe(`/sessions/${run.id}`);
-    expect(
-      within(screen.getByRole('navigation', { name: 'Sessions' })).getByRole('button', {
-        name: /Review the changes\./,
-      }),
-    ).toHaveAttribute('aria-current', 'page');
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
   });
 
-  it('archives a session from its context menu', async () => {
-    const user = userEvent.setup();
+  it('does not render archive controls or an archived bar', async () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
     });
-
     render(<App client={client} />);
 
-    const sessionButton = await screen.findByRole('button', {
-      name: /Review the changes\./,
-    });
-    fireEvent.contextMenu(sessionButton);
-
-    await user.click(await screen.findByRole('menuitem', { name: 'Archive' }));
-
-    const restore = screen.getByRole('button', { name: 'Restore Review the changes.' });
-    expect(window.location.pathname).toBe('/new');
-    expect(window.localStorage.getItem('pideck-archived-runs')).toContain(run.id);
-
-    await user.click(restore);
-    expect(window.location.pathname).toBe(`/sessions/${run.id}`);
-    expect(window.localStorage.getItem('pideck-archived-runs')).not.toContain(run.id);
+    await screen.findByRole('heading', { name: 'Running agents' });
+    expect(screen.queryByText('Archived:')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Restore/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Close Review/ })).not.toBeInTheDocument();
   });
-
-  it('archives a session from the hover action', async () => {
+  it('returns to the overview from the app toolbar', async () => {
     const user = userEvent.setup();
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
     });
-
     render(<App client={client} />);
 
-    const sessionButton = await screen.findByRole('button', {
-      name: /Review the changes\./,
-    });
-    await user.hover(sessionButton);
-    await user.click(screen.getByRole('button', { name: 'Archive session' }));
-
-    expect(screen.getByRole('button', { name: 'Restore Review the changes.' })).toBeInTheDocument();
-    expect(window.location.pathname).toBe('/new');
-    expect(window.localStorage.getItem('pideck-archived-runs')).toContain(run.id);
+    await user.click(await screen.findByRole('button', { name: 'piDeck overview' }));
+    expect(screen.getByRole('heading', { name: 'Running agents' })).toBeVisible();
+    expect(window.location.pathname).toBe('/');
   });
-
   it('renders the prompt, model avatar, and lifecycle markers', async () => {
-    const user = userEvent.setup();
     const events: ManagedAgentEvent[] = [
       {
         agentId: agent.id,
@@ -675,24 +627,10 @@ describe('App', () => {
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
       listRunEventPages: eventPages(events),
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     expect(await screen.findByRole('heading', { name: 'Review the changes.' })).toBeVisible();
-    const sessionButton = within(screen.getByRole('navigation', { name: 'Sessions' })).getByRole(
-      'button',
-      { name: /Review the changes\./ },
-    );
-    expect(sessionButton).toHaveAttribute(
-      'title',
-      'Review the changes. · workspace · working tree · Fake model · Medium thinking · Completed',
-    );
-    expect(sessionButton).toHaveTextContent('workspace');
-    expect(sessionButton).not.toHaveTextContent('/workspace');
-    expect(sessionButton).toHaveTextContent('working tree');
-    expect(sessionButton.querySelector('[data-slot="avatar"]')).not.toBeNull();
-    await user.hover(sessionButton);
-    expect(await screen.findByRole('tooltip')).toHaveTextContent('Fake model');
-    expect(screen.getByRole('tooltip')).toHaveTextContent('Medium thinking');
     expect(await screen.findByText('Agent started')).toBeVisible();
     expect(await screen.findByText('Looks good.')).toBeVisible();
     expect(screen.getByLabelText('Workspace agent conversation')).toBeInTheDocument();
@@ -727,6 +665,7 @@ describe('App', () => {
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
       listRunEventPage,
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     await user.click(await screen.findByRole('button', { name: 'Load older activity' }));
@@ -762,6 +701,7 @@ describe('App', () => {
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
       listRunEventPages: eventPages(events),
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     await user.click(await screen.findByRole('button', { name: /Running bash/ }));
@@ -788,6 +728,7 @@ describe('App', () => {
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
       listRunEventPages: eventPages(events),
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     const fileBadge = await screen.findByText('App.tsx');
@@ -829,6 +770,7 @@ describe('App', () => {
       }),
       streamRunEvents,
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     resolveReplay({ events: [persistedEvent] });
@@ -844,6 +786,7 @@ describe('App', () => {
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     const composer = await screen.findByRole('textbox', { name: 'Message agent' });
@@ -875,6 +818,7 @@ describe('App', () => {
         ],
       }),
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     expect(await screen.findByRole('group', { name: 'Prompt attachments' })).toBeVisible();
@@ -882,19 +826,20 @@ describe('App', () => {
     expect(client.listRunAttachments).toHaveBeenCalledWith(run.id);
   });
 
-  it('starts a new task from a focused coding prompt', async () => {
+  it('starts a new task without suggested prompts', async () => {
     const user = userEvent.setup();
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [], nextCursor: null }),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
-    await user.click(await screen.findByRole('button', { name: 'Review current changes' }));
+    const composer = await screen.findByRole('textbox', { name: 'Session task' });
+    expect(screen.queryByRole('region', { name: 'Task starters' })).not.toBeInTheDocument();
+    await user.type(composer, 'Review the current changes.');
 
-    expect(screen.getByRole('textbox', { name: 'Session task' })).toHaveValue(
-      'Review the current changes for correctness, regressions, and missing tests. Report findings before editing.',
-    );
+    expect(composer).toHaveValue('Review the current changes.');
   });
 
   it('accepts dropped images in the initial composer and sends them with the run', async () => {
@@ -903,6 +848,7 @@ describe('App', () => {
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [], nextCursor: null }),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     const composer = await screen.findByRole('form', { name: 'New session composer' });
@@ -954,6 +900,7 @@ describe('App', () => {
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     const chatArea = await screen.findByRole('region', { name: 'Chat area' });
@@ -987,6 +934,7 @@ describe('App', () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     await user.click(await screen.findByRole('button', { name: 'Choose project' }));
@@ -1012,6 +960,7 @@ describe('App', () => {
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     await user.click(await screen.findByRole('button', { name: 'Choose project' }));
@@ -1042,6 +991,7 @@ describe('App', () => {
       createRun: vi.fn().mockResolvedValue(activeRun),
       cancelRun: vi.fn().mockResolvedValue(cancelledRun),
     });
+    window.history.replaceState({}, '', `/new`);
     render(<App client={client} />);
 
     const composer = await screen.findByRole('textbox', { name: 'Session task' });
@@ -1109,16 +1059,16 @@ describe('App', () => {
       ),
     };
 
+    window.history.replaceState({}, '', `/new`);
     render(<App connectionManager={manager} />);
 
-    expect(await screen.findByRole('button', { name: /Review the changes\./ })).toBeVisible();
-    expect(screen.getByRole('button', { name: /Inspect the remote workspace\./ })).toBeVisible();
+    expect(await screen.findByRole('textbox', { name: 'Session task' })).toBeVisible();
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: 'New session' }));
-    const serverSelect = screen.getByRole('combobox', { name: 'Server' });
+    const serverSelect = screen.getByRole('combobox', { name: 'Remote host' });
     fireEvent.keyDown(serverSelect, { key: 'Enter' });
     await user.click(await screen.findByRole('option', { name: 'Build host' }));
-    expect(screen.getByRole('combobox', { name: 'Server' })).toHaveTextContent('Build host');
+    expect(screen.getByRole('combobox', { name: 'Remote host' })).toHaveTextContent('Build host');
     expect(screen.getByRole('combobox', { name: 'Agent profile' })).toHaveTextContent(
       'Remote agent',
     );
@@ -1148,6 +1098,7 @@ describe('App', () => {
         truncated: false,
       }),
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     await user.click(await screen.findByRole('button', { name: 'Open changes' }));
@@ -1236,6 +1187,7 @@ describe('App', () => {
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
       getRunDebugLog,
     });
+    window.history.replaceState({}, '', `/sessions/${run.id}`);
     render(<App client={client} />);
 
     await user.click(await screen.findByRole('button', { name: 'Open debug log' }));

@@ -52,6 +52,7 @@ test.beforeEach(async ({ page }) => {
   );
   await page.route('**/v1/projects', (route) => route.fulfill({ status: 201, json: project }));
   await page.route('**/v1/inbox', (route) => route.fulfill({ json: { items: [] } }));
+  await page.route('**/v1/worktrees', (route) => route.fulfill({ json: { worktrees: [] } }));
   await page.route('**/v1/projects/*', async (route) => {
     if (route.request().method() === 'DELETE') {
       await route.fulfill({ status: 200, json: project });
@@ -77,11 +78,12 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   page,
 }, testInfo) => {
   const errors = watchBrowserErrors(page);
+  const activeRun = { ...run, status: 'running', completedAt: null };
   await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [agent], nextCursor: null } }),
   );
   await page.route('**/v1/runs?**', (route) =>
-    route.fulfill({ json: { runs: [run], nextCursor: null } }),
+    route.fulfill({ json: { runs: [activeRun], nextCursor: null } }),
   );
   await page.route('**/v1/models', (route) =>
     route.fulfill({
@@ -183,6 +185,7 @@ test('renders persisted and streamed PI events with chat primitives', async ({
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/');
+  await page.getByRole('link', { name: 'Open Review the changes.' }).click();
   await expect(
     page.getByRole('heading', { name: 'Review the changes.', exact: true }),
   ).toBeVisible();
@@ -256,13 +259,16 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   });
 });
 
-test('switches between sidebar and session tabs layouts', async ({ page }, testInfo) => {
+test('shows running agents in the overview and opens each run as a tab', async ({
+  page,
+}, testInfo) => {
   const errors = watchBrowserErrors(page);
+  const activeRun = { ...run, status: 'running', completedAt: null };
   await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [agent], nextCursor: null } }),
   );
   await page.route('**/v1/runs?**', (route) =>
-    route.fulfill({ json: { runs: [run], nextCursor: null } }),
+    route.fulfill({ json: { runs: [activeRun], nextCursor: null } }),
   );
   await page.route('**/v1/models', (route) =>
     route.fulfill({
@@ -279,38 +285,43 @@ test('switches between sidebar and session tabs layouts', async ({ page }, testI
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/');
-  await page.getByRole('button', { name: 'Settings' }).click();
-  const settings = page.getByRole('dialog', { name: 'Settings' });
-  await settings.getByRole('button', { name: 'Appearance' }).click();
-  await settings.getByRole('radio', { name: /Tabs/ }).click();
-  await expect.poll(() => page.evaluate(() => localStorage.getItem('pideck-layout'))).toBe('tabs');
-  await page.keyboard.press('Escape');
-
-  const sessionTab = page.getByRole('tab', { name: /Review the changes\./ });
-  await expect(sessionTab).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Collapse sidebar' })).toHaveCount(0);
-  await sessionTab.focus();
-  await expect(sessionTab).toBeFocused();
+  await expect(page.getByRole('heading', { name: 'Running agents' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Running agents' })).toContainText(
+    'Review the changes.',
+  );
+  await expect(page.getByRole('tablist')).toHaveCount(0);
+  const runLink = page.getByRole('link', { name: 'Open Review the changes.' });
+  await expect(runLink).toBeVisible();
   await expect
     .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
     .toBe(true);
-  expect(errors).toEqual([]);
 
   mkdirSync('.impeccable/review', { recursive: true });
   const viewport = testInfo.project.name.startsWith('mobile') ? 'mobile' : 'desktop';
   await page.screenshot({
-    path: `.impeccable/review/tabs-layout-${viewport}.png`,
+    path: `.impeccable/review/overview-${viewport}.png`,
     fullPage: true,
   });
+  await page.evaluate(() => document.documentElement.classList.add('dark'));
+  await page.screenshot({
+    path: `.impeccable/review/overview-dark-${viewport}.png`,
+    fullPage: true,
+  });
+
+  await runLink.click();
+  await expect(page).toHaveURL(new RegExp(`/sessions/${run.id}$`));
+  await expect(page.getByRole('tablist')).toHaveCount(0);
+  expect(errors).toEqual([]);
 });
 
 test('accepts dropped images in the chat composer', async ({ page }, testInfo) => {
   const errors = watchBrowserErrors(page);
+  const activeRun = { ...run, status: 'running', completedAt: null };
   await page.route('**/v1/agents?**', (route) =>
     route.fulfill({ json: { agents: [agent], nextCursor: null } }),
   );
   await page.route('**/v1/runs?**', (route) =>
-    route.fulfill({ json: { runs: [run], nextCursor: null } }),
+    route.fulfill({ json: { runs: [activeRun], nextCursor: null } }),
   );
   await page.route('**/v1/models', (route) =>
     route.fulfill({
@@ -327,6 +338,7 @@ test('accepts dropped images in the chat composer', async ({ page }, testInfo) =
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/');
+  await page.getByRole('link', { name: 'Open Review the changes.' }).click();
   await expect(page.getByRole('textbox', { name: 'Message agent' })).toBeVisible();
 
   await page.evaluate(() => {
@@ -385,7 +397,7 @@ test('navigates skills and reports extension availability honestly', async ({ pa
   );
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/');
+  await page.goto('/new');
   await page.getByRole('button', { name: 'Open agent settings' }).click();
   const settings = page.getByRole('dialog', { name: 'Settings' });
   await expect(settings).toBeVisible();
@@ -466,7 +478,7 @@ test('chooses a saved project or prepares a new workspace', async ({ page }, tes
   );
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/');
+  await page.goto('/new');
   await page.getByRole('button', { name: 'Choose project' }).click();
   const picker = page.getByRole('dialog', { name: 'Choose project' });
   await expect(picker.getByRole('option', { name: /workspace/ })).toBeVisible();
@@ -551,7 +563,7 @@ test('adds a server and selects it in the composer', async ({ page }, testInfo) 
   expect(errors).toEqual([]);
 });
 
-test('completes Pi commands and @ file references in the new-session composer', async ({
+test('applies composer commands and completes @ file references in a new session', async ({
   page,
 }, testInfo) => {
   const errors = watchBrowserErrors(page);
@@ -603,17 +615,44 @@ test('completes Pi commands and @ file references in the new-session composer', 
   });
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/');
+  await page.goto('/new');
   const composer = page.getByRole('textbox', { name: 'Session task' });
-  await composer.fill('/mod');
-  await expect(page.getByRole('option', { name: /\/model/ })).toBeVisible();
+  const composerForm = page.getByRole('form', { name: 'New session composer' });
+  const sessionSettings = page.getByRole('group', { name: 'Session settings' });
+  await expect(sessionSettings).toBeVisible();
+  await expect
+    .poll(() => composerForm.evaluate((element) => getComputedStyle(element).opacity))
+    .toBe('1');
+  await expect
+    .poll(() => sessionSettings.evaluate((element) => element.scrollWidth <= element.clientWidth))
+    .toBe(true);
+  await expect
+    .poll(() =>
+      sessionSettings.evaluate(
+        (element) =>
+          new Set(
+            [...element.children].map((child) => Math.round(child.getBoundingClientRect().top)),
+          ).size,
+      ),
+    )
+    .toBeGreaterThan(1);
+
   mkdirSync('.impeccable/review', { recursive: true });
+  await page.screenshot({
+    path: `.impeccable/review/composer-wrapped-settings-${testInfo.project.name}.png`,
+    fullPage: true,
+  });
+
+  await composer.fill('/think ');
+  await expect(page.getByRole('listbox', { name: 'Thinking level options' })).toBeVisible();
   await page.screenshot({
     path: `.impeccable/review/composer-autocomplete-${testInfo.project.name}.png`,
     fullPage: true,
   });
-  await page.keyboard.press('Enter');
-  await expect(composer).toHaveValue('/model ');
+  for (let index = 0; index < 4; index += 1) await composer.press('ArrowDown');
+  await composer.press('Enter');
+  await expect(composer).toHaveValue('');
+  await expect(page.getByRole('combobox', { name: 'Thinking level' })).toContainText('High');
 
   await composer.fill('@App');
   await expect(page.getByRole('option', { name: /App\.tsx/ })).toBeVisible();
@@ -710,7 +749,7 @@ test('creates an agent and starts a managed run', async ({ page }, testInfo) => 
   await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, () => undefined);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/');
+  await page.goto('/new');
   await page.getByRole('button', { name: 'Open agent settings' }).click();
   const settingsDialog = page.getByRole('dialog', { name: 'Settings' });
   await expect(settingsDialog).toBeVisible();

@@ -1,5 +1,6 @@
 node_modules/
 dist/
+build/
 .turbo/
 *.tsbuildinfo
 .env
@@ -11,3 +12,4 @@ playwright-report/
 **/data/*.sqlite*
 **/data/pi-sessions/
 .impeccable/review/
+.repos/effect
