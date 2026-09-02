@@ -1,2 +1,2 @@
-export { GHOSTTY_CELL_WIDE, ghosttyColorsEqual } from "@pideck/ghostty-core"
-export type { GhosttyColor } from "@pideck/ghostty-core"
+export { GHOSTTY_CELL_WIDE, ghosttyColorsEqual } from "@yaade/ghostty-core"
+export type { GhosttyColor } from "@yaade/ghostty-core"

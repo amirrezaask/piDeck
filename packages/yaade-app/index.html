@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#01040a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="YAADE" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; connect-src 'self' data: http: https: ws: wss:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
+    />
+    <title>YAADE</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <script>
+      (function () {
+        try {
+          var raw = localStorage.getItem("yaade-color-scheme")
+          var themeId = localStorage.getItem("yaade-theme-id") || ""
+          var lightThemeIds = ["default-light"]
+          var scheme = raw === "light" || raw === "dark"
+            ? raw
+            : raw === "system"
+              ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+              : lightThemeIds.indexOf(themeId) >= 0 ? "light" : "dark"
+          if (scheme === "dark") document.documentElement.classList.add("dark")
+          document.documentElement.dataset.yaadeSurface = "default"
+        } catch (_) {
+          document.documentElement.classList.add("dark")
+          document.documentElement.dataset.yaadeSurface = "default"
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

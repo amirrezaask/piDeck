@@ -1,0 +1,78 @@
+{
+  "fixtureId": "resize-reset-theme",
+  "observations": [
+    {
+      "id": "before-reset",
+      "cursor": { "column": 11, "row": 1 },
+      "activeScreen": "primary",
+      "dimensions": { "columns": 26, "rows": 7, "widthPixels": 260, "heightPixels": 140 },
+      "scrollbar": { "total": 7, "offset": 0, "length": 7 },
+      "kittyKeyboardFlags": 0,
+      "rows": [],
+      "cells": [
+        {
+          "row": 0,
+          "column": 7,
+          "graphemeBase64": "Yw==",
+          "width": "narrow",
+          "style": {
+            "foreground": { "r": 120, "g": 80, "b": 40 },
+            "background": { "r": 248, "g": 250, "b": 252 },
+            "foregroundSource": { "kind": "rgb", "color": { "r": 120, "g": 80, "b": 40 } },
+            "backgroundSource": { "kind": "none" },
+            "underlineColorSource": { "kind": "none" },
+            "bold": false,
+            "italic": false,
+            "faint": false,
+            "blink": false,
+            "inverse": false,
+            "invisible": false,
+            "strikethrough": false,
+            "overline": false,
+            "underline": "none"
+          }
+        },
+        { "row": 1, "column": 0, "graphemeBase64": "YQ==", "width": "narrow" }
+      ],
+      "palette": [],
+      "modes": [],
+      "effects": []
+    },
+    {
+      "id": "final",
+      "cursor": { "column": 9, "row": 0 },
+      "activeScreen": "primary",
+      "dimensions": { "columns": 26, "rows": 7, "widthPixels": 260, "heightPixels": 140 },
+      "scrollbar": { "total": 7, "offset": 0, "length": 7 },
+      "kittyKeyboardFlags": 0,
+      "rows": [],
+      "cells": [
+        {
+          "row": 0,
+          "column": 8,
+          "graphemeBase64": "IQ==",
+          "width": "narrow",
+          "style": {
+            "foreground": { "r": 30, "g": 41, "b": 59 },
+            "background": { "r": 248, "g": 250, "b": 252 },
+            "foregroundSource": { "kind": "none" },
+            "backgroundSource": { "kind": "none" },
+            "underlineColorSource": { "kind": "none" },
+            "bold": false,
+            "italic": false,
+            "faint": false,
+            "blink": false,
+            "inverse": false,
+            "invisible": false,
+            "strikethrough": false,
+            "overline": false,
+            "underline": "single"
+          }
+        }
+      ],
+      "palette": [],
+      "modes": [],
+      "effects": []
+    }
+  ]
+}

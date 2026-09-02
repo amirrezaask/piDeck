@@ -1,30 +1,50 @@
-import { defineConfig, devices } from '@playwright/test';
+import { defineConfig } from "@playwright/test"
 
 export default defineConfig({
-  testDir: './tests/e2e',
-  fullyParallel: true,
-  forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 2 : 0,
-  reporter: 'list',
+  timeout: 120_000,
+  expect: { timeout: 10_000 },
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 1 : 0,
+  workers: process.env.PLAYWRIGHT_WORKERS ? Number(process.env.PLAYWRIGHT_WORKERS) : 1,
+  fullyParallel: false,
+  passWithNoTests: true,
+  globalSetup: "./tests/web/global-setup.ts",
   use: {
-    baseURL: 'http://127.0.0.1:4173',
-    trace: 'retain-on-failure',
-    screenshot: 'only-on-failure',
+    actionTimeout: 15_000,
+    navigationTimeout: 30_000,
+    trace: "retain-on-failure",
+    screenshot: "only-on-failure",
+    video: "retain-on-failure",
+    viewport: { width: 1440, height: 900 },
   },
   projects: [
     {
-      name: 'desktop-chromium',
-      use: { ...devices['Desktop Chrome'], channel: process.env.CI ? undefined : 'chrome' },
+      name: "web-e2e",
+      testDir: "./tests/web",
+      testMatch: "**/*.web.spec.ts",
+      timeout: 180_000,
     },
     {
-      name: 'mobile-chromium',
-      use: { ...devices['Pixel 7'], channel: process.env.CI ? undefined : 'chrome' },
+      name: "security-e2e",
+      testDir: "./tests/security",
+      testMatch: "*.security.spec.ts",
+      timeout: 180_000,
+    },
+    {
+      name: "platform-e2e",
+      testDir: "./tests/platform",
+      testMatch: "*.e2e.test.ts",
+      timeout: 180_000,
+    },
+    {
+      name: "bench",
+      testDir: "./tests/bench",
+      testMatch: "*.bench.ts",
+      timeout: 180_000,
+      // Latency budgets are meaningless when independent host/browser pairs
+      // contend for the same CPU. Keep functional E2E parallel, benchmarks serial.
+      fullyParallel: false,
+      workers: 1,
     },
   ],
-  webServer: {
-    command:
-      'pnpm --filter @pideck/web build && pnpm --filter @pideck/web preview --host 127.0.0.1 --port 4173',
-    url: 'http://127.0.0.1:4173',
-    reuseExistingServer: !process.env.CI,
-  },
-});
+})

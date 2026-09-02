@@ -1,0 +1,41 @@
+{
+  "fixtureId": "complex-tui",
+  "observations": [
+    {
+      "id": "alternate",
+      "cursor": { "column": 18, "row": 4 },
+      "activeScreen": "alternate",
+      "dimensions": { "columns": 42, "rows": 12, "widthPixels": 336, "heightPixels": 192 },
+      "scrollbar": { "total": 12, "offset": 0, "length": 12 },
+      "kittyKeyboardFlags": 0,
+      "rows": [],
+      "cells": [
+        { "row": 0, "column": 0, "graphemeBase64": "4pSM", "width": "narrow" },
+        { "row": 2, "column": 11, "graphemeBase64": "Iw==", "width": "narrow" },
+        { "row": 4, "column": 10, "graphemeBase64": "Yw==", "width": "narrow" }
+      ],
+      "palette": [],
+      "modes": [
+        { "number": 1049, "ansi": false, "enabled": true }
+      ],
+      "effects": []
+    },
+    {
+      "id": "final",
+      "cursor": { "column": 10, "row": 0 },
+      "activeScreen": "primary",
+      "dimensions": { "columns": 42, "rows": 12, "widthPixels": 336, "heightPixels": 192 },
+      "scrollbar": { "total": 12, "offset": 0, "length": 12 },
+      "kittyKeyboardFlags": 0,
+      "rows": [],
+      "cells": [
+        { "row": 0, "column": 0, "graphemeBase64": "VA==", "width": "narrow" }
+      ],
+      "palette": [],
+      "modes": [
+        { "number": 1049, "ansi": false, "enabled": false }
+      ],
+      "effects": []
+    }
+  ]
+}

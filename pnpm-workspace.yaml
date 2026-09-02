@@ -1,3 +1,19 @@
 packages:
-  - apps/*
-  - packages/*
+  - "apps/*"
+  - "packages/*"
+  - "tests/*"
+  - "tests/*/*"
+
+pnpm:
+  overrides:
+    typescript: "$typescript"
+    effect: "3.22.1"
+    "@effect/platform": "0.97.1"
+    "@effect/platform-node": "0.99.0"
+    "@effect/platform-browser": "0.77.1"
+    "@effect/rpc": "0.73.0"
+    "@effect/experimental": "0.58.0"
+
+catalog:
+  vite: npm:@voidzero-dev/vite-plus-core@0.2.9
+  vite-plus: 0.2.9

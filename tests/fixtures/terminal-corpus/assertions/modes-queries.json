@@ -1,0 +1,57 @@
+{
+  "fixtureId": "modes-queries",
+  "observations": [
+    {
+      "id": "alternate",
+      "cursor": { "column": 8, "row": 1 },
+      "activeScreen": "alternate",
+      "dimensions": { "columns": 36, "rows": 9, "widthPixels": 288, "heightPixels": 153 },
+      "scrollbar": { "total": 9, "offset": 0, "length": 9 },
+      "kittyKeyboardFlags": 0,
+      "rows": [],
+      "cells": [
+        { "row": 1, "column": 2, "graphemeBase64": "cw==", "width": "narrow" }
+      ],
+      "palette": [
+        { "index": 1, "color": { "r": 204, "g": 102, "b": 102 } }
+      ],
+      "modes": [
+        { "number": 1, "ansi": false, "enabled": true },
+        { "number": 1003, "ansi": false, "enabled": true },
+        { "number": 1004, "ansi": false, "enabled": true },
+        { "number": 1006, "ansi": false, "enabled": true },
+        { "number": 1049, "ansi": false, "enabled": true },
+        { "number": 2004, "ansi": false, "enabled": true },
+        { "number": 2026, "ansi": false, "enabled": false }
+      ],
+      "effects": [
+        { "eventIndex": 3, "callbackIndex": 0, "base64": "G1s/NjI7MjJj" },
+        { "eventIndex": 3, "callbackIndex": 1, "base64": "G1s+MTswOzBj" },
+        { "eventIndex": 3, "callbackIndex": 2, "base64": "G1syOzVS" },
+        { "eventIndex": 3, "callbackIndex": 3, "base64": "G1s/MjAwNDsxJHk=" }
+      ]
+    },
+    {
+      "id": "final",
+      "cursor": { "column": 8, "row": 1 },
+      "activeScreen": "primary",
+      "dimensions": { "columns": 36, "rows": 9, "widthPixels": 288, "heightPixels": 153 },
+      "scrollbar": { "total": 9, "offset": 0, "length": 9 },
+      "kittyKeyboardFlags": 1,
+      "rows": [],
+      "cells": [
+        { "row": 0, "column": 0, "graphemeBase64": "cA==", "width": "narrow" },
+        { "row": 1, "column": 4, "graphemeBase64": "Yg==", "width": "narrow" }
+      ],
+      "palette": [],
+      "modes": [
+        { "number": 1049, "ansi": false, "enabled": false },
+        { "number": 2004, "ansi": false, "enabled": true }
+      ],
+      "effects": [
+        { "eventIndex": 3, "callbackIndex": 0, "base64": "G1s/NjI7MjJj" },
+        { "eventIndex": 3, "callbackIndex": 3, "base64": "G1s/MjAwNDsxJHk=" }
+      ]
+    }
+  ]
+}

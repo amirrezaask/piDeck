@@ -1,1 +1,1 @@
-export * from "@pideck/ghostty-core"
+export * from "@yaade/ghostty-core"

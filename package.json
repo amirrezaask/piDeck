@@ -1,47 +1,84 @@
 {
-  "name": "pideck",
-  "version": "0.1.0",
+  "name": "pideck-monorepo",
+  "version": "0.2.0",
   "private": true,
   "packageManager": "pnpm@9.15.0",
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=24.0.0"
   },
   "scripts": {
     "prepare": "./scripts/prepare-effect.sh",
-    "build": "pnpm build:binary && pnpm --filter @pideck/client make:dist && node scripts/verify-build.mjs",
-    "build:binary": "turbo run build && node scripts/build-binary.mjs",
-    "dev": "turbo run dev",
-    "dev:web": "pnpm --filter @pideck/web dev",
-    "dev:client": "pnpm --filter @pideck/client dev",
-    "dev:server": "pnpm --filter @pideck/server dev",
-    "dev:supervisor": "pnpm --filter @pideck/server dev",
-    "db:migrate": "tsx packages/database/src/migrate.ts",
-    "typecheck": "turbo run typecheck",
+    "dev": "vp run --parallel --filter @yaade/server --filter @yaade/web --filter @pideck/web --filter @dispatch/client dev",
+    "dev:server": "vp run @yaade/server#dev",
+    "dev:terminal": "vp run --filter @yaade/web dev",
+    "dev:agents": "pnpm --filter @pideck/web dev",
+    "dev:tasks": "pnpm --filter @dispatch/client dev",
+    "dev:desktop": "vp run --filter @yaade/desktop dev",
+    "dev:agents-desktop": "pnpm --filter @pideck/client dev",
+    "build": "pnpm build:server && pnpm build:clients",
+    "build:server": "vp run --filter @yaade/server build",
+    "build:clients": "pnpm build:terminal && pnpm build:agents && pnpm build:agents-desktop && pnpm build:agents-switcher && pnpm build:tasks",
+    "build:terminal": "vp run --filter @yaade/web build",
+    "build:agents": "pnpm --filter @pideck/web build",
+    "build:agents-desktop": "pnpm --filter @pideck/client build",
+    "build:agents-switcher": "pnpm --filter @pideck/switcher build",
+    "build:agents-libs": "pnpm --filter @nextflow/contracts build && pnpm --filter @nextflow/database build && pnpm --filter @nextflow/observability build && pnpm --filter @nextflow/agent-runtime build && pnpm --filter @nextflow/test-agents build && pnpm --filter @pideck/terminal-multiplexer build",
+    "build:tasks": "pnpm --filter @dispatch/client build",
+    "build:desktop": "vp run --filter @yaade/desktop build",
+    "build:release": "node scripts/build-release.mjs",
+    "prepare:ghostty": "node scripts/prepare-ghostty-source.mjs prepare",
+    "check:ghostty-source": "node scripts/prepare-ghostty-source.mjs check",
+    "build:ghostty-native": "cargo build --release --manifest-path crates/ghostty-vt-sys/Cargo.toml",
+    "test:ghostty-native": "cargo test --manifest-path crates/ghostty-vt-sys/Cargo.toml",
+    "test:ghostty:parity": "node scripts/test-ghostty-parity.mjs",
+    "test:server": "cargo test --manifest-path apps/server/Cargo.toml",
+    "test:web": "vp test apps/web packages/ghostty-core packages/ghostty-react packages/yaade-app packages/yaade-host-client packages/yaade-panels packages/yaade-rpc packages/yaade-shared packages/yaade-ui packages/yaade-workspace",
+    "test:agents": "pnpm build:agents-libs && pnpm --filter @pideck/web test && pnpm --filter @pideck/supervisor test && pnpm --filter @pideck/client test && pnpm --filter @pideck/switcher test",
+    "test:tasks": "pnpm --filter @dispatch/client test",
+    "test:desktop": "vp run --filter @yaade/desktop test",
+    "test:web:e2e": "vp exec playwright test --project=web-e2e",
+    "test:agents:e2e": "playwright test --config playwright.agents.config.ts",
+    "test:tasks:e2e": "playwright test --config playwright.tasks.config.ts",
+    "test": "pnpm test:server && pnpm test:web && pnpm test:agents && pnpm test:tasks",
+    "typecheck": "pnpm build:agents-libs && vp run --filter './apps/*' --filter './packages/*' typecheck",
     "lint:boundaries": "depcruise packages",
-    "check": "pnpm typecheck && pnpm lint:boundaries",
-    "test": "turbo run test",
-    "test:coverage": "pnpm --filter @pideck/web test:coverage",
-    "test:recovery": "pnpm vitest run --project node packages/database/tests/recovery.test.ts && pnpm vitest run --project node packages/supervisor/tests/recovery-process.test.ts",
-    "test:soak": "node --expose-gc --import tsx --test tests/soak/event-stream-soak.test.mjs",
-    "test:soak:ci": "node --expose-gc --import tsx --test tests/soak/event-stream-soak.test.mjs",
-    "test:backup-restore": "node --test scripts/tests/backup-restore.test.mjs",
-    "test:electron:packaged": "node scripts/test-packaged-electron.mjs",
-    "test:server:packaged": "node scripts/test-packaged-server.mjs",
-    "test:e2e": "playwright test",
-    "lint": "turbo run lint && biome check tests scripts playwright.config.ts",
-    "format": "biome format --write apps packages",
-    "format:check": "biome format apps packages scripts tests",
-    "verify": "pnpm check && pnpm lint && pnpm test && pnpm test:coverage && pnpm test:recovery && pnpm test:backup-restore && pnpm build:binary"
+    "lint:server": "cargo fmt --manifest-path apps/server/Cargo.toml -- --check && cargo clippy --manifest-path apps/server/Cargo.toml --all-targets -- -D warnings",
+    "lint": "vp lint && pnpm lint:server",
+    "format": "vp fmt && cargo fmt --manifest-path apps/server/Cargo.toml",
+    "format:check": "vp fmt --check && cargo fmt --manifest-path apps/server/Cargo.toml -- --check",
+    "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm build:clients"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.4",
-    "@playwright/test": "^1.55.0",
+    "@oxlint/plugins": "1.79.0",
+    "@playwright/test": "^1.62.1",
     "@types/node": "^24.13.3",
     "dependency-cruiser": "^18.2.0",
+    "effect": "3.22.1",
     "kysely": "^0.28.5",
-    "tsx": "^4.20.3",
+    "oxfmt": "0.66.0",
+    "oxlint": "1.81.0",
+    "tsx": "^4.23.13",
     "turbo": "^2.5.6",
-    "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "typescript": "^7.0.2",
+    "vite": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "^4.1.11"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "allowAny": ["vite"],
+      "allowedVersions": { "vite": "*" }
+    }
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.2.9"
+  },
+  "workspaces": {
+    "packages": ["apps/*", "packages/*", "tests/*", "tests/*/*"],
+    "catalog": {
+      "vite": "npm:@voidzero-dev/vite-plus-core@0.2.9",
+      "vite-plus": "0.2.9"
+    }
   }
 }

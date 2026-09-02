@@ -2,7 +2,7 @@ import {
   GhosttyTerminal,
   type GhosttyTerminalHandle,
   type GhosttyTheme,
-} from '@pideck/ghostty-react';
+} from '@yaade/ghostty-react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import * as React from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';

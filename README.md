@@ -1,148 +1,121 @@
 # piDeck
 
-**A desktop control plane for Pi coding agents.**
+A monorepo for terminal sessions, coding agents, and task tracking. One Rust process owns all server-side state in one SQLite database.
 
-Run Pi on one machine or scatter it across a small fleet. piDeck gives you one desktop app for starting sessions, watching tool calls, sending follow-ups, and returning to old transcripts without living in a pile of terminals.
+## Server routes
 
-![piDeck desktop app](assets/pideck.png)
+| Product | HTTP | WebSocket |
+| --- | --- | --- |
+| Terminal | `/terminal/health`, `/terminal/api/v1/*` | `/terminal/ws` |
+| Tasks | `/tasks/health`, `/tasks/api/*` | none |
+| Agents | `/agents/v1/*` | `/agents/v1/agents/:id/stream`, `/agents/v1/runs/:id/stream` |
+
+The host token protects all non-health APIs when you configure one. Terminal device pairing and scoped credentials remain available under `/terminal/api/v1/security/*`.
+
+The database defaults to `<data-dir>/yaade.sqlite3`. Terminal tables keep their existing names. Task tables use the `task_` prefix; agent tables use the `agent_` prefix.
+
+## Applications
 
 ```text
-┌──────────────────── piDeck desktop ────────────────────┐
-│  sessions · prompts · profiles · projects · settings   │
-└───────────────┬───────────────────────┬─────────────────┘
-                │ HTTP(S) / WebSocket   │
-        ┌───────▼────────┐      ┌───────▼────────┐
-        │ Pi supervisor  │      │ Pi supervisor  │
-        │ workstation    │      │ home server    │
-        └───────┬────────┘      └───────┬────────┘
-                │                       │
-             Pi agents               Pi agents
+apps/server           Rust host: SQLite, PTY, terminal, tasks, and Pi RPC
+apps/web              terminal web client
+apps/desktop          Tauri terminal desktop client
+apps/agents-web       piDeck agent client
+apps/agents-desktop   Electron shell for the agent client
+apps/agents-switcher  piDeck browser extension
+apps/tasks-web        Dispatch task client
 ```
 
-## What you get
+`packages/ghostty-core` and `packages/ghostty-react` provide the Ghostty VT terminal stack. The repository does not include the GPUI desktop experiment.
 
-- **One inbox for every server.** Sessions from all configured supervisors land in the same sidebar.
-- **A proper launch panel.** Pick a server, project, agent profile, model, and thinking level before the first prompt.
-- **Live agent telemetry.** Read streamed Markdown, highlighted code, tool activity, lifecycle events, failures, and reconnect state as they happen.
-- **Durable conversations.** Runs, events, attachments, and transcripts survive app and supervisor restarts. Finished runs remain open for follow-up chat while their supervisor process is alive.
-- **Keyboard-native prompting.** Type `/` for Pi commands and `@` to reference files or directories from the active project.
-- **Image input.** Attach PNG, JPEG, GIF, or WebP files directly to a prompt.
-- **Fleet-aware settings.** Manage servers, projects, agent profiles, Pi skills, extensions, package updates, and appearance from the app.
-- **Local archiving.** Hide stale sessions without deleting their remote history.
+## Requirements
 
-## How it works
-
-piDeck has two deployment options:
-
-1. **`pideck-server`** runs beside Pi on each machine where you want agents. It owns process lifecycle, SQLite persistence, event history, and the authenticated HTTP/WebSocket API.
-2. **The piDeck desktop app** starts the same Supervisor API inside Electron's main process, then connects to it automatically. The desktop app needs no separately launched local server. It can also connect to additional remote servers.
-
-The Electron renderer never stores server tokens. The main process encrypts them with Electron `safeStorage`, checks requests against configured server origins, and trades authenticated HTTP requests for short-lived, single-use WebSocket tickets. Run admission uses a SQLite partial unique index, so one agent cannot accidentally pick up two queued or running jobs across supervisor processes.
-
-## Run it from source
-
-You need:
-
-- Node.js 22.19+
+- Node.js 24 or newer
 - pnpm 9.15
+- Rust stable
+- TypeScript 7
+- Pi on `PATH` for agent runs
 
-Install the workspace and prepare the local database:
+Install dependencies:
 
 ```sh
-git clone https://github.com/amirrezaask/piDeck.git pideck
-cd pideck
 pnpm install
-cp .env.example .env
-pnpm db:migrate
 ```
-
-Start the desktop app:
-
-```sh
-pnpm dev:client
-```
-
-The desktop app starts its built-in Supervisor on a loopback port. To run a standalone development server for browser access, use `pnpm dev:server`; it listens at `http://127.0.0.1:4101` without requiring a token. Set `NEXTFLOW_SUPERVISOR_TOKEN` when remote clients need to connect.
-
-To run Pi on another machine, start `pideck-server` there with `NEXTFLOW_SUPERVISOR_TOKEN` set, then add its HTTPS origin and token to the same settings page. Plain HTTP is accepted only for exact loopback hosts (`localhost`, `127.0.0.1`, and `[::1]`); network deployments must terminate TLS and enforce host authentication in front of the service.
 
 ## Development
 
-The repository is a pnpm/Turborepo monorepo:
-
-```text
-apps/client          Electron main process and secure preload bridge
-apps/web             React 19 renderer, Vite, Tailwind CSS, shadcn/ui
-apps/server          pideck-server executable
-packages/supervisor  Pi process manager and server API
-packages/*           contracts, runtime, database, observability, test agents
-```
-
-Useful commands:
+Start the Rust server and the three browser clients:
 
 ```sh
-pnpm dev:web          # renderer only at http://127.0.0.1:5173
-pnpm dev:server       # supervisor at http://127.0.0.1:4101
-pnpm dev:client       # build and open the Electron app
+pnpm dev
+```
 
-pnpm build
+Or run them separately:
+
+```sh
+pnpm dev:server    # Rust server on http://127.0.0.1:7774
+pnpm dev:terminal  # terminal client on http://127.0.0.1:5174
+pnpm dev:agents    # agent client on http://127.0.0.1:5173
+pnpm dev:tasks     # task client on http://127.0.0.1:5175
+```
+
+The clients proxy their namespaced routes to the Rust server. Set `YAADE_PORT`, `VITE_SUPERVISOR_URL`, or `VITE_API_URL` when the server uses another origin.
+
+The server accepts the Mergence host options:
+
+```sh
+cargo run --manifest-path apps/server/Cargo.toml -- \
+  serve --host 127.0.0.1 --port 7774 --data-dir ./data
+```
+
+Set `PI_EXECUTABLE` to use a Pi binary outside `PATH`. Agent runs launch Pi in JSONL RPC mode and persist the run, event, attachment, and inbox records in SQLite.
+
+## Checks
+
+```sh
 pnpm typecheck
 pnpm test
-pnpm test:coverage
-pnpm test:e2e
-pnpm lint
-pnpm format:check
+pnpm build:clients
+pnpm lint:server
 ```
 
-Vite proxies `/supervisor/*` to the configured local development server and sends an access token when one is configured. Playwright uses the locally installed Google Chrome channel; install Chrome in CI or switch the project to a bundled Playwright browser.
-
-## Build artifacts
-
-`pnpm build` builds the workspace, then creates both release artifacts. Bun must be installed because it compiles the standalone server and bundles the Electron main process.
+Useful focused commands:
 
 ```sh
-pnpm build
+pnpm test:server
+pnpm test:web
+pnpm test:agents
+pnpm test:tasks
+pnpm test:web:e2e
+pnpm test:agents:e2e
+pnpm test:tasks:e2e
 ```
 
-The outputs are:
+`pnpm test:web` includes Ghostty core, Ghostty React, host-client, RPC, workspace, and terminal UI tests. `pnpm test:server` runs terminal parity tests plus the Rust task and agent API suites.
 
-- `dist/pideck-server` (`.exe` on Windows): standalone browser binary with the web client and Supervisor server embedded
-- `dist/electron/make/*.dmg` (macOS): Electron desktop installer
-- `dist/electron/make/zip/<platform>/<arch>/*.zip` (Windows/Linux): Electron desktop installer
+## Desktop clients
 
-Run the standalone browser build, then open its local address:
+Build the Tauri terminal desktop client:
 
 ```sh
-./dist/pideck-server
-# open http://127.0.0.1:4101
+pnpm build:desktop
 ```
 
-To build only the standalone browser binary, run `pnpm build:binary`. To package the desktop app separately, run `pnpm --filter @pideck/client make`.
+Run the Electron agent client against the Rust server:
 
-## Embed the supervisor
-
-`@pideck/supervisor` is also a reusable package:
-
-```ts
-import { buildSupervisorApp } from '@pideck/supervisor';
-
-const serviceToken = process.env.NEXTFLOW_SUPERVISOR_TOKEN?.trim();
-const { server } = buildSupervisorApp({
-  databasePath: './data/pideck.sqlite',
-  agentDefaultCwd: process.cwd(),
-  ...(serviceToken ? { serviceToken } : {}),
-  allowUnauthenticatedLoopback: !serviceToken,
-});
-
-await server.listen({ host: '127.0.0.1', port: 4101 });
+```sh
+pnpm dev:server
+pnpm dev:agents-desktop
 ```
 
-Call `server.close()` during shutdown. The package handles migrations, Pi sessions, run lifecycle, event persistence, paged HTTP history, and bounded WebSocket replay. Event payloads default to 256 KiB, 16 levels of nesting, and 10,000 items. You can set tighter limits through the app options.
+The Electron shell uses `http://127.0.0.1:7774` by default. Set `PIDECK_SERVER_URL` to select another unified server. It stores remote credentials through Electron `safeStorage` and only forwards `/agents/v1/*` requests.
 
-Prompts, tool inputs, and model output may contain source code, credentials, or other sensitive data. Treat the SQLite database and Pi session directory like the repositories your agents can access.
+## Release build
 
-Use the tested [backup and recovery runbook](docs/backup-and-recovery.md) for quiesced backups, integrity verification, restore, and rollback. Never copy a live WAL database directly.
+```sh
+pnpm build:release
+```
 
-## Production gates
+The release script compiles the Rust host and embeds the terminal web assets. Agent and task clients build with `pnpm build:agents` and `pnpm build:tasks`; package their desktop or web distributions according to the target deployment.
 
-Pull requests run type/boundary checks, lint and formatting, unit and coverage tests, browser E2E, crash recovery, backup/restore, dependency audit, a checked 100k-event/25-agent soak, and packaged smoke tests on macOS, Windows, and Linux. Configure branch protection to require `Source, recovery, browser, security`, `Checked 100k-event soak`, and all three `Packaged smoke` matrix checks. Releases are draft-only until platform signing/notarization, fuse/ASAR verification, and packaged smoke succeed.
+Treat the SQLite database and Pi session directory as sensitive data. They may contain terminal output, prompts, model responses, tool input, attachments, and source paths. See [docs/backup-and-recovery.md](docs/backup-and-recovery.md) before copying or restoring a live database.

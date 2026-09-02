@@ -1,0 +1,54 @@
+{
+  "fixtureId": "ascii-styles",
+  "observations": [
+    {
+      "id": "final",
+      "titleBase64": "WUFBREUgY29ycHVz",
+      "workingDirectoryBase64": "ZmlsZTovLy90bXAveWFhZGU=",
+      "cursor": { "column": 4, "row": 6 },
+      "activeScreen": "primary",
+      "dimensions": { "columns": 40, "rows": 10, "widthPixels": 320, "heightPixels": 160 },
+      "scrollbar": { "total": 10, "offset": 0, "length": 10 },
+      "kittyKeyboardFlags": 0,
+      "rows": [
+        { "row": 2, "wrapsToNext": true, "isWrapContinuation": false },
+        { "row": 3, "wrapsToNext": true, "isWrapContinuation": true },
+        { "row": 4, "wrapsToNext": false, "isWrapContinuation": true }
+      ],
+      "cells": [
+        {
+          "row": 1,
+          "column": 0,
+          "graphemeBase64": "cw==",
+          "width": "narrow",
+          "style": {
+            "foreground": { "r": 12, "g": 34, "b": 56 },
+            "background": { "r": 255, "g": 0, "b": 0 },
+            "foregroundSource": { "kind": "rgb", "color": { "r": 12, "g": 34, "b": 56 } },
+            "backgroundSource": { "kind": "palette", "index": 196 },
+            "underlineColorSource": { "kind": "none" },
+            "bold": true,
+            "italic": true,
+            "faint": false,
+            "blink": false,
+            "inverse": false,
+            "invisible": false,
+            "strikethrough": true,
+            "overline": true,
+            "underline": "single"
+          }
+        },
+        { "row": 2, "column": 39, "graphemeBase64": "OQ==", "width": "narrow" },
+        { "row": 3, "column": 0, "graphemeBase64": "MA==", "width": "narrow" }
+      ],
+      "palette": [
+        { "index": 0, "color": { "r": 29, "g": 31, "b": 33 } },
+        { "index": 196, "color": { "r": 255, "g": 0, "b": 0 } }
+      ],
+      "modes": [
+        { "number": 25, "ansi": false, "enabled": true }
+      ],
+      "effects": []
+    }
+  ]
+}

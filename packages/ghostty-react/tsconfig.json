@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.web.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "jsx": "react-jsx"
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
+}

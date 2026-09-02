@@ -1,0 +1,40 @@
+{
+  "fixtureId": "editing-reflow-scrollback",
+  "observations": [
+    {
+      "id": "history-top",
+      "cursor": { "column": 2, "row": 3 },
+      "activeScreen": "primary",
+      "dimensions": { "columns": 12, "rows": 6, "widthPixels": 96, "heightPixels": 96 },
+      "scrollbar": { "total": 8, "offset": 0, "length": 6 },
+      "kittyKeyboardFlags": 0,
+      "rows": [
+        { "row": 0, "wrapsToNext": true, "isWrapContinuation": false },
+        { "row": 1, "wrapsToNext": true, "isWrapContinuation": true },
+        { "row": 2, "wrapsToNext": false, "isWrapContinuation": true }
+      ],
+      "cells": [
+        { "row": 0, "column": 0, "graphemeBase64": "bw==", "width": "narrow" },
+        { "row": 5, "column": 1, "graphemeBase64": "WA==", "width": "narrow" }
+      ],
+      "palette": [],
+      "modes": [],
+      "effects": []
+    },
+    {
+      "id": "final",
+      "cursor": { "column": 2, "row": 3 },
+      "activeScreen": "primary",
+      "dimensions": { "columns": 12, "rows": 6, "widthPixels": 96, "heightPixels": 96 },
+      "scrollbar": { "total": 8, "offset": 2, "length": 6 },
+      "kittyKeyboardFlags": 0,
+      "rows": [],
+      "cells": [
+        { "row": 3, "column": 1, "graphemeBase64": "WA==", "width": "narrow" }
+      ],
+      "palette": [],
+      "modes": [],
+      "effects": []
+    }
+  ]
+}

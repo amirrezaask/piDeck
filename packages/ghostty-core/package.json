@@ -1,11 +1,24 @@
 {
-  "name": "@pideck/ghostty-core",
-  "version": "0.1.0",
+  "name": "@yaade/ghostty-core",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./index.ts",
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
     "./loaders/browser": "./src/loaders/browser.ts",
     "./loaders/node": "./src/loaders/node.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vp test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "effect": "^3.22.1",
+    "typescript": "^7.0.2"
   }
 }

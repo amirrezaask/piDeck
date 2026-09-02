@@ -1,0 +1,21 @@
+error: lifetime may not live long enough
+ --> tests/ui/render_view_cannot_escape.rs:6:37
+  |
+6 |         .with_render_state(|render| Ok::<_, GhosttyError>(render))
+  |                             ------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+  |                             |     |
+  |                             |     return type of closure is Result<&'2 mut RenderView<'_>, GhosttyError>
+  |                             has type `&'1 mut RenderView<'_>`
+
+error: lifetime may not live long enough
+ --> tests/ui/render_view_cannot_escape.rs:6:37
+  |
+6 |         .with_render_state(|render| Ok::<_, GhosttyError>(render))
+  |                             ------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'4`
+  |                             |     |
+  |                             |     return type of closure is Result<&mut RenderView<'4>, GhosttyError>
+  |                             has type `&mut RenderView<'3>`
+  |
+  = note: requirement occurs because of a mutable reference to `RenderView<'_>`
+  = note: mutable references are invariant over their type parameter
+  = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

@@ -40,8 +40,11 @@ export function ghosttyTextRunEnd(
     const next = cells[end];
     if (!next) break;
     if (next.wide === GHOSTTY_CELL_WIDE.spacerTail) {
+      // A wide glyph owns this spacer cell. End the run here so the next
+      // grapheme starts at its authoritative grid column; concatenating past
+      // the spacer lets Canvas shape it immediately after the glyph instead.
       end += 1;
-      continue;
+      break;
     }
     if (next.text.length === 0 || !sameStyle(next)) break;
     end += 1;
@@ -152,6 +155,8 @@ export function renderGhosttySnapshot(options: {
   readonly focused?: boolean;
   readonly selectionBackground?: string;
   readonly hoveredLinkRange?: GhosttyCellRange | null;
+  /** Override dirty rows when repainting only local overlays such as a cursor. */
+  readonly dirtyRows?: ReadonlySet<number>;
   /** Vertical origin of row 0; defaults to the horizontal padding. */
   readonly originY?: number;
   /** CSS-to-device-pixel ratio used to keep row edges on exact raster lines. */
@@ -176,7 +181,7 @@ export function renderGhosttySnapshot(options: {
   const snap = (value: number) => Math.round(value * pixelRatio) / pixelRatio;
   const rowsToDraw = forceFull
     ? Array.from({ length: snapshot.rows }, (_, index) => index)
-    : [...snapshot.dirtyRows];
+    : [...(options.dirtyRows ?? snapshot.dirtyRows)];
   if (
     previousCursorY !== null &&
     previousCursorY !== undefined &&
@@ -201,13 +206,16 @@ export function renderGhosttySnapshot(options: {
   for (const rowIndex of rowsToDraw) {
     const row = snapshot.rowData[rowIndex];
     if (!row) continue;
-    // Bottom anchoring can produce a fractional origin when the pane height is
-    // not an exact row multiple. Snap every row to device pixels or Canvas 2D
-    // anti-aliasing leaves a hairline between otherwise adjacent rows.
+    // Bottom anchoring and fractional DPRs can put row boundaries between
+    // device pixels. Snap both edges and derive the painted height from them;
+    // snapping only the top leaves a partially covered pixel at the bottom,
+    // exposing the canvas background as a horizontal hairline.
     const top = snap(originY + rowIndex * metrics.height);
+    const bottom = snap(originY + (rowIndex + 1) * metrics.height);
+    const paintHeight = bottom - top;
 
     context.fillStyle = cssColor(snapshot.background);
-    context.fillRect(padding, top, snapshot.cols * metrics.width, metrics.height);
+    context.fillRect(padding, top, snapshot.cols * metrics.width, paintHeight);
 
     let backgroundStart = 0;
     while (backgroundStart < row.cells.length) {
@@ -230,11 +238,11 @@ export function renderGhosttySnapshot(options: {
         const width = (backgroundEnd - backgroundStart) * metrics.width;
         if (!ghosttyColorsEqual(first.background, snapshot.background)) {
           context.fillStyle = cssColor(first.background);
-          context.fillRect(left, top, width, metrics.height);
+          context.fillRect(left, top, width, paintHeight);
         }
         if (first.selected) {
           context.fillStyle = selectionBackground;
-          context.fillRect(left, top, width, metrics.height);
+          context.fillRect(left, top, width, paintHeight);
         }
       }
       backgroundStart = backgroundEnd;
@@ -249,28 +257,29 @@ export function renderGhosttySnapshot(options: {
         continue;
       }
       const runEnd = ghosttyTextRunEnd(row.cells, runStart, (cell) => sameTextStyle(cell, first));
-      const text = row.cells
-        .slice(runStart, runEnd)
-        .map((cell) => cell.text)
-        .join("");
-      if (!first.invisible && text.trim().length > 0) {
+      let text = "";
+      let hasVisibleText = false;
+      for (let column = runStart; column < runEnd; column += 1) {
+        const cellText = row.cells[column]?.text ?? "";
+        text += cellText;
+        if (cellText !== "" && cellText !== " ") hasVisibleText = true;
+      }
+      if (!first.invisible && hasVisibleText) {
         context.save();
         context.beginPath();
         context.rect(
           padding + runStart * metrics.width,
           top,
           (runEnd - runStart) * metrics.width,
-          metrics.height,
+          paintHeight,
         );
         context.clip();
         context.font = fontForCell(first, fontSize, fontFamily);
         context.fillStyle = cssColor(first.foreground);
-        context.fillText(
-          text,
-          padding + runStart * metrics.width,
-          top + metrics.baseline,
-          (runEnd - runStart) * metrics.width,
-        );
+        // The clip enforces the cell span. Passing Canvas maxWidth would
+        // horizontally condense fallback glyphs and make YAADE diverge from
+        // Ghostty's metrics and cursor grid.
+        context.fillText(text, padding + runStart * metrics.width, top + metrics.baseline);
         context.restore();
       }
       runStart = runEnd;
@@ -309,25 +318,32 @@ export function renderGhosttySnapshot(options: {
   if (cursorOn && snapshot.cursorVisible && snapshot.cursorX >= 0 && snapshot.cursorY >= 0) {
     const left = padding + snapshot.cursorX * metrics.width;
     const top = snap(originY + snapshot.cursorY * metrics.height);
+    const bottom = snap(originY + (snapshot.cursorY + 1) * metrics.height);
+    const paintHeight = bottom - top;
     context.fillStyle = cssColor(snapshot.cursor);
     if (!focused) {
       // An unfocused terminal draws a hollow cursor so the active pane is obvious.
       context.strokeStyle = cssColor(snapshot.cursor);
-      context.strokeRect(left + 0.5, top + 0.5, metrics.width - 1, metrics.height - 1);
+      context.strokeRect(left + 0.5, top + 0.5, metrics.width - 1, paintHeight - 1);
     } else if (snapshot.cursorStyle === 0) {
-      context.fillRect(left, top, 2, metrics.height);
+      context.fillRect(left, top, 2, paintHeight);
     } else if (snapshot.cursorStyle === 2) {
-      context.fillRect(left, top + metrics.height - 2, metrics.width, 2);
+      context.fillRect(left, bottom - 2, metrics.width, 2);
     } else if (snapshot.cursorStyle === 3) {
       context.strokeStyle = cssColor(snapshot.cursor);
-      context.strokeRect(left + 0.5, top + 0.5, metrics.width - 1, metrics.height - 1);
+      context.strokeRect(left + 0.5, top + 0.5, metrics.width - 1, paintHeight - 1);
     } else {
-      context.fillRect(left, top, metrics.width, metrics.height);
+      context.fillRect(left, top, metrics.width, paintHeight);
       const cell = snapshot.rowData[snapshot.cursorY]?.cells[snapshot.cursorX];
       if (cell?.text) {
+        context.save();
+        context.beginPath();
+        context.rect(left, top, metrics.width, paintHeight);
+        context.clip();
         context.font = fontForCell(cell, fontSize, fontFamily);
         context.fillStyle = cssColor(snapshot.background);
-        context.fillText(cell.text, left, top + metrics.baseline, metrics.width);
+        context.fillText(cell.text, left, top + metrics.baseline);
+        context.restore();
       }
     }
   }

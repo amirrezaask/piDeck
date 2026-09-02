@@ -1,0 +1,1096 @@
+@import "@fontsource-variable/geist/wght.css";
+@import "@fontsource-variable/geist-mono/wght.css";
+@import "@fontsource-variable/geist-mono/wght-italic.css";
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@yaade/ghostty-react/styles.css";
+@import "@yaade/ghostty-react/fonts.css";
+@import "./materials.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Tailwind v4 only auto-scans the Vite root (packages/yaade-app), so utility
+ * classes used in sibling workspace packages (yaade-ui, yaade-panels, …) are never
+ * generated. Without this, classes like `absolute`/`relative`/`inset-0` are
+ * dropped and absolutely-positioned panels collapse into static block flow.
+ */
+@source "../../../*/src/**/*.{ts,tsx}";
+@source "../../../../apps/*/src/**/*.{ts,tsx}";
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-backdrop: var(--backdrop);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --font-sans: "Geist Variable", "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", "Symbols Nerd Font Mono", ui-monospace, monospace;
+  --text-4xs: var(--yaade-fs-4xs);
+  --text-3xs: var(--yaade-fs-3xs);
+  --text-2xs: var(--yaade-fs-2xs);
+  --text-xs: var(--yaade-fs-xs);
+  --text-sm: var(--yaade-fs-sm);
+  --text-base: var(--yaade-fs-base);
+  --text-lg: var(--yaade-fs-lg);
+  --text-xl: var(--yaade-fs-xl);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+}
+
+/* Scheme-invariant metrics. Theme colors are applied synchronously from YaadeTheme.tokens. */
+:root {
+  color-scheme: light;
+  --radius: 0.75rem;
+  --yaade-island-radius: 0.875rem;
+  --yaade-pane-radius: 0.75rem;
+  --yaade-control-radius: 0.625rem;
+  --yaade-pill-radius: 999rem;
+  --yaade-app-header-height: 3rem;
+  --yaade-native-titlebar-inline-inset: 5.5rem;
+  --yaade-native-titlebar-block-inset: 2.25rem;
+  /* Target sizes stay in CSS px even when the compact UI font scales rem units. */
+  --yaade-pointer-target: 24px;
+  --yaade-touch-target: 44px;
+
+  /* Compact terminal scale: dense, but never sub-10px for ordinary metadata. */
+  --yaade-fs-4xs: 0.769rem;
+  --yaade-fs-3xs: 0.846rem;
+  --yaade-fs-2xs: 0.885rem;
+  --yaade-fs-xs: 0.923rem;
+  --yaade-fs-sm: 1rem;
+  --yaade-fs-base: 1.077rem;
+  --yaade-fs-lg: 1.231rem;
+  --yaade-fs-xl: 1.846rem;
+  /* Dense terminal and session list row metrics. */
+  --yaade-root-row-height: calc(var(--yaade-fs-base) * 1.75);
+  --yaade-row-height: calc(var(--yaade-fs-base) * 1.5);
+  --yaade-flat-row-height: calc(var(--yaade-fs-base) * 2.5);
+  --yaade-window-chrome-height: calc(var(--yaade-fs-base) * 1.5);
+  /* Palette virtualization and rendered slots share these rem-scaled contracts.
+   * Single-line pickers stay compact; detail rows reserve title + metadata. */
+  --yaade-palette-row-height: 2.5rem;
+  --yaade-palette-detail-row-height: 3rem;
+  --yaade-quick-input-top: clamp(1rem, 7dvh, 4.5rem);
+  --yaade-overlay-list-max: 22rem;
+  --yaade-motion-fast: 100ms;
+  --yaade-motion-hot: 100ms;
+  --yaade-motion-menu: 160ms;
+  --yaade-motion-overlay: 160ms;
+  --yaade-motion-panel: 200ms;
+  --yaade-motion-slow-menu: 200ms;
+  --yaade-motion-scroll: 160ms;
+  --yaade-motion-entity: 200ms;
+  --yaade-motion-dnd-site: 140ms;
+  --yaade-motion-squish-scale: 0.98;
+  --yaade-ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --yaade-ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --yaade-ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --yaade-press-scale: 0.98;
+  --yaade-press-y: 0.5px;
+  --control-radius: var(--yaade-control-radius);
+}
+
+/* Color values live in the required theme token object, never in CSS. */
+.dark {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button {
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+html {
+  height: 100%;
+  font-size: 13px;
+}
+
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: inherit;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Apple-inspired material primitives. Semantic colors remain theme-owned; this
+ * layer only controls translucency, optical edges, depth, and shape. */
+:is(
+  [data-slot="card"],
+  [data-slot="dialog-content"],
+  [data-slot="popover-content"],
+  [data-slot="dropdown-menu-content"],
+  [data-slot="dropdown-menu-sub-content"],
+  [data-slot="context-menu-content"],
+  [data-slot="context-menu-sub-content"],
+  [data-slot="select-content"],
+  [data-slot="combobox-popup"],
+  [data-slot="tooltip-content"]
+) {
+  border-color: var(--yaade-material-light-edge);
+  background: var(--yaade-material-floating-fill);
+  box-shadow: var(--yaade-material-inset-rim), var(--yaade-material-floating-shadow);
+  -webkit-backdrop-filter: var(--yaade-material-floating-filter);
+  backdrop-filter: var(--yaade-material-floating-filter);
+}
+
+[data-slot="card"] {
+  border-radius: var(--yaade-island-radius);
+}
+
+[data-slot="dialog-content"] {
+  border-radius: var(--yaade-material-menu-radius);
+}
+
+:is(
+  [data-slot="popover-content"],
+  [data-slot="dropdown-menu-content"],
+  [data-slot="dropdown-menu-sub-content"],
+  [data-slot="context-menu-content"],
+  [data-slot="context-menu-sub-content"],
+  [data-slot="select-content"],
+  [data-slot="combobox-popup"],
+  [data-slot="tooltip-content"]
+) {
+  border-radius: var(--yaade-material-menu-radius);
+}
+
+:is(
+  [data-slot="input"],
+  [data-slot="textarea"],
+  [data-slot="select-trigger"],
+  [data-slot="combobox-input"],
+  [data-slot="toggle"],
+  [data-slot="toggle-group-item"]
+) {
+  border-radius: var(--yaade-material-control-radius);
+  background: var(--yaade-material-fill-soft);
+  box-shadow: inset 0 1px var(--yaade-material-specular);
+}
+
+[data-slot="button"] {
+  border-radius: var(--yaade-control-radius);
+}
+
+[data-slot="button"][data-size^="icon"] {
+  border-radius: var(--yaade-pill-radius);
+}
+
+:is(
+  [data-slot="dropdown-menu-item"],
+  [data-slot="dropdown-menu-sub-trigger"],
+  [data-slot="context-menu-item"],
+  [data-slot="context-menu-sub-trigger"],
+  [data-slot="select-item"],
+  [data-slot="command-item"]
+) {
+  border-radius: var(--yaade-material-control-radius);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :is(
+    [data-slot="card"],
+    [data-slot="dialog-content"],
+    [data-slot="popover-content"],
+    [data-slot="dropdown-menu-content"],
+    [data-slot="dropdown-menu-sub-content"],
+    [data-slot="context-menu-content"],
+    [data-slot="context-menu-sub-content"],
+    [data-slot="select-content"],
+    [data-slot="combobox-popup"],
+    [data-slot="tooltip-content"]
+  ) {
+    background: var(--yaade-material-floating-fallback);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+::selection {
+  background: color-mix(in oklch, var(--primary) 42%, transparent);
+  color: var(--foreground);
+}
+
+* {
+  scrollbar-color: color-mix(in oklch, var(--muted-foreground) 42%, transparent) transparent;
+  scrollbar-width: thin;
+}
+
+/* Terminal Session shell: floating controls and panes over an atmospheric canvas. */
+[data-yaade-shell="terminal-multiplexer"] {
+  border: 1px solid var(--yaade-material-light-edge);
+  border-radius: var(--yaade-island-radius);
+  background: var(--yaade-canvas-background);
+  box-shadow: var(--yaade-material-inset-rim);
+}
+
+/* The Tauri shell owns the outer window edge. macOS overlays native traffic
+ * lights into the shared top bar, so only the non-interactive chrome moves. */
+[data-yaade-shell="terminal-multiplexer"][data-yaade-client="desktop"] {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+[data-yaade-shell="terminal-multiplexer"][data-yaade-desktop-platform="macos"]
+  [data-yaade-top-tabbar] {
+  padding-inline-start: var(--yaade-native-titlebar-inline-inset);
+}
+
+[data-yaade-shell="terminal-multiplexer"][data-yaade-desktop-platform="macos"]:not(
+    [data-yaade-session-layout="tabs"]
+  )
+  .yaade-terminal-multiplexer-grid {
+  padding-top: var(--yaade-native-titlebar-block-inset);
+}
+
+.yaade-pwa-update {
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity var(--yaade-motion-menu) var(--yaade-ease-out),
+    transform var(--yaade-motion-menu) var(--yaade-ease-out);
+
+  @starting-style {
+    opacity: 0;
+    transform: translateY(0.5rem);
+  }
+}
+
+/* Mobile has no window layer: sessions directly group every MuxTerminal, and a
+ * selected MuxTerminal replaces the list. Keep both views clear of device cutouts
+ * without changing the desktop shell's geometry. */
+@media (max-width: 767px) {
+  [data-yaade-mobile-shell] {
+    padding-top: env(safe-area-inset-top);
+    padding-inline-start: env(safe-area-inset-left);
+    padding-inline-end: env(safe-area-inset-right);
+  }
+
+  [data-yaade-mobile-terminal-detail] [data-yaade-glass-surface] {
+    border-radius: 0;
+  }
+
+  [data-yaade-mobile-terminal-list] main {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  }
+
+  [data-yaade-mobile-terminal-detail] [data-yaade-terminal-workspace] {
+    padding: 0;
+  }
+
+  [data-yaade-mobile-terminal-detail] [data-yaade-terminal-workspace] [data-yaade-panel-leaf] {
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 0;
+  }
+
+  [data-yaade-mobile-terminal-detail] > [data-yaade-glass-surface] button,
+  [data-yaade-mobile-terminal-keys] button,
+  [data-yaade-mobile-session-group] [data-yaade-mobile-new-terminal],
+  [data-yaade-mobile-new-session] {
+    min-width: var(--yaade-touch-target);
+    min-height: var(--yaade-touch-target);
+  }
+}
+
+.yaade-terminal-multiplexer-grid {
+  gap: 0;
+  padding: 0;
+  transition: grid-template-columns var(--yaade-motion-menu) var(--yaade-ease-drawer);
+  will-change: grid-template-columns;
+}
+
+[data-yaade-shell="terminal-multiplexer"][data-yaade-sidebars-state="collapsed"]
+  .yaade-terminal-multiplexer-grid {
+  gap: 0;
+  padding-inline: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .yaade-terminal-multiplexer-grid {
+    transition: none;
+    will-change: auto;
+  }
+}
+
+/* Structural chrome never overlaps moving terminal content, so alpha, optical
+ * edges, and elevation provide the glass read without a live backdrop blur. */
+[data-yaade-session-tabs],
+[data-yaade-terminal-tabs],
+[data-yaade-terminal-context] {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+[data-yaade-terminal] {
+  transform: translateZ(0);
+}
+
+/* Navigation rails are floating materials rather than opaque app bars. */
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-session-sidebar],
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-terminal-sidebar],
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-single-sidebar] {
+  border-color: var(--yaade-material-light-edge);
+  background: var(--yaade-material-shell-fill);
+  box-shadow: var(--yaade-material-inset-rim), var(--yaade-material-shell-shadow);
+  -webkit-backdrop-filter: var(--yaade-material-shell-filter);
+  backdrop-filter: var(--yaade-material-shell-filter);
+}
+
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-top-tabbar] {
+  height: var(--yaade-tab-bar-height);
+  min-height: var(--yaade-tab-bar-height);
+  width: 100%;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--yaade-material-light-edge);
+  padding: 0.375rem 0.5rem;
+  background: var(--yaade-material-chrome-fill);
+  box-shadow: inset 0 1px var(--yaade-material-specular-soft);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+[data-yaade-window-controls] {
+  align-self: stretch;
+}
+
+[data-yaade-window-control="close"] {
+  background: var(--destructive);
+  color: var(--destructive-foreground);
+}
+
+[data-yaade-window-control="minimize"] {
+  background: var(--warning);
+  color: var(--warning-foreground);
+}
+
+[data-yaade-window-control="maximize"] {
+  background: var(--success);
+  color: var(--success-foreground);
+}
+
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-window-tabs] {
+  height: var(--yaade-tab-bar-height);
+  margin: 0.5rem 0.5rem 0;
+  border: 1px solid var(--yaade-material-light-edge);
+  border-radius: calc(var(--yaade-tab-bar-height) / 2);
+  padding-inline: 0.375rem;
+  background: var(--yaade-material-chrome-fill);
+  box-shadow: var(--yaade-material-inset-rim), var(--yaade-material-chrome-shadow);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* In the top-tab layout, Window tabs live inside the shared header material.
+ * Do not give that nested strip a second surface or independent vertical box. */
+[data-yaade-shell="terminal-multiplexer"][data-yaade-session-layout="tabs"]
+  [data-yaade-window-tabs] {
+  height: 100%;
+  margin: 0;
+  border: 0;
+  border-radius: inherit;
+  padding-inline: 0;
+  background: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+[data-yaade-shell="terminal-multiplexer"][data-yaade-session-layout="tabs"]
+  [data-yaade-window-tabs]::before {
+  display: none;
+}
+
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-window-tabs] nav {
+  gap: 0.125rem;
+  padding-block: 0.375rem;
+}
+
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-window-tabs] [data-yaade-session-tab] {
+  height: var(--yaade-tab-pill-height);
+  min-width: 14rem;
+  max-width: 18rem;
+  border: 0;
+  border-radius: var(--yaade-pill-radius);
+  padding-inline: 0;
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  [data-yaade-shell="terminal-multiplexer"]
+    [data-yaade-window-tabs]
+    [data-yaade-session-tab]:not([data-active="true"]):hover {
+    background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  }
+}
+
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-window-tabs] > button {
+  width: var(--yaade-tab-pill-height);
+  height: var(--yaade-tab-pill-height);
+}
+
+[data-yaade-shell="terminal-multiplexer"]
+  [data-yaade-terminal-tabs][data-yaade-terminal-tabs-layout="header"]
+  nav {
+  gap: 0;
+}
+
+[data-yaade-shell="terminal-multiplexer"]
+  [data-yaade-terminal-tabs][data-yaade-terminal-tabs-layout="header"]
+  [data-yaade-terminal-pane-tab] {
+  height: calc(100% - 0.5rem);
+  margin-block: 0.25rem;
+  border: 0;
+  border-radius: var(--yaade-pill-radius);
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+[data-yaade-shell="terminal-multiplexer"]
+  :is([data-yaade-session-sidebar], [data-yaade-terminal-sidebar], [data-yaade-single-sidebar]) {
+  overflow: hidden;
+  border-radius: var(--yaade-island-radius);
+}
+
+[data-yaade-shell="terminal-multiplexer"] [data-yaade-terminal-pane-tab][data-active="true"] {
+  border-color: var(--yaade-material-light-edge);
+  border-radius: var(--yaade-pill-radius);
+  background: var(--yaade-tab-pill-active-fill);
+  box-shadow: var(--yaade-tab-pill-active-shadow);
+  transform: none;
+}
+
+[data-yaade-shell="terminal-multiplexer"]
+  :is([data-yaade-session-sidebar], [data-yaade-single-sidebar])
+  [data-yaade-session][data-active="true"] {
+  border-color: color-mix(in srgb, var(--sidebar-primary) 42%, var(--sidebar-border));
+  border-radius: var(--yaade-material-tab-radius);
+  background: var(--sidebar-accent);
+  box-shadow: inset 0 1px color-mix(in srgb, var(--sidebar-primary) 16%, transparent);
+  transform: none;
+}
+
+[data-yaade-terminal-workspace] {
+  padding: 0.625rem;
+}
+
+[data-yaade-terminal-workspace] [data-yaade-panel-leaf] {
+  isolation: isolate;
+  overflow: hidden;
+  border: 1px solid var(--yaade-material-dark-edge);
+  border-radius: var(--yaade-material-panel-radius);
+  background: var(--yaade-material-content-fill);
+  box-shadow: var(--yaade-material-content-shadow);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+[data-yaade-terminal-workspace] [data-yaade-panel-leaf][data-focused] {
+  border-color: color-mix(in srgb, var(--ring) 32%, var(--yaade-material-dark-edge));
+  box-shadow:
+    var(--yaade-material-content-shadow),
+    0 0 0 1px color-mix(in srgb, var(--ring) 8%, transparent);
+}
+
+[data-yaade-terminal-workspace] [data-yaade-mux-pane-chrome] {
+  pointer-events: none;
+  position: absolute;
+  inset-inline: 0;
+  top: 0;
+  z-index: 20;
+  height: 0;
+  min-height: 0;
+}
+
+[data-yaade-terminal-workspace] [data-yaade-mux-pane-controls] {
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-0.25rem);
+  border: 1px solid transparent;
+  border-radius: var(--yaade-pill-radius);
+  padding: 0.125rem;
+  background: transparent;
+  transition:
+    opacity var(--yaade-motion-hot) var(--yaade-ease-out),
+    transform var(--yaade-motion-menu) var(--yaade-ease-out),
+    border-color var(--yaade-motion-hot) var(--yaade-ease-out),
+    background-color var(--yaade-motion-hot) var(--yaade-ease-out);
+}
+
+[data-yaade-terminal-workspace]
+  [data-yaade-mux-pane-control-zone]:hover
+  [data-yaade-mux-pane-controls],
+[data-yaade-terminal-workspace] [data-yaade-mux-pane-controls]:has(:focus-visible) {
+  pointer-events: auto;
+  opacity: 1;
+  transform: translateY(0);
+  border-color: var(--yaade-material-light-edge);
+  background: var(--yaade-material-chrome-fill);
+}
+
+[data-yaade-terminal-workspace] [data-yaade-mux-pane-chrome] [data-slot="button"] {
+  opacity: 0.76;
+}
+
+[data-yaade-terminal-workspace] [data-yaade-mux-pane-chrome][data-focused] [data-slot="button"] {
+  opacity: 0.94;
+}
+
+@media (hover: none) {
+  [data-yaade-terminal-workspace] [data-yaade-mux-pane-controls] {
+    pointer-events: auto;
+    opacity: 1;
+    transform: none;
+  }
+}
+
+[data-yaade-window-tabs] [data-yaade-session-tab][data-active="true"] {
+  border: 0;
+  border-radius: var(--yaade-pill-radius);
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+/* Window tabs are labels on the muted chrome bar; the raised pill is a shared-layout surface. */
+[data-yaade-shell="terminal-multiplexer"][data-yaade-session-layout="tabs"]
+  [data-yaade-window-tabs]
+  [data-yaade-session-tab] {
+  height: var(--yaade-tab-pill-height);
+  margin-block: 0;
+  border: 0;
+  border-radius: var(--yaade-pill-radius);
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+[data-yaade-shell="terminal-multiplexer"][data-yaade-session-layout="tabs"]
+  [data-yaade-window-tabs]
+  [data-yaade-session-tab][data-active="true"] {
+  background: transparent;
+  box-shadow: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  [data-yaade-shell="terminal-multiplexer"][data-yaade-session-layout="tabs"]
+    [data-yaade-window-tabs]
+    [data-yaade-session-tab]:not([data-active="true"]):hover {
+    background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  }
+}
+
+[data-yaade-shell="terminal-multiplexer"]
+  [data-yaade-terminal-tabs][data-yaade-terminal-tabs-layout="header"]
+  [data-yaade-terminal-pane-tab][data-active="true"] {
+  border: 1px solid var(--yaade-material-light-edge);
+  border-radius: var(--yaade-pill-radius);
+  background: var(--yaade-tab-pill-active-fill);
+  box-shadow: var(--yaade-tab-pill-active-shadow);
+  transform: none;
+}
+
+[data-yaade-terminal-workspace] [data-yaade-terminal-panel] {
+  isolation: isolate;
+  background: var(--yaade-material-content-fill);
+}
+
+[data-yaade-terminal-workspace] [data-yaade-terminal-panel] .yaade-terminal-surface,
+[data-yaade-terminal-workspace] [data-yaade-terminal-panel] .yaade-terminal-surface {
+  background: var(--yaade-material-content-fill);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+[data-yaade-terminal-workspace] [data-yaade-pane-separator]::after {
+  border-radius: var(--yaade-pill-radius);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--background) 24%, transparent);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  [data-yaade-terminal]:not([data-active="true"]):hover {
+    transform: translateX(2px);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  [data-yaade-session-tabs],
+  [data-yaade-terminal-tabs],
+  [data-yaade-terminal-context],
+  [data-yaade-window-tabs],
+  [data-yaade-mux-pane-chrome],
+  [data-yaade-session-sidebar],
+  [data-yaade-terminal-sidebar],
+  [data-yaade-single-sidebar],
+  [data-yaade-top-tabbar],
+  [data-yaade-app-header],
+  [data-yaade-terminal-workspace] [data-yaade-panel-leaf] {
+    background: var(--card);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  [data-yaade-terminal][data-active="true"] {
+    border-color: var(--sidebar-primary);
+    background: var(--sidebar-accent);
+  }
+}
+
+/* Shared multiplexer chrome. */
+[data-yaade-app-header] {
+  min-height: var(--yaade-app-header-height);
+  border-color: var(--yaade-material-light-edge);
+  background: var(--yaade-material-chrome-fill);
+  box-shadow: inset 0 1px var(--yaade-material-specular);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* Primary work surfaces materialize above the canvas as rounded glass islands. */
+[data-yaade-island] {
+  border: 1px solid var(--yaade-material-light-edge);
+  border-radius: var(--yaade-material-shell-radius);
+  background: var(--yaade-material-shell-fill);
+  box-shadow: var(--yaade-material-inset-rim), var(--yaade-material-shell-shadow);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+[data-yaade-raised-surface] {
+  border: 1px solid var(--yaade-material-light-edge);
+  border-radius: var(--yaade-material-control-radius);
+  background: var(--yaade-material-chrome-fill);
+  box-shadow: var(--yaade-material-inset-rim);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  [data-yaade-island] {
+    background: var(--yaade-material-shell-fallback);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  [data-yaade-raised-surface] {
+    background: var(--yaade-material-chrome-fallback);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+[data-yaade-terminal-panel] canvas {
+  max-width: none !important;
+}
+
+/* Tactile press — buttons, tabs, menu rows, and other clickable controls */
+.yaade-press,
+:is(
+    [data-slot="button"],
+    [data-slot="tabs-trigger"],
+    [data-slot="toggle"],
+    [data-slot="toggle-group-item"],
+    [data-slot="command-item"],
+    [data-slot="item"],
+    [data-slot="sidebar-menu-button"],
+    [data-slot="sidebar-menu-sub-button"],
+    [data-slot="sidebar-menu-action"],
+    [data-slot="sidebar-group-action"],
+    [data-slot="sidebar-trigger"],
+    [data-slot="dialog-trigger"],
+    [data-slot="dialog-close"],
+    [data-slot="drawer-trigger"],
+    [data-slot="drawer-close"],
+    [data-slot="popover-trigger"],
+    [data-slot="context-menu-item"],
+    [data-slot="context-menu-sub-trigger"],
+    [data-slot="context-menu-checkbox-item"],
+    [data-slot="context-menu-radio-item"],
+    [data-slot="dropdown-menu-item"],
+    [data-slot="dropdown-menu-sub-trigger"],
+    [data-slot="dropdown-menu-checkbox-item"],
+    [data-slot="dropdown-menu-radio-item"],
+    [data-slot="menubar-trigger"],
+    [data-slot="menubar-item"],
+    [data-slot="menubar-sub-trigger"],
+    [data-slot="menubar-checkbox-item"],
+    [data-slot="menubar-radio-item"],
+    [data-slot="accordion-trigger"],
+    [data-slot="collapsible-trigger"]
+  ):not(:disabled):not([data-disabled="true"]):not([aria-disabled="true"]) {
+  transform-origin: center;
+  transition-property:
+    transform, filter, opacity, color, background-color, border-color, box-shadow;
+  transition-duration: var(--yaade-motion-hot);
+  transition-timing-function: var(--yaade-ease-out);
+}
+
+.yaade-press:active:not(:disabled):not([data-disabled="true"]):not([aria-disabled="true"]),
+:is(
+    [data-slot="button"],
+    [data-slot="tabs-trigger"],
+    [data-slot="toggle"],
+    [data-slot="toggle-group-item"],
+    [data-slot="command-item"],
+    [data-slot="item"],
+    [data-slot="sidebar-menu-button"],
+    [data-slot="sidebar-menu-sub-button"],
+    [data-slot="sidebar-menu-action"],
+    [data-slot="sidebar-group-action"],
+    [data-slot="sidebar-trigger"],
+    [data-slot="dialog-trigger"],
+    [data-slot="dialog-close"],
+    [data-slot="drawer-trigger"],
+    [data-slot="drawer-close"],
+    [data-slot="popover-trigger"],
+    [data-slot="context-menu-item"],
+    [data-slot="context-menu-sub-trigger"],
+    [data-slot="context-menu-checkbox-item"],
+    [data-slot="context-menu-radio-item"],
+    [data-slot="dropdown-menu-item"],
+    [data-slot="dropdown-menu-sub-trigger"],
+    [data-slot="dropdown-menu-checkbox-item"],
+    [data-slot="dropdown-menu-radio-item"],
+    [data-slot="menubar-trigger"],
+    [data-slot="menubar-item"],
+    [data-slot="menubar-sub-trigger"],
+    [data-slot="menubar-checkbox-item"],
+    [data-slot="menubar-radio-item"],
+    [data-slot="accordion-trigger"],
+    [data-slot="collapsible-trigger"]
+  ):active:not(:disabled):not([data-disabled="true"]):not([aria-disabled="true"]) {
+  transition-duration: 0ms;
+  transform: scale(var(--yaade-press-scale)) translateY(var(--yaade-press-y));
+  filter: brightness(0.96);
+  box-shadow: inset 0 1px 2px rgb(0 0 0 / 0.22);
+}
+
+/* VS Code-style quick input: top-docked, dense, rectangular rows with a strong selection. */
+[data-yaade-quick-input] [data-slot="command-item"] {
+  border-radius: 0;
+}
+
+[data-yaade-quick-input] [data-slot="command-item"][data-selected="true"] {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+[data-yaade-quick-input] [data-slot="command-item"][data-selected="true"] .text-foreground {
+  color: var(--primary-foreground);
+}
+
+[data-yaade-quick-input]
+  [data-slot="command-item"][data-selected="true"]
+  :is(.text-muted-foreground, [data-slot="palette-row-meta"]) {
+  color: color-mix(in oklch, var(--primary-foreground) 78%, transparent);
+}
+
+[data-yaade-quick-input] [data-slot="command-item"]:active {
+  transform: none;
+  filter: none;
+  box-shadow: none;
+}
+
+/* List / sidebar row hover — RAD DrawHotEffects (flat accent, no press inset) */
+.yaade-interactive-row {
+  transition-property: background-color, box-shadow, color;
+  transition-duration: var(--yaade-motion-hot);
+  transition-timing-function: ease-out;
+}
+
+.yaade-interactive-row:hover:not(:active):not(:disabled):not([data-disabled="true"]):not(
+    [aria-disabled="true"]
+  ) {
+  background-color: var(--sidebar-accent);
+  color: var(--sidebar-accent-foreground);
+}
+
+.yaade-interactive-row:active {
+  transition-duration: 0ms;
+}
+
+/* Instant keyboard focus ring — RAD focus_active_t */
+.yaade-focus-ring:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--ring);
+}
+
+/* Disabled wash — RAD disabled_t */
+.yaade-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+  transition: opacity var(--yaade-motion-menu) ease-out;
+}
+
+/* Scroll edge fade — RAD DrawFadeTop/Bottom */
+.yaade-scroll-fade {
+  mask-image: linear-gradient(to bottom, transparent, black 5%, black 95%, transparent);
+}
+
+@keyframes yaade-dialog-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes yaade-dialog-exit {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+
+@keyframes yaade-overlay-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes yaade-overlay-exit {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+.yaade-dialog-motion[data-yaade-dialog-motion="standard"][data-state="open"] {
+  animation: yaade-dialog-enter var(--yaade-motion-overlay) var(--yaade-ease-out);
+}
+
+.yaade-dialog-motion[data-yaade-dialog-motion="standard"][data-state="closed"] {
+  animation: yaade-dialog-exit var(--yaade-motion-fast) var(--yaade-ease-out);
+}
+
+.yaade-dialog-overlay[data-yaade-dialog-motion="standard"][data-state="open"] {
+  animation: yaade-overlay-enter var(--yaade-motion-overlay) var(--yaade-ease-out);
+}
+
+.yaade-dialog-overlay[data-yaade-dialog-motion="standard"][data-state="closed"] {
+  animation: yaade-overlay-exit var(--yaade-motion-fast) var(--yaade-ease-out);
+}
+
+.yaade-dialog-motion[data-yaade-dialog-motion="instant"],
+.yaade-dialog-overlay[data-yaade-dialog-motion="instant"] {
+  animation: none;
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .yaade-press:active,
+  :is(
+    [data-slot="button"],
+    [data-slot="tabs-trigger"],
+    [data-slot="toggle"],
+    [data-slot="toggle-group-item"],
+    [data-slot="command-item"],
+    [data-slot="item"],
+    [data-slot="sidebar-menu-button"],
+    [data-slot="sidebar-menu-sub-button"],
+    [data-slot="sidebar-menu-action"],
+    [data-slot="sidebar-group-action"],
+    [data-slot="sidebar-trigger"],
+    [data-slot="dialog-trigger"],
+    [data-slot="dialog-close"],
+    [data-slot="drawer-trigger"],
+    [data-slot="drawer-close"],
+    [data-slot="popover-trigger"],
+    [data-slot="context-menu-item"],
+    [data-slot="context-menu-sub-trigger"],
+    [data-slot="context-menu-checkbox-item"],
+    [data-slot="context-menu-radio-item"],
+    [data-slot="dropdown-menu-item"],
+    [data-slot="dropdown-menu-sub-trigger"],
+    [data-slot="dropdown-menu-checkbox-item"],
+    [data-slot="dropdown-menu-radio-item"],
+    [data-slot="menubar-trigger"],
+    [data-slot="menubar-item"],
+    [data-slot="menubar-sub-trigger"],
+    [data-slot="menubar-checkbox-item"],
+    [data-slot="menubar-radio-item"],
+    [data-slot="select-item"],
+    [data-slot="accordion-trigger"],
+    [data-slot="collapsible-trigger"]
+  ):active {
+    transform: none;
+    filter: none;
+  }
+}
+
+:root[data-yaade-reduced-motion="true"] .yaade-press:active,
+:root[data-yaade-reduced-motion="true"]
+  :is(
+    [data-slot="button"],
+    [data-slot="tabs-trigger"],
+    [data-slot="toggle"],
+    [data-slot="toggle-group-item"],
+    [data-slot="command-item"],
+    [data-slot="item"],
+    [data-slot="sidebar-menu-button"],
+    [data-slot="sidebar-menu-sub-button"],
+    [data-slot="context-menu-item"],
+    [data-slot="dropdown-menu-item"]
+  ):active {
+  transform: none;
+  filter: none;
+}
+
+:root[data-yaade-reduced-motion="true"] {
+  scroll-behavior: auto;
+  --yaade-motion-fast: 0ms;
+  --yaade-motion-hot: 0ms;
+  --yaade-motion-menu: 0ms;
+  --yaade-motion-overlay: 0ms;
+  --yaade-motion-panel: 0ms;
+  --yaade-motion-slow-menu: 0ms;
+  --yaade-motion-scroll: 0ms;
+  --yaade-motion-entity: 0ms;
+  --yaade-motion-dnd-site: 0ms;
+}
+
+:root[data-yaade-reduced-motion="true"]
+  .yaade-dialog-motion[data-yaade-dialog-motion="standard"][data-state="open"] {
+  transform: none;
+  animation-name: yaade-overlay-enter;
+  animation-duration: var(--yaade-motion-fast);
+}
+
+:root[data-yaade-reduced-motion="true"]
+  .yaade-dialog-motion[data-yaade-dialog-motion="standard"][data-state="closed"] {
+  transform: none;
+  animation-name: yaade-overlay-exit;
+  animation-duration: var(--yaade-motion-fast);
+}
+
+:root[data-yaade-reduced-motion="true"] :is(.animate-spin, .animate-pulse) {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    scroll-behavior: auto;
+    --yaade-motion-fast: 0ms;
+    --yaade-motion-hot: 0ms;
+    --yaade-motion-menu: 0ms;
+    --yaade-motion-overlay: 0ms;
+    --yaade-motion-panel: 0ms;
+    --yaade-motion-slow-menu: 0ms;
+    --yaade-motion-scroll: 0ms;
+    --yaade-motion-entity: 0ms;
+    --yaade-motion-dnd-site: 0ms;
+  }
+
+  .yaade-dialog-motion[data-yaade-dialog-motion="standard"][data-state="open"] {
+    transform: none;
+    animation-name: yaade-overlay-enter;
+    animation-duration: var(--yaade-motion-fast);
+  }
+
+  .yaade-dialog-motion[data-yaade-dialog-motion="standard"][data-state="closed"] {
+    transform: none;
+    animation-name: yaade-overlay-exit;
+    animation-duration: var(--yaade-motion-fast);
+  }
+
+  :is(.animate-spin, .animate-pulse) {
+    animation: none;
+  }
+
+  :is([class*="slide-in-from"], [class*="slide-out-to"], [class*="zoom-in"], [class*="zoom-out"]) {
+    --tw-enter-translate-x: 0;
+    --tw-enter-translate-y: 0;
+    --tw-exit-translate-x: 0;
+    --tw-exit-translate-y: 0;
+    --tw-enter-scale: 1;
+    --tw-exit-scale: 1;
+  }
+}
+
+/* Ghostty owns the cell grid; its canvas and hidden IME input fill the slot. */
+[data-yaade-terminal-panel] .yaade-terminal-surface,
+[data-yaade-terminal-panel] .yaade-terminal-surface,
+[data-yaade-terminal-panel] [data-yaade-terminal-fit] {
+  height: 100%;
+  width: 100%;
+}
+
+[data-yaade-terminal-panel] .yaade-terminal-surface {
+  position: relative;
+  background: var(--yaade-bg, var(--background));
+}
+
+/* Mux shell — terminal panes are islands on a persistent canvas. */
+[data-yaade-shell="mux"],
+[data-yaade-shell="mux-embedded"],
+[data-yaade-mux] {
+  background: var(--background);
+}
+
+[data-yaade-mux] [data-yaade-terminal-panel] .yaade-terminal-surface {
+  background: var(--yaade-bg, var(--card));
+}
+
+/* The Canvas renderer supplies its own font metrics, cursor and selection. */

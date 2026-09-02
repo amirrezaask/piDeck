@@ -1,0 +1,266 @@
+error[E0277]: `Rc<()>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:6:19
+  |
+6 |     assert_sync::<RowView<'static>>();
+  |                   ^^^^^^^^^^^^^^^^ `Rc<()>` cannot be shared between threads safely
+  |
+  = help: within `RowView<'static>`, the trait `Sync` is not implemented for `Rc<()>`
+note: required because it appears within the type `PhantomData<Rc<()>>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `RowView<'static>`
+ --> src/render.rs
+  |
+  | pub struct RowView<'render> {
+  |            ^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `NonNull<ghostty_vt_sys::bindings::RenderStateRowCellsImpl>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:6:19
+  |
+6 |     assert_sync::<RowView<'static>>();
+  |                   ^^^^^^^^^^^^^^^^ `NonNull<ghostty_vt_sys::bindings::RenderStateRowCellsImpl>` cannot be shared between threads safely
+  |
+  = help: within `RowView<'static>`, the trait `Sync` is not implemented for `NonNull<ghostty_vt_sys::bindings::RenderStateRowCellsImpl>`
+note: required because it appears within the type `ghostty_vt::render::RawCells`
+ --> src/render.rs
+  |
+  | struct RawCells(NonNull<ffi::RenderStateRowCellsImpl>);
+  |        ^^^^^^^^
+note: required because it appears within the type `ghostty_vt::render::RenderResources`
+ --> src/render.rs
+  |
+  | pub(crate) struct RenderResources {
+  |                   ^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut ghostty_vt::render::RenderResources`
+note: required because it appears within the type `RowView<'static>`
+ --> src/render.rs
+  |
+  | pub struct RowView<'render> {
+  |            ^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `NonNull<ghostty_vt_sys::bindings::RenderStateRowIteratorImpl>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:6:19
+  |
+6 |     assert_sync::<RowView<'static>>();
+  |                   ^^^^^^^^^^^^^^^^ `NonNull<ghostty_vt_sys::bindings::RenderStateRowIteratorImpl>` cannot be shared between threads safely
+  |
+  = help: within `RowView<'static>`, the trait `Sync` is not implemented for `NonNull<ghostty_vt_sys::bindings::RenderStateRowIteratorImpl>`
+note: required because it appears within the type `ghostty_vt::render::RawRowIterator`
+ --> src/render.rs
+  |
+  | struct RawRowIterator(NonNull<ffi::RenderStateRowIteratorImpl>);
+  |        ^^^^^^^^^^^^^^
+note: required because it appears within the type `ghostty_vt::render::RenderResources`
+ --> src/render.rs
+  |
+  | pub(crate) struct RenderResources {
+  |                   ^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut ghostty_vt::render::RenderResources`
+note: required because it appears within the type `RowView<'static>`
+ --> src/render.rs
+  |
+  | pub struct RowView<'render> {
+  |            ^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `NonNull<ghostty_vt_sys::bindings::RenderStateImpl>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:6:19
+  |
+6 |     assert_sync::<RowView<'static>>();
+  |                   ^^^^^^^^^^^^^^^^ `NonNull<ghostty_vt_sys::bindings::RenderStateImpl>` cannot be shared between threads safely
+  |
+  = help: within `RowView<'static>`, the trait `Sync` is not implemented for `NonNull<ghostty_vt_sys::bindings::RenderStateImpl>`
+note: required because it appears within the type `ghostty_vt::render::RawRenderState`
+ --> src/render.rs
+  |
+  | struct RawRenderState(NonNull<ffi::RenderStateImpl>);
+  |        ^^^^^^^^^^^^^^
+note: required because it appears within the type `ghostty_vt::render::RenderResources`
+ --> src/render.rs
+  |
+  | pub(crate) struct RenderResources {
+  |                   ^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut ghostty_vt::render::RenderResources`
+note: required because it appears within the type `RowView<'static>`
+ --> src/render.rs
+  |
+  | pub struct RowView<'render> {
+  |            ^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `Rc<()>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:7:19
+  |
+7 |     assert_sync::<CellView<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^ `Rc<()>` cannot be shared between threads safely
+  |
+  = help: within `CellView<'static>`, the trait `Sync` is not implemented for `Rc<()>`
+note: required because it appears within the type `PhantomData<Rc<()>>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `CellView<'static>`
+ --> src/render.rs
+  |
+  | pub struct CellView<'row> {
+  |            ^^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `NonNull<ghostty_vt_sys::bindings::RenderStateRowCellsImpl>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:7:19
+  |
+7 |     assert_sync::<CellView<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^ `NonNull<ghostty_vt_sys::bindings::RenderStateRowCellsImpl>` cannot be shared between threads safely
+  |
+  = help: within `CellView<'static>`, the trait `Sync` is not implemented for `NonNull<ghostty_vt_sys::bindings::RenderStateRowCellsImpl>`
+note: required because it appears within the type `ghostty_vt::render::RawCells`
+ --> src/render.rs
+  |
+  | struct RawCells(NonNull<ffi::RenderStateRowCellsImpl>);
+  |        ^^^^^^^^
+note: required because it appears within the type `ghostty_vt::render::RenderResources`
+ --> src/render.rs
+  |
+  | pub(crate) struct RenderResources {
+  |                   ^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut ghostty_vt::render::RenderResources`
+note: required because it appears within the type `CellView<'static>`
+ --> src/render.rs
+  |
+  | pub struct CellView<'row> {
+  |            ^^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `NonNull<ghostty_vt_sys::bindings::RenderStateRowIteratorImpl>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:7:19
+  |
+7 |     assert_sync::<CellView<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^ `NonNull<ghostty_vt_sys::bindings::RenderStateRowIteratorImpl>` cannot be shared between threads safely
+  |
+  = help: within `CellView<'static>`, the trait `Sync` is not implemented for `NonNull<ghostty_vt_sys::bindings::RenderStateRowIteratorImpl>`
+note: required because it appears within the type `ghostty_vt::render::RawRowIterator`
+ --> src/render.rs
+  |
+  | struct RawRowIterator(NonNull<ffi::RenderStateRowIteratorImpl>);
+  |        ^^^^^^^^^^^^^^
+note: required because it appears within the type `ghostty_vt::render::RenderResources`
+ --> src/render.rs
+  |
+  | pub(crate) struct RenderResources {
+  |                   ^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut ghostty_vt::render::RenderResources`
+note: required because it appears within the type `CellView<'static>`
+ --> src/render.rs
+  |
+  | pub struct CellView<'row> {
+  |            ^^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `NonNull<ghostty_vt_sys::bindings::RenderStateImpl>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:7:19
+  |
+7 |     assert_sync::<CellView<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^ `NonNull<ghostty_vt_sys::bindings::RenderStateImpl>` cannot be shared between threads safely
+  |
+  = help: within `CellView<'static>`, the trait `Sync` is not implemented for `NonNull<ghostty_vt_sys::bindings::RenderStateImpl>`
+note: required because it appears within the type `ghostty_vt::render::RawRenderState`
+ --> src/render.rs
+  |
+  | struct RawRenderState(NonNull<ffi::RenderStateImpl>);
+  |        ^^^^^^^^^^^^^^
+note: required because it appears within the type `ghostty_vt::render::RenderResources`
+ --> src/render.rs
+  |
+  | pub(crate) struct RenderResources {
+  |                   ^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut ghostty_vt::render::RenderResources`
+note: required because it appears within the type `CellView<'static>`
+ --> src/render.rs
+  |
+  | pub struct CellView<'row> {
+  |            ^^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `Rc<()>` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:8:19
+  |
+8 |     assert_sync::<TerminalEffects<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<()>` cannot be shared between threads safely
+  |
+  = help: within `TerminalEffects<'static>`, the trait `Sync` is not implemented for `Rc<()>`
+note: required because it appears within the type `PhantomData<Rc<()>>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `TerminalEffects<'static>`
+ --> src/effects.rs
+  |
+  | pub struct TerminalEffects<'terminal> {
+  |            ^^^^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `*mut ghostty_vt_sys::bindings::TerminalImpl` cannot be shared between threads safely
+ --> tests/ui/borrowed_views_not_sync.rs:8:19
+  |
+8 |     assert_sync::<TerminalEffects<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^ `*mut ghostty_vt_sys::bindings::TerminalImpl` cannot be shared between threads safely
+  |
+  = help: within `TerminalEffects<'static>`, the trait `Sync` is not implemented for `*mut ghostty_vt_sys::bindings::TerminalImpl`
+note: required because it appears within the type `ghostty_vt::effects::CallbackState`
+ --> src/effects.rs
+  |
+  | pub(crate) struct CallbackState {
+  |                   ^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static ghostty_vt::effects::CallbackState`
+note: required because it appears within the type `TerminalEffects<'static>`
+ --> src/effects.rs
+  |
+  | pub struct TerminalEffects<'terminal> {
+  |            ^^^^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+ --> tests/ui/borrowed_views_not_sync.rs:3:19
+  |
+3 | fn assert_sync<T: Sync>() {}
+  |                   ^^^^ required by this bound in `assert_sync`

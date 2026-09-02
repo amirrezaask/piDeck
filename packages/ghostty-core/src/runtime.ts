@@ -35,7 +35,7 @@ export class GhosttyRuntime {
   readonly memory: WebAssembly.Memory;
   readonly layouts: TypeLayouts;
   private readonly exports: WebAssembly.Exports;
-  private readonly ptyWriters = new Map<number, (data: string) => void>();
+  private readonly ptyWriters = new Map<number, (data: Uint8Array) => void>();
   private nextPtyWriterId = 1;
   private writePtyFunctionIndex = 0;
 
@@ -123,6 +123,11 @@ export class GhosttyRuntime {
   }
 
   attachPtyWriter(terminal: number, writer: (data: string) => void): number {
+    return this.attachPtyByteWriter(terminal, (data) => writer(textDecoder.decode(data)))
+  }
+
+  /** Attach an exact-byte PTY effect sink. Callback bytes are copied from WASM memory. */
+  attachPtyByteWriter(terminal: number, writer: (data: Uint8Array) => void): number {
     if (this.writePtyFunctionIndex === 0) {
       throw new Error("libghostty-vt PTY callback trampoline is unavailable");
     }
@@ -206,7 +211,7 @@ export class GhosttyRuntime {
         t3_write_pty: (_terminal: number, userdata: number, pointer: number, length: number) => {
           const writer = this.ptyWriters.get(userdata);
           if (!writer || length === 0) return;
-          writer(textDecoder.decode(new Uint8Array(this.memory.buffer, pointer, length)));
+          writer(Uint8Array.from(new Uint8Array(this.memory.buffer, pointer, length)));
         },
       },
     });

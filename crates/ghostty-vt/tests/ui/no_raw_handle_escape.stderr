@@ -1,0 +1,5 @@
+error[E0599]: no method named `as_raw` found for struct `Terminal` in the current scope
+ --> tests/ui/no_raw_handle_escape.rs:5:25
+  |
+5 |     let _raw = terminal.as_raw();
+  |                         ^^^^^^ method not found in `Terminal`

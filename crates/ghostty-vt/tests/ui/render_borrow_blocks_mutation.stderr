@@ -1,0 +1,28 @@
+error[E0499]: cannot borrow `terminal` as mutable more than once at a time
+  --> tests/ui/render_borrow_blocks_mutation.rs:5:5
+   |
+ 5 | /     terminal
+ 6 | |         .with_render_state(|render| {
+   | |          ----------------- -------- first mutable borrow occurs here
+   | |          |
+   | |          first borrow later used by call
+ 7 | |             let row = render.next_row()?.unwrap();
+ 8 | |             terminal.write(b"mutate")?;
+   | |             -------- first borrow occurs due to use of `terminal` in closure
+ 9 | |             drop(row);
+10 | |             Ok(())
+11 | |         })
+   | |__________^ second mutable borrow occurs here
+
+error[E0499]: cannot borrow `terminal` as mutable more than once at a time
+ --> tests/ui/render_borrow_blocks_mutation.rs:6:28
+  |
+5 |     terminal
+  |     -------- first mutable borrow occurs here
+6 |         .with_render_state(|render| {
+  |          ----------------- ^^^^^^^^ second mutable borrow occurs here
+  |          |
+  |          first borrow later used by call
+7 |             let row = render.next_row()?.unwrap();
+8 |             terminal.write(b"mutate")?;
+  |             -------- second borrow occurs due to use of `terminal` in closure

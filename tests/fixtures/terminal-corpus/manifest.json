@@ -1,0 +1,657 @@
+{
+  "formatVersion": 1,
+  "normalizerVersion": 1,
+  "limits": {
+    "maxFixtureBytes": 1048576,
+    "maxColumns": 256,
+    "maxRows": 128,
+    "maxEvents": 10000,
+    "maxEffectsBytes": 1048576,
+    "maxObservationBytes": 16777216
+  },
+  "modes": [
+    {
+      "number": 1,
+      "ansi": false
+    },
+    {
+      "number": 4,
+      "ansi": true
+    },
+    {
+      "number": 25,
+      "ansi": false
+    },
+    {
+      "number": 1000,
+      "ansi": false
+    },
+    {
+      "number": 1002,
+      "ansi": false
+    },
+    {
+      "number": 1003,
+      "ansi": false
+    },
+    {
+      "number": 1004,
+      "ansi": false
+    },
+    {
+      "number": 1006,
+      "ansi": false
+    },
+    {
+      "number": 1049,
+      "ansi": false
+    },
+    {
+      "number": 2004,
+      "ansi": false
+    },
+    {
+      "number": 2026,
+      "ansi": false
+    },
+    {
+      "number": 2048,
+      "ansi": false
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "ascii-styles",
+      "purpose": "ASCII shell output, long runs, SGR colors and decorations, OSC metadata, hyperlinks, and safe clipboard policy",
+      "bytes": {
+        "path": "ascii-styles.bin",
+        "length": 278,
+        "sha256": "6c76343fd820f5c7eaee63cf6a3cb5a26cb004fd4f855ffd9db562caaee73822"
+      },
+      "initial": {
+        "columns": 40,
+        "rows": 10,
+        "cellWidth": 8,
+        "cellHeight": 16,
+        "scrollback": 128,
+        "defaultCursorBlink": true,
+        "theme": {
+          "foreground": {
+            "r": 226,
+            "g": 232,
+            "b": 240
+          },
+          "background": {
+            "r": 15,
+            "g": 23,
+            "b": 42
+          },
+          "cursor": {
+            "r": 251,
+            "g": 191,
+            "b": 36
+          }
+        },
+        "host": {
+          "enquiryBase64": "",
+          "xtversionBase64": "",
+          "colorScheme": null,
+          "deviceAttributes": null
+        }
+      },
+      "assertions": "assertions/ascii-styles.json",
+      "events": [
+        {
+          "type": "write",
+          "offset": 0,
+          "length": 14
+        },
+        {
+          "type": "write",
+          "offset": 14,
+          "length": 42
+        },
+        {
+          "type": "write",
+          "offset": 56,
+          "length": 12
+        },
+        {
+          "type": "write",
+          "offset": 68,
+          "length": 90
+        },
+        {
+          "type": "write",
+          "offset": 158,
+          "length": 2
+        },
+        {
+          "type": "write",
+          "offset": 160,
+          "length": 17
+        },
+        {
+          "type": "write",
+          "offset": 177,
+          "length": 23
+        },
+        {
+          "type": "write",
+          "offset": 200,
+          "length": 48
+        },
+        {
+          "type": "write",
+          "offset": 248,
+          "length": 24
+        },
+        {
+          "type": "write",
+          "offset": 272,
+          "length": 6
+        },
+        {
+          "type": "observe",
+          "id": "final"
+        }
+      ]
+    },
+    {
+      "id": "unicode-malformed",
+      "purpose": "Split UTF-8, malformed bytes, NUL/C0/C1 controls, wide and combining grapheme clusters, ZWJ, and variation selectors",
+      "bytes": {
+        "path": "unicode-malformed.bin",
+        "length": 73,
+        "sha256": "66c9d4bb26068da6fe701020959c86d18fccd3c05dbaede19557801e4cee0ea3"
+      },
+      "initial": {
+        "columns": 24,
+        "rows": 8,
+        "cellWidth": 9,
+        "cellHeight": 18,
+        "scrollback": 64,
+        "defaultCursorBlink": true,
+        "theme": {
+          "foreground": {
+            "r": 226,
+            "g": 232,
+            "b": 240
+          },
+          "background": {
+            "r": 15,
+            "g": 23,
+            "b": 42
+          },
+          "cursor": {
+            "r": 251,
+            "g": 191,
+            "b": 36
+          }
+        },
+        "host": {
+          "enquiryBase64": "",
+          "xtversionBase64": "",
+          "colorScheme": null,
+          "deviceAttributes": null
+        }
+      },
+      "assertions": "assertions/unicode-malformed.json",
+      "events": [
+        {
+          "type": "write",
+          "offset": 0,
+          "length": 6
+        },
+        {
+          "type": "write",
+          "offset": 6,
+          "length": 1
+        },
+        {
+          "type": "write",
+          "offset": 7,
+          "length": 1
+        },
+        {
+          "type": "write",
+          "offset": 8,
+          "length": 1
+        },
+        {
+          "type": "write",
+          "offset": 9,
+          "length": 1
+        },
+        {
+          "type": "write",
+          "offset": 10,
+          "length": 9
+        },
+        {
+          "type": "write",
+          "offset": 19,
+          "length": 2
+        },
+        {
+          "type": "write",
+          "offset": 21,
+          "length": 1
+        },
+        {
+          "type": "write",
+          "offset": 22,
+          "length": 4
+        },
+        {
+          "type": "write",
+          "offset": 26,
+          "length": 1
+        },
+        {
+          "type": "write",
+          "offset": 27,
+          "length": 4
+        },
+        {
+          "type": "write",
+          "offset": 31,
+          "length": 1
+        },
+        {
+          "type": "write",
+          "offset": 32,
+          "length": 8
+        },
+        {
+          "type": "write",
+          "offset": 40,
+          "length": 33
+        },
+        {
+          "type": "observe",
+          "id": "final"
+        }
+      ]
+    },
+    {
+      "id": "modes-queries",
+      "purpose": "Primary and alternate screens, DEC modes, mouse/focus/paste/Kitty keyboard flags, synchronized output, and terminal queries",
+      "bytes": {
+        "path": "modes-queries.bin",
+        "length": 172,
+        "sha256": "8fe37f8eb84fef193eb1fd94164cd382156b55a60a43836199b04b60c0f9c77f"
+      },
+      "initial": {
+        "columns": 36,
+        "rows": 9,
+        "cellWidth": 8,
+        "cellHeight": 17,
+        "scrollback": 96,
+        "defaultCursorBlink": true,
+        "theme": {
+          "foreground": {
+            "r": 226,
+            "g": 232,
+            "b": 240
+          },
+          "background": {
+            "r": 15,
+            "g": 23,
+            "b": 42
+          },
+          "cursor": {
+            "r": 251,
+            "g": 191,
+            "b": 36
+          }
+        },
+        "host": {
+          "enquiryBase64": "",
+          "xtversionBase64": "",
+          "colorScheme": null,
+          "deviceAttributes": null
+        }
+      },
+      "assertions": "assertions/modes-queries.json",
+      "events": [
+        {
+          "type": "write",
+          "offset": 0,
+          "length": 9
+        },
+        {
+          "type": "write",
+          "offset": 9,
+          "length": 51
+        },
+        {
+          "type": "write",
+          "offset": 60,
+          "length": 25
+        },
+        {
+          "type": "write",
+          "offset": 85,
+          "length": 20
+        },
+        {
+          "type": "write",
+          "offset": 105,
+          "length": 32
+        },
+        {
+          "type": "write",
+          "offset": 137,
+          "length": 23
+        },
+        {
+          "type": "observe",
+          "id": "alternate"
+        },
+        {
+          "type": "write",
+          "offset": 160,
+          "length": 12
+        },
+        {
+          "type": "observe",
+          "id": "final"
+        }
+      ]
+    },
+    {
+      "id": "resize-reset-theme",
+      "purpose": "Resize, reset, and theme mutations interleaved with deliberately split escape sequences",
+      "bytes": {
+        "path": "resize-reset-theme.bin",
+        "length": 63,
+        "sha256": "0919299ca301f37d0ed6d863ba6cad3d2d10d2e41c94ec4d1c2789a9206afdc1"
+      },
+      "initial": {
+        "columns": 18,
+        "rows": 6,
+        "cellWidth": 8,
+        "cellHeight": 16,
+        "scrollback": 32,
+        "defaultCursorBlink": true,
+        "theme": {
+          "foreground": {
+            "r": 226,
+            "g": 232,
+            "b": 240
+          },
+          "background": {
+            "r": 15,
+            "g": 23,
+            "b": 42
+          },
+          "cursor": {
+            "r": 251,
+            "g": 191,
+            "b": 36
+          }
+        },
+        "host": {
+          "enquiryBase64": "",
+          "xtversionBase64": "",
+          "colorScheme": null,
+          "deviceAttributes": null
+        }
+      },
+      "assertions": "assertions/resize-reset-theme.json",
+      "events": [
+        {
+          "type": "write",
+          "offset": 0,
+          "length": 14
+        },
+        {
+          "type": "resize",
+          "columns": 26,
+          "rows": 7,
+          "cellWidth": 10,
+          "cellHeight": 20
+        },
+        {
+          "type": "write",
+          "offset": 14,
+          "length": 19
+        },
+        {
+          "type": "theme",
+          "theme": {
+            "foreground": {
+              "r": 30,
+              "g": 41,
+              "b": 59
+            },
+            "background": {
+              "r": 248,
+              "g": 250,
+              "b": 252
+            },
+            "cursor": {
+              "r": 190,
+              "g": 24,
+              "b": 93
+            }
+          }
+        },
+        {
+          "type": "write",
+          "offset": 33,
+          "length": 13
+        },
+        {
+          "type": "observe",
+          "id": "before-reset"
+        },
+        {
+          "type": "reset"
+        },
+        {
+          "type": "write",
+          "offset": 46,
+          "length": 17
+        },
+        {
+          "type": "observe",
+          "id": "final"
+        }
+      ]
+    },
+    {
+      "id": "editing-reflow-scrollback",
+      "purpose": "Scroll regions, insert/delete operations, wrapping, reflow, and explicit viewport scroll metadata",
+      "bytes": {
+        "path": "editing-reflow-scrollback.bin",
+        "length": 118,
+        "sha256": "d1f4b3add58bc583a670af1324df806b87c704cb49a3831086187e1cd55d719b"
+      },
+      "initial": {
+        "columns": 16,
+        "rows": 5,
+        "cellWidth": 8,
+        "cellHeight": 16,
+        "scrollback": 64,
+        "defaultCursorBlink": true,
+        "theme": {
+          "foreground": {
+            "r": 226,
+            "g": 232,
+            "b": 240
+          },
+          "background": {
+            "r": 15,
+            "g": 23,
+            "b": 42
+          },
+          "cursor": {
+            "r": 251,
+            "g": 191,
+            "b": 36
+          }
+        },
+        "host": {
+          "enquiryBase64": "",
+          "xtversionBase64": "",
+          "colorScheme": null,
+          "deviceAttributes": null
+        }
+      },
+      "assertions": "assertions/editing-reflow-scrollback.json",
+      "events": [
+        {
+          "type": "write",
+          "offset": 0,
+          "length": 35
+        },
+        {
+          "type": "write",
+          "offset": 35,
+          "length": 40
+        },
+        {
+          "type": "write",
+          "offset": 75,
+          "length": 30
+        },
+        {
+          "type": "write",
+          "offset": 105,
+          "length": 13
+        },
+        {
+          "type": "resize",
+          "columns": 12,
+          "rows": 6,
+          "cellWidth": 8,
+          "cellHeight": 16
+        },
+        {
+          "type": "scroll",
+          "position": "top"
+        },
+        {
+          "type": "observe",
+          "id": "history-top"
+        },
+        {
+          "type": "scroll",
+          "position": "bottom"
+        },
+        {
+          "type": "observe",
+          "id": "final"
+        }
+      ]
+    },
+    {
+      "id": "complex-tui",
+      "purpose": "Deterministic full-screen TUI rewrites with borders, progress updates, cursor moves, and alternate-screen lifecycle",
+      "bytes": {
+        "path": "complex-tui.bin",
+        "length": 565,
+        "sha256": "a54ca411639a40baad0de3f359501c4c8691cbc7481e45693b326d3a1a067ec2"
+      },
+      "initial": {
+        "columns": 42,
+        "rows": 12,
+        "cellWidth": 8,
+        "cellHeight": 16,
+        "scrollback": 128,
+        "defaultCursorBlink": true,
+        "theme": {
+          "foreground": {
+            "r": 226,
+            "g": 232,
+            "b": 240
+          },
+          "background": {
+            "r": 15,
+            "g": 23,
+            "b": 42
+          },
+          "cursor": {
+            "r": 251,
+            "g": 191,
+            "b": 36
+          }
+        },
+        "host": {
+          "enquiryBase64": "",
+          "xtversionBase64": "",
+          "colorScheme": null,
+          "deviceAttributes": null
+        }
+      },
+      "assertions": "assertions/complex-tui.json",
+      "events": [
+        {
+          "type": "write",
+          "offset": 0,
+          "length": 15
+        },
+        {
+          "type": "write",
+          "offset": 15,
+          "length": 126
+        },
+        {
+          "type": "write",
+          "offset": 141,
+          "length": 52
+        },
+        {
+          "type": "write",
+          "offset": 193,
+          "length": 51
+        },
+        {
+          "type": "write",
+          "offset": 244,
+          "length": 51
+        },
+        {
+          "type": "write",
+          "offset": 295,
+          "length": 51
+        },
+        {
+          "type": "write",
+          "offset": 346,
+          "length": 132
+        },
+        {
+          "type": "write",
+          "offset": 478,
+          "length": 27
+        },
+        {
+          "type": "write",
+          "offset": 505,
+          "length": 27
+        },
+        {
+          "type": "write",
+          "offset": 532,
+          "length": 15
+        },
+        {
+          "type": "observe",
+          "id": "alternate"
+        },
+        {
+          "type": "write",
+          "offset": 547,
+          "length": 18
+        },
+        {
+          "type": "observe",
+          "id": "final"
+        }
+      ]
+    }
+  ]
+}

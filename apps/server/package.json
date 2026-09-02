@@ -1,21 +1,13 @@
 {
-  "name": "@pideck/server",
-  "version": "0.1.0",
+  "name": "@yaade/server",
+  "version": "0.0.1",
   "private": true,
-  "main": "dist/main.js",
-  "types": "dist/main.d.ts",
-  "bin": {
-    "pideck-server": "dist/main.js"
-  },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "dev": "tsx watch src/main.ts",
-    "start": "node dist/main.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests",
-    "lint": "biome check src"
-  },
-  "dependencies": {
-    "@pideck/supervisor": "workspace:*"
+    "dev": "cargo run --manifest-path Cargo.toml -- serve",
+    "start": "cargo run --release --manifest-path Cargo.toml -- serve",
+    "build": "cargo build --release --locked --manifest-path Cargo.toml",
+    "typecheck": "cargo check --manifest-path Cargo.toml",
+    "test": "cargo test --manifest-path Cargo.toml",
+    "lint": "cargo fmt --manifest-path Cargo.toml -- --check && cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings"
   }
 }

@@ -1,4 +1,3 @@
-import * as React from "react"
 import {
   forwardRef,
   useEffect,
@@ -15,8 +14,6 @@ import {
 import { matchTerminalUrls } from "./links.js"
 import type { GhosttyTheme } from "./core.js"
 import "./styles.css"
-
-void React.version
 
 export type GhosttyTerminalHandle = GhosttyTerminalSurface
 
@@ -43,6 +40,7 @@ type GhosttyTerminalCallbacks = {
   onLinkActivate?: GhosttyTerminalProps["onLinkActivate"]
   linkMatcher?: GhosttyTerminalProps["linkMatcher"]
   onTitleChange?: GhosttyTerminalProps["onTitleChange"]
+  onPresented?: GhosttyTerminalProps["onPresented"]
   onReady?: GhosttyTerminalProps["onReady"]
   onError?: GhosttyTerminalProps["onError"]
 }
@@ -67,6 +65,8 @@ export const GhosttyTerminal = forwardRef<
     theme,
     font,
     visible = true,
+    renderer,
+    runtime,
     className,
     style,
     ariaLabel = "Terminal",
@@ -77,6 +77,7 @@ export const GhosttyTerminal = forwardRef<
     onLinkActivate,
     linkMatcher,
     onTitleChange,
+    onPresented,
     onReady,
     onError,
   },
@@ -94,6 +95,7 @@ export const GhosttyTerminal = forwardRef<
     onLinkActivate,
     linkMatcher,
     onTitleChange,
+    onPresented,
     onReady,
     onError,
   }
@@ -117,8 +119,10 @@ export const GhosttyTerminal = forwardRef<
 
     void GhosttyTerminalSurface.create(mount, {
       theme: themeRef.current,
-      ...(fontRef.current ? { font: fontRef.current } : {}),
+      font: fontRef.current,
       visible: visibleRef.current,
+      renderer,
+      runtime,
       onData: (data) => callbacksRef.current.onData?.(data),
       onResize: (cols, rows) => callbacksRef.current.onResize?.(cols, rows),
       onSelectionChange: () => callbacksRef.current.onSelectionChange?.(),
@@ -127,6 +131,8 @@ export const GhosttyTerminal = forwardRef<
       linkMatcher: (line) =>
         callbacksRef.current.linkMatcher?.(line) ?? matchTerminalUrls(line),
       onTitleChange: (title) => callbacksRef.current.onTitleChange?.(title),
+      onPresented: sample => callbacksRef.current.onPresented?.(sample),
+      onRuntimeError: error => callbacksRef.current.onError?.(error),
     }).then(
       (next) => {
         if (cancelled) {

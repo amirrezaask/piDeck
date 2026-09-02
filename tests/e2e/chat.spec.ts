@@ -556,7 +556,7 @@ test('adds a server and selects it in the composer', async ({ page }, testInfo) 
   });
 
   await settings.getByRole('button', { name: 'Close' }).click();
-  const serverSelect = page.getByRole('combobox', { name: 'Server' });
+  const serverSelect = page.getByRole('combobox', { name: 'Remote host' });
   await serverSelect.click();
   await page.getByRole('option', { name: 'Build host' }).click();
   await expect(serverSelect).toContainText('Build host');

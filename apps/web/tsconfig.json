@@ -1,10 +1,12 @@
 {
-  "files": [],
+  "extends": "../../tsconfig.web.base.json",
   "compilerOptions": {
-    "baseUrl": ".",
+    "noEmit": true,
+    "lib": ["ES2022", "DOM"],
+    "types": ["vite/client"],
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["../../packages/yaade-ui/src/*"]
     }
   },
-  "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }]
+  "include": ["vite.config.ts"]
 }

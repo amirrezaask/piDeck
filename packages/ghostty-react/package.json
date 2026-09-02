@@ -1,19 +1,35 @@
 {
-  "name": "@pideck/ghostty-react",
-  "version": "0.1.0",
+  "name": "@yaade/ghostty-react",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
+  "sideEffects": [
+    "./src/styles.css",
+    "./src/fonts.css"
+  ],
   "exports": {
-    ".": "./index.ts",
-    "./styles.css": "./src/styles.css"
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./styles.css": "./src/styles.css",
+    "./fonts.css": "./src/fonts.css"
   },
-  "dependencies": {
-    "@pideck/ghostty-core": "workspace:*"
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:ghostty-wasm": "bash scripts/build-ghostty-wasm.sh",
+    "test": "vp test"
   },
   "peerDependencies": {
     "react": ">=19.0.0"
   },
+  "dependencies": {
+    "@yaade/ghostty-core": "workspace:*"
+  },
   "devDependencies": {
-    "react": "^19.2.8"
+    "@types/react": "^19.1.8",
+    "react": "^19.1.0",
+    "typescript": "^7.0.2"
   }
 }

@@ -1,0 +1,9 @@
+error[E0499]: cannot borrow `terminal` as mutable more than once at a time
+ --> tests/ui/effects_borrow_blocks_write.rs:6:5
+  |
+5 |     let effects = terminal.write(b"first").unwrap();
+  |                   -------- first mutable borrow occurs here
+6 |     terminal.write(b"second").unwrap();
+  |     ^^^^^^^^ second mutable borrow occurs here
+7 |     assert!(effects.is_empty());
+  |             ------- first borrow later used here

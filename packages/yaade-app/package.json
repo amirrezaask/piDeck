@@ -1,0 +1,36 @@
+{
+  "name": "@yaade/app",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "vp build",
+    "test": "vp test src/client-environment.test.ts src/hooks/useAppearanceSettings.test.ts src/build-branding.test.ts src/mux/mux-routing.test.ts src/mux/mux-store.test.ts src/mux/mux-client.test.ts src/mux/terminal-tiling.test.ts src/commands/commands.test.ts src/keybindings.test.ts src/keymap-profile.test.ts src/keymap-storage.test.ts src/mux/terminal-focus-history.test.ts src/mux/terminal-switcher-model.test.ts"
+  },
+  "dependencies": {
+    "@effect/platform": "0.97.1",
+    "@tauri-apps/api": "^2.11.0",
+    "@yaade/host-client": "workspace:*",
+    "@yaade/panels": "workspace:*",
+    "@yaade/rpc": "workspace:*",
+    "@yaade/shared": "workspace:*",
+    "@yaade/ui": "workspace:*",
+    "@yaade/workspace": "workspace:*",
+    "effect": "3.22.1",
+    "lucide-react": "^0.511.0",
+    "motion": "^13.1.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.8",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^6.1.0",
+    "tailwindcss": "^4.1.8",
+    "typescript": "^7.0.2",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}

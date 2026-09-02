@@ -1,0 +1,13 @@
+{
+  "release": {
+    "coldHostMs": 650,
+    "warmHostMedianMs": 520,
+    "rendererMedianMs": 300
+  },
+  "aspirational": {
+    "coldHostMs": 400,
+    "warmHostMedianMs": 300,
+    "rendererMedianMs": 280
+  },
+  "notes": "Raise only with measured before/after results and reviewer approval."
+}

@@ -1,0 +1,458 @@
+/*
+ * YAADE material contract.
+ *
+ * Components consume these named materials instead of inventing their own
+ * alpha, blur, radius, or elevation values. The defaults are deliberately
+ * quiet: glass belongs to chrome, while dense work surfaces stay matte.
+ * Liquid Glass is a white frost film with a refractive rim in both
+ * schemes — never stack glass on glass, and never put the terminal
+ * behind a blur.
+ */
+:root {
+  /* Canvas — a quiet milky field. Dark keeps the same wash over a cool void. */
+  --yaade-canvas-background:
+    radial-gradient(
+      ellipse 72% 42% at 50% -12%,
+      color-mix(in oklch, var(--primary) 7%, transparent),
+      transparent 64%
+    ),
+    var(--background);
+  --yaade-canvas-noise-opacity: 0;
+
+  /* Structural glass uses alpha, edges, and depth without a live blur. Only
+   * overlapping floating surfaces pay for backdrop filtering. */
+  --yaade-material-shell-fill: color-mix(in srgb, white 24%, transparent);
+  --yaade-material-chrome-fill: color-mix(in srgb, white 34%, transparent);
+  --yaade-material-content-fill: color-mix(in srgb, var(--background) 96%, transparent);
+  --yaade-material-floating-fill: color-mix(in srgb, white 76%, transparent);
+
+  --yaade-material-shell-fallback: color-mix(in srgb, var(--card) 96%, transparent);
+  --yaade-material-chrome-fallback: color-mix(in srgb, var(--card) 98%, transparent);
+  --yaade-material-content-fallback: var(--background);
+  --yaade-material-floating-fallback: color-mix(in srgb, var(--popover) 98%, transparent);
+
+  /* Blur is assigned by material, never by individual components. */
+  --yaade-material-shell-blur: 0px;
+  --yaade-material-chrome-blur: 0px;
+  --yaade-material-content-blur: 0px;
+  --yaade-material-floating-blur: 18px;
+  --yaade-material-shell-saturation: 1;
+  --yaade-material-chrome-saturation: 1;
+  --yaade-material-content-saturation: 1;
+  --yaade-material-floating-saturation: 1.25;
+  --yaade-material-shell-brightness: 1;
+  --yaade-material-chrome-brightness: 1;
+  --yaade-material-content-brightness: 1;
+  --yaade-material-floating-brightness: 1.02;
+  --yaade-material-shell-filter: blur(var(--yaade-material-shell-blur))
+    saturate(var(--yaade-material-shell-saturation))
+    brightness(var(--yaade-material-shell-brightness));
+  --yaade-material-chrome-filter: blur(var(--yaade-material-chrome-blur))
+    saturate(var(--yaade-material-chrome-saturation))
+    brightness(var(--yaade-material-chrome-brightness));
+  --yaade-material-floating-filter: blur(var(--yaade-material-floating-blur))
+    saturate(var(--yaade-material-floating-saturation))
+    brightness(var(--yaade-material-floating-brightness));
+
+  /* Optical edges and elevation. */
+  --yaade-material-light-edge: color-mix(in srgb, var(--foreground) 14%, transparent);
+  --yaade-material-dark-edge: color-mix(in srgb, var(--foreground) 12%, transparent);
+  --yaade-material-specular: color-mix(in srgb, white 88%, transparent);
+  --yaade-material-specular-soft: color-mix(in srgb, white 38%, transparent);
+  --yaade-material-rim-side: color-mix(in srgb, white 52%, transparent);
+  --yaade-material-thickness: color-mix(in srgb, black 10%, transparent);
+  --yaade-material-sheen: linear-gradient(
+    165deg,
+    color-mix(in srgb, white 22%, transparent) 0%,
+    color-mix(in srgb, white 6%, transparent) 20%,
+    transparent 46%
+  );
+  --yaade-material-shadow: color-mix(in srgb, var(--foreground) 22%, transparent);
+  --yaade-material-inset-rim:
+    inset 0 1px 0.5px var(--yaade-material-specular),
+    inset 0 -1px 0 var(--yaade-material-specular-soft),
+    inset 1px 0 0 var(--yaade-material-rim-side), inset -1px 0 0 var(--yaade-material-rim-side),
+    inset 0 -18px 28px -20px var(--yaade-material-thickness);
+  --yaade-material-shell-shadow: 0 18px 48px -28px var(--yaade-material-shadow);
+  --yaade-material-chrome-shadow: 0 10px 28px -20px var(--yaade-material-shadow);
+  --yaade-material-content-shadow: inset 0 1px color-mix(in srgb, var(--foreground) 5%, transparent);
+  --yaade-material-floating-shadow: 0 24px 64px -24px var(--yaade-material-shadow);
+  --yaade-material-scrim: var(--backdrop);
+
+  /* Named elevation and interaction states. */
+  --yaade-elevation-embedded: var(--yaade-material-content-shadow);
+  --yaade-elevation-raised: var(--yaade-material-chrome-shadow);
+  --yaade-elevation-floating: var(--yaade-material-floating-shadow);
+  --yaade-elevation-modal: 0 32px 88px -36px var(--yaade-material-shadow);
+  --yaade-state-focus: var(--ring);
+  --yaade-state-selected: var(--primary);
+  --yaade-state-hover: var(--accent);
+  --yaade-state-destructive: var(--destructive);
+  --yaade-state-running: var(--success);
+  --yaade-state-attention: var(--warning);
+  --yaade-state-error: var(--destructive);
+
+  /* Geometry */
+  --yaade-material-shell-radius: var(--yaade-island-radius);
+  --yaade-material-panel-radius: var(--yaade-pane-radius);
+  --yaade-material-tab-radius: var(--yaade-control-radius);
+  --yaade-material-control-radius: var(--yaade-control-radius);
+  --yaade-material-menu-radius: 0.875rem;
+
+  /* Window tabs are small glass pills inside a single structural glass bar. */
+  --yaade-tab-bar-height: 3.25rem;
+  --yaade-tab-pill-height: 2.375rem;
+  --yaade-tab-pill-inactive-fill: transparent;
+  --yaade-tab-pill-active-fill: color-mix(in srgb, white 72%, transparent);
+  --yaade-tab-pill-active-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 94%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--foreground) 7%, transparent),
+    0 1px 2px color-mix(in srgb, var(--foreground) 16%, transparent),
+    0 10px 24px -14px color-mix(in srgb, var(--foreground) 38%, transparent);
+
+  /* Motion */
+  --yaade-material-hover-duration: var(--yaade-motion-hot);
+  --yaade-material-selection-duration: var(--yaade-motion-panel);
+  --yaade-material-overlay-duration: var(--yaade-motion-overlay);
+  --yaade-material-ease: var(--yaade-ease-out);
+  --yaade-material-dense-ease: cubic-bezier(0.23, 1, 0.32, 1);
+
+  /* Compatibility names for older surfaces being migrated incrementally. */
+  --glass-blur: var(--yaade-material-floating-blur);
+  --glass-blur-compact: var(--yaade-material-chrome-blur);
+  --glass-opacity: 58%;
+  --glass-saturation: var(--yaade-material-floating-saturation);
+  --yaade-material-fill: var(--yaade-material-chrome-fill);
+  --yaade-material-fill-strong: var(--yaade-material-floating-fill);
+  --yaade-material-fill-soft: color-mix(in srgb, white 36%, transparent);
+  --yaade-material-stroke: var(--yaade-material-light-edge);
+  --yaade-material-highlight: var(--yaade-material-specular);
+}
+
+:root:not(.dark) {
+  --yaade-canvas-background:
+    radial-gradient(
+      ellipse 72% 46% at 50% -14%,
+      color-mix(in oklch, white 46%, transparent),
+      transparent 68%
+    ),
+    var(--background);
+  --yaade-canvas-noise-opacity: 0;
+  --yaade-material-shell-shadow: 0 18px 48px -30px
+    color-mix(in srgb, var(--foreground) 22%, transparent);
+  --yaade-material-chrome-shadow: 0 10px 26px -18px
+    color-mix(in srgb, var(--foreground) 24%, transparent);
+}
+
+.dark {
+  /* Same milk-on-milk relationship as light: frost is a lifted card film,
+   * never white paint on a void. Floating alpha stays under 0.4. */
+  --yaade-canvas-background: var(--background);
+  --yaade-canvas-noise-opacity: 0;
+  --yaade-material-shell-fill: color-mix(in oklch, var(--card) 78%, transparent);
+  --yaade-material-chrome-fill: color-mix(in oklch, var(--card) 86%, transparent);
+  --yaade-material-content-fill: color-mix(in oklch, var(--background) 94%, transparent);
+  --yaade-material-floating-fill: color-mix(in oklch, var(--popover) 72%, transparent);
+  --yaade-material-shell-fallback: var(--card);
+  --yaade-material-chrome-fallback: var(--card);
+  --yaade-material-floating-fallback: var(--popover);
+  --yaade-material-shell-blur: 0px;
+  --yaade-material-chrome-blur: 0px;
+  --yaade-material-floating-blur: 18px;
+  --yaade-material-shell-saturation: 1;
+  --yaade-material-chrome-saturation: 1;
+  --yaade-material-floating-saturation: 1.2;
+  --yaade-material-shell-brightness: 1;
+  --yaade-material-chrome-brightness: 1;
+  --yaade-material-floating-brightness: 1.02;
+  --yaade-material-light-edge: color-mix(in oklch, white 12%, transparent);
+  --yaade-material-dark-edge: color-mix(in oklch, var(--foreground) 8%, transparent);
+  --yaade-material-specular: color-mix(in oklch, white 22%, transparent);
+  --yaade-material-specular-soft: color-mix(in oklch, white 8%, transparent);
+  --yaade-material-rim-side: color-mix(in oklch, white 8%, transparent);
+  --yaade-material-thickness: color-mix(in oklch, black 10%, transparent);
+  --yaade-material-sheen: linear-gradient(
+    165deg,
+    color-mix(in oklch, white 12%, transparent) 0%,
+    color-mix(in oklch, white 3%, transparent) 20%,
+    transparent 46%
+  );
+  --yaade-material-shadow: color-mix(in srgb, black 40%, transparent);
+  --yaade-material-shell-shadow: 0 18px 48px -28px var(--yaade-material-shadow);
+  --yaade-material-chrome-shadow: 0 10px 28px -20px var(--yaade-material-shadow);
+  --yaade-material-floating-shadow: 0 24px 64px -24px var(--yaade-material-shadow);
+  --yaade-material-fill-soft: color-mix(in oklch, var(--card) 55%, transparent);
+  --yaade-material-stroke: var(--yaade-material-light-edge);
+  --yaade-tab-pill-active-fill: color-mix(in oklch, white 9%, var(--card));
+  --yaade-tab-pill-active-shadow:
+    inset 0 1px 0 color-mix(in oklch, white 15%, transparent),
+    0 1px 2px color-mix(in srgb, black 28%, transparent),
+    0 8px 18px -12px color-mix(in srgb, black 48%, transparent);
+  --glass-opacity: 38%;
+}
+
+/* The classic mode keeps the same geometry and hierarchy without translucency. */
+:root[data-yaade-interface-material="classic"] {
+  --yaade-canvas-background: var(--background);
+  --yaade-canvas-noise-opacity: 0;
+  --yaade-material-shell-fill: var(--card);
+  --yaade-material-chrome-fill: var(--card);
+  --yaade-material-content-fill: var(--background);
+  --yaade-material-floating-fill: var(--popover);
+  --yaade-material-shell-fallback: var(--card);
+  --yaade-material-chrome-fallback: var(--card);
+  --yaade-material-content-fallback: var(--background);
+  --yaade-material-floating-fallback: var(--popover);
+  --yaade-material-shell-blur: 0px;
+  --yaade-material-chrome-blur: 0px;
+  --yaade-material-content-blur: 0px;
+  --yaade-material-floating-blur: 0px;
+  --yaade-material-shell-saturation: 1;
+  --yaade-material-chrome-saturation: 1;
+  --yaade-material-content-saturation: 1;
+  --yaade-material-floating-saturation: 1;
+  --yaade-material-shell-brightness: 1;
+  --yaade-material-chrome-brightness: 1;
+  --yaade-material-content-brightness: 1;
+  --yaade-material-floating-brightness: 1;
+  --yaade-material-light-edge: var(--border);
+  --yaade-material-dark-edge: var(--border);
+  --yaade-material-specular: transparent;
+  --yaade-material-specular-soft: transparent;
+  --yaade-material-rim-side: transparent;
+  --yaade-material-thickness: transparent;
+  --yaade-material-sheen: none;
+  --yaade-material-shadow: color-mix(in srgb, var(--foreground) 16%, transparent);
+  --yaade-material-inset-rim: inset 0 0 0 transparent;
+  --yaade-material-shell-shadow: 0 8px 24px -20px var(--yaade-material-shadow);
+  --yaade-material-chrome-shadow: none;
+  --yaade-material-content-shadow: none;
+  --yaade-material-floating-shadow: 0 14px 32px -20px var(--yaade-material-shadow);
+  --glass-blur: 0px;
+  --glass-blur-compact: 0px;
+  --glass-saturation: 1;
+  --yaade-material-fill: var(--card);
+  --yaade-material-fill-strong: var(--popover);
+  --yaade-material-fill-soft: var(--secondary);
+  --yaade-material-stroke: var(--border);
+  --yaade-material-highlight: transparent;
+}
+
+[data-yaade-glass-surface] {
+  position: relative;
+  isolation: isolate;
+  border: 1px solid var(--yaade-glass-edge, var(--yaade-material-light-edge));
+  background: var(--yaade-glass-fill, var(--yaade-material-chrome-fill));
+  box-shadow:
+    var(--yaade-material-inset-rim), var(--yaade-glass-shadow, var(--yaade-material-chrome-shadow));
+  -webkit-backdrop-filter: blur(var(--yaade-glass-blur, var(--yaade-material-chrome-blur)))
+    saturate(var(--yaade-glass-saturation, var(--yaade-material-chrome-saturation)))
+    brightness(var(--yaade-glass-brightness, var(--yaade-material-chrome-brightness)));
+  backdrop-filter: blur(var(--yaade-glass-blur, var(--yaade-material-chrome-blur)))
+    saturate(var(--yaade-glass-saturation, var(--yaade-material-chrome-saturation)))
+    brightness(var(--yaade-glass-brightness, var(--yaade-material-chrome-brightness)));
+  transition:
+    background-color var(--yaade-material-hover-duration) var(--yaade-material-ease),
+    border-color var(--yaade-material-hover-duration) var(--yaade-material-ease),
+    box-shadow var(--yaade-material-hover-duration) var(--yaade-material-ease),
+    transform var(--yaade-material-hover-duration) var(--yaade-material-ease);
+}
+
+[data-yaade-glass-surface][data-yaade-glass-material="shell"] {
+  --yaade-glass-fill: var(--yaade-material-shell-fill);
+  --yaade-glass-fallback: var(--yaade-material-shell-fallback);
+  --yaade-glass-blur: var(--yaade-material-shell-blur);
+  --yaade-glass-saturation: var(--yaade-material-shell-saturation);
+  --yaade-glass-brightness: var(--yaade-material-shell-brightness);
+  --yaade-glass-edge: var(--yaade-material-light-edge);
+  --yaade-glass-shadow: var(--yaade-material-shell-shadow);
+  border-radius: var(--yaade-material-shell-radius);
+}
+
+[data-yaade-glass-surface][data-yaade-glass-material="chrome"] {
+  --yaade-glass-fill: var(--yaade-material-chrome-fill);
+  --yaade-glass-fallback: var(--yaade-material-chrome-fallback);
+  --yaade-glass-blur: var(--yaade-material-chrome-blur);
+  --yaade-glass-saturation: var(--yaade-material-chrome-saturation);
+  --yaade-glass-brightness: var(--yaade-material-chrome-brightness);
+  --yaade-glass-edge: var(--yaade-material-light-edge);
+  --yaade-glass-shadow: var(--yaade-material-chrome-shadow);
+  border-radius: var(--yaade-material-tab-radius);
+}
+
+[data-yaade-glass-surface][data-yaade-glass-material="content"] {
+  --yaade-glass-fill: var(--yaade-material-content-fill);
+  --yaade-glass-fallback: var(--yaade-material-content-fallback);
+  --yaade-glass-blur: var(--yaade-material-content-blur);
+  --yaade-glass-saturation: var(--yaade-material-content-saturation);
+  --yaade-glass-brightness: var(--yaade-material-content-brightness);
+  --yaade-glass-edge: var(--yaade-material-dark-edge);
+  --yaade-glass-shadow: var(--yaade-material-content-shadow);
+  border-radius: var(--yaade-material-panel-radius);
+  box-shadow: var(--yaade-material-content-shadow);
+}
+
+[data-yaade-glass-surface][data-yaade-glass-material="floating"] {
+  --yaade-glass-fill: var(--yaade-material-floating-fill);
+  --yaade-glass-fallback: var(--yaade-material-floating-fallback);
+  --yaade-glass-blur: var(--yaade-material-floating-blur);
+  --yaade-glass-saturation: var(--yaade-material-floating-saturation);
+  --yaade-glass-brightness: var(--yaade-material-floating-brightness);
+  --yaade-glass-edge: var(--yaade-material-light-edge);
+  --yaade-glass-shadow: var(--yaade-material-floating-shadow);
+  border-radius: var(--yaade-material-menu-radius);
+}
+
+[data-yaade-glass-surface][data-yaade-glass-interactive="true"] {
+  cursor: pointer;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  [data-yaade-glass-surface][data-yaade-glass-interactive="true"]:not(
+      [data-yaade-glass-material="content"]
+    ):hover {
+    border-color: color-mix(in srgb, var(--yaade-material-light-edge) 70%, white 30%);
+    box-shadow:
+      var(--yaade-material-inset-rim),
+      0 14px 36px -20px var(--yaade-material-shadow);
+  }
+}
+
+[data-yaade-glass-surface][data-yaade-glass-elevated="true"] {
+  box-shadow: var(--yaade-material-inset-rim), var(--yaade-material-floating-shadow);
+}
+
+[data-yaade-glass-surface]::before {
+  pointer-events: none;
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--yaade-material-sheen);
+  mix-blend-mode: screen;
+  content: "";
+}
+
+[data-yaade-glass-surface][data-yaade-glass-material="content"]::before,
+[data-yaade-session-switcher-popover]::before {
+  content: none;
+}
+
+.yaade-glass-control-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+  padding: 0.125rem;
+}
+
+.yaade-glass-divider {
+  flex: 0 0 auto;
+  background: var(--yaade-material-light-edge);
+}
+
+.yaade-glass-divider[data-orientation="horizontal"] {
+  width: 100%;
+  height: 1px;
+}
+
+.yaade-glass-divider[data-orientation="vertical"] {
+  width: 1px;
+  height: 100%;
+}
+
+.yaade-glass-focus-ring:focus-visible {
+  outline: 2px solid var(--yaade-state-focus);
+  outline-offset: 2px;
+}
+
+.yaade-ambient-canvas {
+  position: relative;
+  isolation: isolate;
+  background: var(--yaade-canvas-background);
+}
+
+.yaade-ambient-canvas::before {
+  pointer-events: none;
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  opacity: var(--yaade-canvas-noise-opacity);
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 160 160' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.55'/%3E%3C/svg%3E");
+  content: "";
+}
+
+.yaade-ambient-canvas > * {
+  position: relative;
+  z-index: 1;
+}
+
+.yaade-glass-gallery-busy.yaade-ambient-canvas,
+.yaade-glass-gallery-busy {
+  --yaade-canvas-background:
+    radial-gradient(ellipse 70% 55% at 16% 6%, oklch(0.58 0.12 250 / 0.42), transparent 52%),
+    radial-gradient(ellipse 50% 42% at 88% 14%, oklch(0.5 0.1 310 / 0.28), transparent 48%),
+    radial-gradient(ellipse 62% 48% at 78% 94%, oklch(0.42 0.08 200 / 0.3), transparent 52%),
+    radial-gradient(ellipse 38% 32% at 36% 62%, oklch(0.55 0.06 80 / 0.16), transparent 44%),
+    var(--background);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  [data-yaade-glass-surface] {
+    background: var(--yaade-glass-fallback, var(--card));
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  [data-yaade-glass-surface] {
+    background: var(--yaade-glass-fallback, var(--card));
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  [data-yaade-glass-surface]::before {
+    content: none;
+  }
+}
+
+:root[data-yaade-interface-material="classic"] [data-yaade-glass-surface]::before {
+  content: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-yaade-glass-surface] {
+    transition-duration: 0ms;
+  }
+}
+
+:root[data-yaade-reduced-motion="true"] [data-yaade-glass-surface] {
+  transition-duration: 0ms;
+}
+
+[data-yaade-session-tab] {
+  border-radius: var(--yaade-pill-radius);
+  background-color: var(--yaade-tab-pill-inactive-fill);
+}
+
+[data-yaade-session-tab][data-active="true"] {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+[data-yaade-window-tab-pill] {
+  border: 1px solid var(--yaade-material-light-edge);
+  border-radius: var(--yaade-pill-radius);
+  background-color: var(--yaade-tab-pill-active-fill);
+  box-shadow: var(--yaade-tab-pill-active-shadow);
+  -webkit-backdrop-filter: blur(16px) saturate(1.24);
+  backdrop-filter: blur(16px) saturate(1.24);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  [data-yaade-window-tab-pill] {
+    background-color: var(--yaade-material-chrome-fallback);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}

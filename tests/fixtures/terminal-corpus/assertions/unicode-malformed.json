@@ -1,0 +1,33 @@
+{
+  "fixtureId": "unicode-malformed",
+  "observations": [
+    {
+      "id": "final",
+      "cursor": { "column": 16, "row": 2 },
+      "activeScreen": "primary",
+      "dimensions": { "columns": 24, "rows": 8, "widthPixels": 216, "heightPixels": 144 },
+      "scrollbar": { "total": 8, "offset": 0, "length": 8 },
+      "kittyKeyboardFlags": 0,
+      "rows": [
+        { "row": 0, "wrapsToNext": true, "isWrapContinuation": false },
+        { "row": 1, "wrapsToNext": false, "isWrapContinuation": true }
+      ],
+      "cells": [
+        { "row": 0, "column": 6, "graphemeBase64": "8J+YgA==", "width": "wide" },
+        { "row": 0, "column": 7, "graphemeBase64": "", "width": "spacer-tail" },
+        { "row": 0, "column": 17, "graphemeBase64": "77+9", "width": "narrow" },
+        { "row": 0, "column": 18, "graphemeBase64": "77+9", "width": "narrow" },
+        { "row": 1, "column": 3, "graphemeBase64": "77+9", "width": "narrow" },
+        { "row": 2, "column": 5, "graphemeBase64": "55WM", "width": "wide" },
+        { "row": 2, "column": 6, "graphemeBase64": "", "width": "spacer-tail" },
+        { "row": 2, "column": 8, "graphemeBase64": "ZcyB", "width": "narrow" },
+        { "row": 2, "column": 10, "graphemeBase64": "4p2k77iP", "width": "narrow" },
+        { "row": 2, "column": 12, "graphemeBase64": "8J+RqeKAjQ==", "width": "wide" },
+        { "row": 2, "column": 14, "graphemeBase64": "8J+Suw==", "width": "wide" }
+      ],
+      "palette": [],
+      "modes": [],
+      "effects": []
+    }
+  ]
+}
