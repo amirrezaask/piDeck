@@ -28,6 +28,7 @@
     "@nextflow/database": "workspace:*",
     "@nextflow/observability": "workspace:*",
     "@nextflow/test-agents": "workspace:*",
+    "@pideck/terminal-multiplexer": "workspace:*",
     "fastify": "^5.4.0",
     "ws": "^8.21.3",
     "zod": "^3.25.76"

@@ -17,6 +17,7 @@ import {
   ManagedAgentService,
   type SupervisorLifecyclePhase,
 } from '../agent-service';
+import { PiExtensionRequestCancelledError } from '../pi-session';
 import { Deferred, FakePiSessionFactory } from './fake-pi-session';
 
 async function createService(
@@ -79,6 +80,23 @@ async function waitForEvent(service: ManagedAgentService, agentId: string, event
 }
 
 describe('ManagedAgentService', () => {
+  it('marks a run cancelled when an operator declines an extension request', async () => {
+    const context = await createService();
+    try {
+      const agent = await context.service.createAgent({ systemPrompt: 'Ask first.' });
+      const run = await context.service.createRun({ agentId: agent.id, prompt: 'Continue?' });
+      const session = context.factory.sessions[0];
+      if (!session) throw new Error('Expected a fake PI session');
+
+      session.rejectPrompt(new PiExtensionRequestCancelledError());
+      await waitForEvent(context.service, agent.id, 'supervisor.run_cancelled');
+
+      await expect(context.service.getRun(run.id)).resolves.toMatchObject({ status: 'cancelled' });
+    } finally {
+      await context.close();
+    }
+  });
+
   it('binds worktree runs to the canonical worktree and holds it busy until completion', async () => {
     const context = await createService();
     try {

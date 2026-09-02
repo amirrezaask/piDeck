@@ -4,7 +4,11 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   resolve: {
+    dedupe: ['react', 'react-dom', 'motion', 'framer-motion'],
     alias: {
+      motion: path.resolve(import.meta.dirname, './node_modules/motion'),
+      react: path.resolve(import.meta.dirname, './node_modules/react'),
+      'react-dom': path.resolve(import.meta.dirname, './node_modules/react-dom'),
       '@': path.resolve(import.meta.dirname, './src'),
       '@nextflow/contracts': path.resolve(
         import.meta.dirname,
@@ -18,11 +22,7 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary'],
-      include: [
-        'src/App.tsx',
-        'src/components/operations.tsx',
-        'src/lib/**/*.ts',
-      ],
+      include: ['src/App.tsx', 'src/components/operations.tsx', 'src/lib/**/*.ts'],
       thresholds: {
         statements: 50,
         branches: 45,

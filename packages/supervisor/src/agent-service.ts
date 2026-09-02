@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
+import { type FileHandle, open, realpath } from 'node:fs/promises';
 
 import {
   type AgentImageAttachment,
@@ -31,6 +31,7 @@ import {
   ManagedAgentRunResponseSchema,
   type ManagedAgentRunStatus,
   ManagedAgentRunStatusSchema,
+  type RunDebugLogResponse,
   type UpdateManagedAgentRequest,
   UpdateManagedAgentRequestSchema,
 } from '@nextflow/contracts';
@@ -48,12 +49,16 @@ import { ManagedAgentEventHub } from './agent-event-hub.js';
 import type {
   CreatePiSessionOptions,
   ManagedPiSession,
+  PiExtensionUI,
   PiImageContent,
   PiSessionFactory,
 } from './pi-session.js';
+import { PiExtensionRequestCancelledError } from './pi-session.js';
 import { ProjectService } from './project-service.js';
 import type { SupervisorLogger } from './service.js';
 import { resolveWorkingDirectory } from './working-directory.js';
+
+const MAX_DEBUG_LOG_BYTES = 2_000_000;
 
 const defaultLogger: SupervisorLogger = {
   info: (message, context) => console.info(message, context ?? ''),
@@ -214,6 +219,8 @@ export interface ManagedAgentServiceOptions {
   readonly now?: () => string;
   readonly idFactory?: () => string;
   readonly projectService?: ProjectService;
+  readonly extensionUI?: (runId: string) => PiExtensionUI;
+  readonly cancelExtensionRequests?: (runId: string) => Promise<void>;
   /** Bounds shutdown and abort cleanup when an SDK session is unhealthy. */
   readonly shutdownTimeoutMs?: number;
   readonly operationTimeoutMs?: number;
@@ -247,6 +254,8 @@ export class ManagedAgentService {
   private readonly now: () => string;
   private readonly idFactory: () => string;
   private readonly projectService: ProjectService;
+  private readonly extensionUI: ((runId: string) => PiExtensionUI) | undefined;
+  private readonly cancelExtensionRequests: ((runId: string) => Promise<void>) | undefined;
   private readonly shutdownTimeoutMs: number;
   private readonly operationTimeoutMs: number;
   private readonly eventPayloadLimits: EventPayloadLimits;
@@ -281,6 +290,8 @@ export class ManagedAgentService {
     this.instanceId = randomUUID();
     this.projectService =
       options.projectService ?? new ProjectService({ db: options.db, now: this.now });
+    this.extensionUI = options.extensionUI;
+    this.cancelExtensionRequests = options.cancelExtensionRequests;
     this.shutdownTimeoutMs = Math.max(1, options.shutdownTimeoutMs ?? 5_000);
     this.operationTimeoutMs = Math.max(1, options.operationTimeoutMs ?? this.shutdownTimeoutMs);
     this.eventPayloadLimits = {
@@ -359,6 +370,7 @@ export class ManagedAgentService {
             systemPrompt: row.system_prompt,
             systemPromptMode: row.system_prompt_mode,
             ...(row.tools_json ? { tools: decodeJson(row.tools_json) as AgentToolName[] } : {}),
+            ...(this.extensionUI ? { extensionUI: this.extensionUI(row.run_id) } : {}),
           });
           this.attachRecoveredSession(row.run_id, row.agent_id, session);
           await this.db
@@ -805,6 +817,7 @@ export class ManagedAgentService {
         if (isTerminalRunStatus(status)) throw new ManagedAgentRunNotCancellableError(runId);
 
         const active = this.activeRuns.get(runId);
+        await this.cancelExtensionRequests?.(runId);
         if (active) {
           // Invalidate every older prompt before asking the SDK to stop. Even a
           // rejected abort therefore cannot turn the cancelled row into failed.
@@ -1148,6 +1161,74 @@ export class ManagedAgentService {
     return this.listEventsPage(row.agent_id, options, runId);
   }
 
+  async getRunDebugLog(runId: string): Promise<RunDebugLogResponse> {
+    const row = await this.getRunRow(runId);
+    if (!row) throw new ManagedAgentRunNotFoundError(runId);
+    const supervisorEvents = (
+      await this.listEventsPage(row.agent_id, { afterSequence: 0, limit: 500 }, runId)
+    ).events;
+    const diagnostics: string[] = [];
+    const hasAgentEvents = supervisorEvents.some((event) => !event.type.startsWith('supervisor.'));
+    if (
+      row.status === 'completed' &&
+      !hasAgentEvents &&
+      supervisorEvents.some((event) => event.type === 'supervisor.prompt_accepted')
+    ) {
+      diagnostics.push(
+        'PI accepted and completed the prompt without emitting an agent event. An input extension likely handled the prompt before any request reached the LLM.',
+      );
+    }
+    const unavailable = (reason: string): RunDebugLogResponse => ({
+      runId,
+      sessionId: row.pi_session_id,
+      sessionFile: row.pi_session_file,
+      available: false,
+      unavailableReason: reason,
+      content: '',
+      bytesRead: 0,
+      fileSize: null,
+      truncated: false,
+      diagnostics,
+      supervisorEvents,
+    });
+    if (!row.pi_session_file) {
+      return unavailable('PI did not assign a session journal to this run.');
+    }
+
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(row.pi_session_file, 'r');
+      const file = await handle.stat();
+      if (!file.isFile()) return unavailable('The recorded PI session journal is not a file.');
+      const bytesRead = Math.min(file.size, MAX_DEBUG_LOG_BYTES);
+      const buffer = Buffer.allocUnsafe(bytesRead);
+      const result = await handle.read(buffer, 0, bytesRead, 0);
+      return {
+        runId,
+        sessionId: row.pi_session_id,
+        sessionFile: row.pi_session_file,
+        available: true,
+        unavailableReason: null,
+        content: buffer.subarray(0, result.bytesRead).toString('utf8'),
+        bytesRead: result.bytesRead,
+        fileSize: file.size,
+        truncated: file.size > result.bytesRead,
+        diagnostics,
+        supervisorEvents,
+      };
+    } catch (error) {
+      const code =
+        typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+      return unavailable(
+        code === 'ENOENT'
+          ? 'The PI session journal was never written or is no longer present.'
+          : 'The PI session journal could not be read.',
+      );
+    } finally {
+      await handle?.close();
+    }
+  }
+
   subscribe(agentId: string, listener: (event: ManagedAgentEvent) => void): () => void {
     return this.events.subscribe(agentId, listener);
   }
@@ -1226,7 +1307,10 @@ export class ManagedAgentService {
   ): Promise<void> {
     let session: ManagedPiSession;
     try {
-      session = await this.sessionFactory.create(sessionOptions);
+      session = await this.sessionFactory.create({
+        ...sessionOptions,
+        ...(this.extensionUI ? { extensionUI: this.extensionUI(runId) } : {}),
+      });
     } catch (error) {
       if (this.closed) return;
       const finalized = await this.tryFinalizeRun(
@@ -1385,6 +1469,18 @@ export class ManagedAgentService {
       .catch(async (error: unknown) => {
         if (runAcceptance && !(await runAcceptance)) return;
         if (active.generation !== generation) return;
+        if (error instanceof PiExtensionRequestCancelledError) {
+          const won = await this.tryFinalizeRun(
+            active.agentId,
+            active.runId,
+            'cancelled',
+            { code: 'run_cancelled', message: error.message },
+            'supervisor.run_cancelled',
+          );
+          if (won) active.settled = true;
+          await this.disposeActiveRunSafely(active, 'extension request declined');
+          return;
+        }
         const won = await this.tryFinalizeRun(
           active.agentId,
           active.runId,

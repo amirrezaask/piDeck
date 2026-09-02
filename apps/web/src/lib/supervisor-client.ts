@@ -2,6 +2,7 @@ import {
   type AgentMessageRequest,
   AgentMessageRequestSchema,
   type AgentModel,
+  type ChangeScope,
   type ComposerSuggestionsRequest,
   ComposerSuggestionsRequestSchema,
   type ComposerSuggestionsResponse,
@@ -12,7 +13,16 @@ import {
   CreateManagedAgentRunRequestSchema,
   type CreateManagedProjectRequest,
   CreateManagedProjectRequestSchema,
+  type CreateTerminalSessionRequest,
+  CreateTerminalSessionRequestSchema,
+  type CreateWorktreeRequest,
+  CreateWorktreeRequestSchema,
   ErrorResponseSchema,
+  type FleetOverviewResponse,
+  FleetOverviewResponseSchema,
+  type InboxItemResponse,
+  InboxItemResponseSchema,
+  InboxListResponseSchema,
   type ManagedAgentCommandReceipt,
   ManagedAgentCommandReceiptSchema,
   type ManagedAgentEvent,
@@ -41,32 +51,25 @@ import {
   ManagedProjectListResponseSchema,
   type ManagedProjectResponse,
   ManagedProjectResponseSchema,
+  type RunChangesResponse,
+  RunChangesResponseSchema,
+  type RunDebugLogResponse,
+  RunDebugLogResponseSchema,
+  type SessionSearchResponse,
+  SessionSearchResponseSchema,
+  TerminalSessionListResponseSchema,
+  type TerminalSessionResponse,
+  TerminalSessionResponseSchema,
   type UpdateManagedAgentRequest,
   UpdateManagedAgentRequestSchema,
   UpdateManagedExtensionsRequestSchema,
   type UpdateManagedProjectRequest,
   UpdateManagedProjectRequestSchema,
-  type ChangeScope,
-  type CreateTerminalSessionRequest,
-  CreateTerminalSessionRequestSchema,
-  type CreateWorktreeRequest,
-  CreateWorktreeRequestSchema,
-  type FleetOverviewResponse,
-  FleetOverviewResponseSchema,
-  type InboxItemResponse,
-  InboxItemResponseSchema,
-  InboxListResponseSchema,
-  type RunChangesResponse,
-  RunChangesResponseSchema,
-  type SessionSearchResponse,
-  SessionSearchResponseSchema,
-  type TerminalSessionResponse,
-  TerminalSessionListResponseSchema,
-  TerminalSessionResponseSchema,
-  type WorktreeResponse,
   WorktreeListResponseSchema,
+  type WorktreeResponse,
   WorktreeResponseSchema,
 } from '@nextflow/contracts';
+import type { MultiplexerTerminal } from '@pideck/terminal-multiplexer/client';
 import { ApiError } from './api-error';
 
 interface RuntimeSchema<T> {
@@ -77,6 +80,47 @@ interface WebSocketTicket {
   readonly ticket: string;
   readonly expiresAt: string;
 }
+
+const MultiplexerTerminalSchema: RuntimeSchema<MultiplexerTerminal> = {
+  parse(value: unknown): MultiplexerTerminal {
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      typeof (value as { id?: unknown }).id !== 'string' ||
+      typeof (value as { sessionId?: unknown }).sessionId !== 'string' ||
+      typeof (value as { title?: unknown }).title !== 'string' ||
+      typeof (value as { cwd?: unknown }).cwd !== 'string' ||
+      !['running', 'exited'].includes(String((value as { status?: unknown }).status)) ||
+      typeof (value as { createdAt?: unknown }).createdAt !== 'string'
+    ) {
+      throw new Error('Invalid terminal multiplexer response');
+    }
+    return value as MultiplexerTerminal;
+  },
+};
+
+const MultiplexerTerminalListSchema: RuntimeSchema<{ terminals: MultiplexerTerminal[] }> = {
+  parse(value: unknown) {
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      !Array.isArray((value as { terminals?: unknown }).terminals)
+    ) {
+      throw new Error('Invalid terminal multiplexer list');
+    }
+    return {
+      terminals: (value as { terminals: unknown[] }).terminals.map((terminal) =>
+        MultiplexerTerminalSchema.parse(terminal),
+      ),
+    };
+  },
+};
+
+const EmptyResponseSchema: RuntimeSchema<Record<string, never>> = {
+  parse() {
+    return {};
+  },
+};
 
 const WebSocketTicketSchema: RuntimeSchema<WebSocketTicket> = {
   parse(value: unknown): WebSocketTicket {
@@ -177,6 +221,7 @@ export class SupervisorClient {
     return this.request('/v1/runs', ManagedAgentRunResponseSchema, {
       method: 'POST',
       body: JSON.stringify(CreateManagedAgentRunRequestSchema.parse(request)),
+      requestTimeoutMs: 15 * 60_000,
     });
   }
 
@@ -267,6 +312,13 @@ export class SupervisorClient {
     );
   }
 
+  getRunDebugLog(runId: string): Promise<RunDebugLogResponse> {
+    return this.request(
+      `/v1/runs/${encodeURIComponent(runId)}/debug-log`,
+      RunDebugLogResponseSchema,
+    );
+  }
+
   createWorktree(request: CreateWorktreeRequest): Promise<WorktreeResponse> {
     return this.request('/v1/worktrees', WorktreeResponseSchema, {
       method: 'POST',
@@ -281,6 +333,36 @@ export class SupervisorClient {
     return this.request(`/v1/worktrees/${encodeURIComponent(id)}${query}`, WorktreeResponseSchema, {
       method: 'DELETE',
     });
+  }
+
+  listSessionTerminals(sessionId: string): Promise<{ terminals: MultiplexerTerminal[] }> {
+    return this.request(
+      `/v1/runs/${encodeURIComponent(sessionId)}/terminal-multiplexer/terminals`,
+      MultiplexerTerminalListSchema,
+    );
+  }
+
+  createSessionTerminal(sessionId: string): Promise<MultiplexerTerminal> {
+    return this.request(
+      `/v1/runs/${encodeURIComponent(sessionId)}/terminal-multiplexer/terminals`,
+      MultiplexerTerminalSchema,
+      { method: 'POST' },
+    );
+  }
+
+  async closeSessionTerminal(sessionId: string, terminalId: string): Promise<void> {
+    await this.request(
+      `/v1/runs/${encodeURIComponent(sessionId)}/terminal-multiplexer/terminals/${encodeURIComponent(terminalId)}`,
+      EmptyResponseSchema,
+      { method: 'DELETE' },
+    );
+  }
+
+  async openSessionTerminalSocket(sessionId: string, terminalId: string): Promise<WebSocket> {
+    if (!this.webSocketFactory) throw new Error('WebSocket is not available in this environment');
+    const ticket = await this.websocketTicket();
+    const path = `/v1/runs/${encodeURIComponent(sessionId)}/terminal-multiplexer/terminals/${encodeURIComponent(terminalId)}/socket`;
+    return new this.webSocketFactory(this.websocketUrl(path, new URLSearchParams(), ticket));
   }
 
   createTerminalSession(request: CreateTerminalSessionRequest): Promise<TerminalSessionResponse> {
@@ -620,40 +702,41 @@ export class SupervisorClient {
   private async request<T>(
     path: string,
     schema: RuntimeSchema<T>,
-    init: RequestInit = {},
+    init: RequestInit & { requestTimeoutMs?: number } = {},
   ): Promise<T> {
-    const method = (init.method ?? 'GET').toUpperCase();
+    const { requestTimeoutMs = this.requestTimeoutMs, ...fetchInit } = init;
+    const method = (fetchInit.method ?? 'GET').toUpperCase();
     const attempts = method === 'GET' || method === 'HEAD' ? this.maxRequestAttempts : 1;
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const controller = new AbortController();
       const timeout = globalThis.setTimeout(
         () => controller.abort(new DOMException('Supervisor request timed out', 'TimeoutError')),
-        this.requestTimeoutMs,
+        requestTimeoutMs,
       );
-      const abort = () => controller.abort(init.signal?.reason);
-      init.signal?.addEventListener('abort', abort, { once: true });
-      if (init.signal?.aborted) abort();
+      const abort = () => controller.abort(fetchInit.signal?.reason);
+      fetchInit.signal?.addEventListener('abort', abort, { once: true });
+      if (fetchInit.signal?.aborted) abort();
       try {
         let response: Response;
         try {
           response = await this.fetcher(`${this.baseUrl}${path}`, {
-            ...init,
+            ...fetchInit,
             signal: controller.signal,
             headers: {
               ...this.headers('application/json'),
-              ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-              ...init.headers,
+              ...(fetchInit.body ? { 'Content-Type': 'application/json' } : {}),
+              ...fetchInit.headers,
             },
           });
         } catch (reason) {
           if (
             attempt + 1 < attempts &&
-            !init.signal?.aborted &&
+            !fetchInit.signal?.aborted &&
             !controller.signal.aborted &&
             isRetryableReadFailure(reason)
           ) {
-            await delayWithSignal(requestRetryDelay(attempt), init.signal ?? undefined);
+            await delayWithSignal(requestRetryDelay(attempt), fetchInit.signal ?? undefined);
             continue;
           }
           throw reason;
@@ -662,15 +745,16 @@ export class SupervisorClient {
         if (!response.ok) {
           const error = await responseError(response);
           if (attempt + 1 < attempts && isRetryableReadStatus(response.status)) {
-            await delayWithSignal(requestRetryDelay(attempt), init.signal ?? undefined);
+            await delayWithSignal(requestRetryDelay(attempt), fetchInit.signal ?? undefined);
             continue;
           }
           throw error;
         }
+        if (response.status === 204) return schema.parse({});
         return schema.parse(await response.json());
       } finally {
         globalThis.clearTimeout(timeout);
-        init.signal?.removeEventListener('abort', abort);
+        fetchInit.signal?.removeEventListener('abort', abort);
       }
     }
 

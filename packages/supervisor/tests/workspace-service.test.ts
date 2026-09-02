@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   createId,
   createMigrationDatabase,
@@ -9,7 +9,7 @@ import {
   migrateToLatest,
   nowIso,
 } from '@nextflow/database';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ProjectService } from '../project-service';
 import { WorkspaceService } from '../workspace-service';
 
@@ -89,6 +89,30 @@ async function insertRun(value: Awaited<ReturnType<typeof context>>) {
 }
 
 describe('WorkspaceService', () => {
+  it('bridges extension confirmations through the run inbox', async () => {
+    const value = await context();
+    try {
+      const runId = await insertRun(value);
+      const response = value.service.extensionUI(runId).request({
+        kind: 'approval',
+        title: 'Expensive model consent',
+        body: 'Send this prompt?',
+        options: ['Confirm', 'Cancel'],
+      });
+      await vi.waitFor(async () => {
+        expect(await value.service.listInbox()).toHaveLength(1);
+      });
+      const [request] = await value.service.listInbox();
+      if (!request) throw new Error('Expected an inbox request');
+
+      await value.service.resolveInbox(request.id, 'Confirm');
+
+      await expect(response).resolves.toBe('Confirm');
+    } finally {
+      await value.close();
+    }
+  });
+
   it('returns nested attention-ordered fleet state and bounded search', async () => {
     const value = await context();
     try {

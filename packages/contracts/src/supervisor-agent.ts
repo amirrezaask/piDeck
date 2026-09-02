@@ -293,6 +293,21 @@ export const ManagedAgentEventsResponseSchema = z.object({
 });
 export type ManagedAgentEventsResponse = z.infer<typeof ManagedAgentEventsResponseSchema>;
 
+export const RunDebugLogResponseSchema = z.object({
+  runId: IdSchema,
+  sessionId: z.string().min(1).nullable(),
+  sessionFile: z.string().nullable(),
+  available: z.boolean(),
+  unavailableReason: z.string().nullable(),
+  content: z.string(),
+  bytesRead: z.number().int().nonnegative(),
+  fileSize: z.number().int().nonnegative().nullable(),
+  truncated: z.boolean(),
+  diagnostics: z.array(z.string()),
+  supervisorEvents: z.array(ManagedAgentEventSchema),
+});
+export type RunDebugLogResponse = z.infer<typeof RunDebugLogResponseSchema>;
+
 export const ManagedAgentCommandTypeSchema = z.enum([
   'create',
   'prompt',

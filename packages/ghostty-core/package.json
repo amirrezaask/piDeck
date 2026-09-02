@@ -1,0 +1,11 @@
+{
+  "name": "@pideck/ghostty-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./loaders/browser": "./src/loaders/browser.ts",
+    "./loaders/node": "./src/loaders/node.ts"
+  }
+}

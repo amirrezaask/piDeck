@@ -20,6 +20,7 @@ import {
   BookOpenIcon,
   BotIcon,
   BrainIcon,
+  BugIcon,
   CheckCircle2Icon,
   ChevronDownIcon,
   ChevronRightIcon,
@@ -57,6 +58,8 @@ import {
   type ChangeEvent,
   type DragEvent,
   type FormEvent,
+  lazy,
+  Suspense,
   type SVGProps,
   useCallback,
   useEffect,
@@ -67,12 +70,7 @@ import {
 
 import { ComposerInput } from '@/components/composer-input';
 import { MarkdownContent } from '@/components/markdown-content';
-import {
-  ChangesPanel,
-  CommandPalette,
-  type ServerOperationsClient,
-  TerminalPanel,
-} from '@/components/operations';
+import { CommandPalette, type ServerOperationsClient } from '@/components/operations';
 import {
   Accordion,
   AccordionContent,
@@ -130,6 +128,26 @@ import {
   FieldSet,
 } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@/components/ui/resizable';
+
+const ChangesPanel = lazy(() =>
+  import('@/components/changes-panel').then(({ ChangesPanel: Component }) => ({
+    default: Component,
+  })),
+);
+
+const DebugPanel = lazy(() =>
+  import('@/components/debug-panel').then(({ DebugPanel: Component }) => ({
+    default: Component,
+  })),
+);
+
+const GhosttyMultiplexer = lazy(() =>
+  import('@pideck/terminal-multiplexer/client').then(({ GhosttyMultiplexer: Component }) => ({
+    default: Component,
+  })),
+);
+
 import { Marker, MarkerContent } from '@/components/ui/marker';
 import { Message, MessageContent, MessageFooter, MessageHeader } from '@/components/ui/message';
 import {
@@ -237,6 +255,8 @@ const THEME_STORAGE_KEY = 'pideck-theme';
 const LAYOUT_STORAGE_KEY = 'pideck-layout';
 const SIDEBAR_STORAGE_KEY = 'pideck-sidebar-collapsed';
 const ARCHIVED_RUNS_STORAGE_KEY = 'pideck-archived-runs';
+const CHANGES_PANEL_SIZE_STORAGE_KEY = 'pideck-changes-panel-size';
+const TERMINAL_PANEL_SIZE_STORAGE_KEY = 'pideck-terminal-panel-size';
 const RUN_ATTACHMENT_CACHE_LIMIT = 24;
 const LATEST_TRANSCRIPT_PAGE_SIZE = 500;
 const MAX_COMPOSER_CHARACTERS = 1_000_000;
@@ -543,9 +563,14 @@ export type SupervisorClientApi = Pick<
   | 'followUpRun'
   | 'getFleet'
   | 'getRunChanges'
+  | 'getRunDebugLog'
   | 'createWorktree'
   | 'listWorktrees'
   | 'releaseWorktree'
+  | 'listSessionTerminals'
+  | 'createSessionTerminal'
+  | 'closeSessionTerminal'
+  | 'openSessionTerminalSocket'
   | 'createTerminalSession'
   | 'listTerminalSessions'
   | 'getTerminalSession'
@@ -725,6 +750,18 @@ export default function App({
       })),
     [snapshots],
   );
+  const globalInboxRequest = useMemo(() => {
+    for (const [key, items] of Object.entries(inboxBySession)) {
+      if (key === selectedSessionKey || items.length === 0) continue;
+      const session = sessions.find(
+        (candidate) => sessionKey(candidate.serverId, candidate.run.id) === key,
+      );
+      const request = items[0];
+      const requestClient = session ? snapshots[session.serverId]?.client : undefined;
+      if (request && requestClient) return { key, request, client: requestClient };
+    }
+    return undefined;
+  }, [inboxBySession, selectedSessionKey, sessions, snapshots]);
   const workspaceTabValue =
     activeServerId && selectedRunId ? sessionKey(activeServerId, selectedRunId) : 'new';
 
@@ -2234,6 +2271,17 @@ export default function App({
               </TabsContent>
             </Tabs>
 
+            {globalInboxRequest ? (
+              <ExtensionRequestDialog
+                key={globalInboxRequest.request.id}
+                request={globalInboxRequest.request}
+                client={globalInboxRequest.client}
+                onHandled={() =>
+                  handleInboxItem(globalInboxRequest.key, globalInboxRequest.request.id)
+                }
+              />
+            ) : null}
+
             <CommandPalette
               open={paletteOpen}
               onOpenChange={setPaletteOpen}
@@ -2285,6 +2333,116 @@ export default function App({
         </LayoutGroup>
       </MotionConfig>
     </TooltipProvider>
+  );
+}
+
+function ExtensionRequestDialog({
+  request,
+  client,
+  onHandled,
+}: {
+  request: InboxItemResponse;
+  client: Pick<SupervisorClientApi, 'resolveInbox' | 'cancelInbox'>;
+  onHandled(): void;
+}) {
+  const [response, setResponse] = useState('');
+  const [error, setError] = useState<string>();
+  const [submitting, setSubmitting] = useState(false);
+
+  async function resolve(value: string) {
+    if (!value.trim() || submitting) return;
+    setSubmitting(true);
+    setError(undefined);
+    try {
+      await client.resolveInbox(request.id, value.trim());
+      onHandled();
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setSubmitting(false);
+    }
+  }
+
+  async function cancel() {
+    if (submitting) return;
+    setSubmitting(true);
+    setError(undefined);
+    try {
+      await client.cancelInbox(request.id);
+      onHandled();
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Dialog open>
+      <DialogContent
+        className="max-w-md"
+        showCloseButton={false}
+        onEscapeKeyDown={(event) => event.preventDefault()}
+        onPointerDownOutside={(event) => event.preventDefault()}
+      >
+        <DialogHeader>
+          <DialogTitle>{request.title}</DialogTitle>
+          <DialogDescription className="whitespace-pre-wrap leading-5">
+            {request.body || 'PI needs your response before it can continue.'}
+          </DialogDescription>
+        </DialogHeader>
+        {error ? (
+          <p className="text-sm text-destructive" role="alert">
+            {error}
+          </p>
+        ) : null}
+        {request.options.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {request.options.map((option) => (
+              <Button
+                key={option}
+                type="button"
+                variant={option.toLowerCase() === 'cancel' ? 'outline' : 'default'}
+                disabled={submitting}
+                onClick={() => void resolve(option)}
+              >
+                {option}
+              </Button>
+            ))}
+          </div>
+        ) : (
+          <div className="flex gap-2">
+            <Input
+              value={response}
+              onChange={(event) => setResponse(event.target.value)}
+              placeholder="Type your response"
+              aria-label={`Response to ${request.title}`}
+              disabled={submitting}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void resolve(response);
+              }}
+            />
+            <Button
+              type="button"
+              disabled={submitting || !response.trim()}
+              onClick={() => void resolve(response)}
+            >
+              Submit
+            </Button>
+          </div>
+        )}
+        {request.options.some((option) => option.toLowerCase() === 'cancel') ? null : (
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={submitting}
+              onClick={() => void cancel()}
+            >
+              Cancel request
+            </Button>
+          </DialogFooter>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -3644,6 +3802,7 @@ function Conversation({
   onSteer(message: string, attachments?: AgentImageAttachment[]): Promise<void>;
   onSendMessage(message: string, attachments?: AgentImageAttachment[]): Promise<void>;
 }) {
+  const reducedMotion = useReducedMotion();
   const [message, setMessage, clearMessageDraft] = useComposerDraft(`run:${run.id}`);
   const [deliveryMode, setDeliveryMode] = useState<'follow-up' | 'steer'>('follow-up');
   const [inboxResponse, setInboxResponse] = useState('');
@@ -3652,7 +3811,34 @@ function Conversation({
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [dragActive, setDragActive] = useState(false);
-  const [inspector, setInspector] = useState<'changes' | 'terminal'>();
+  const [inspector, setInspector] = useState<'changes' | 'debug'>();
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const changesOpen = inspector === 'changes';
+  const debugOpen = inspector === 'debug';
+  const [changesPanelSize, setChangesPanelSize] = useState(() => {
+    const storedValue = window.localStorage.getItem(CHANGES_PANEL_SIZE_STORAGE_KEY);
+    if (storedValue === null) return 42;
+    const stored = Number(storedValue);
+    return Number.isFinite(stored) ? Math.max(20, Math.min(70, stored)) : 42;
+  });
+  const [terminalPanelSize, setTerminalPanelSize] = useState(() => {
+    const storedValue = window.localStorage.getItem(TERMINAL_PANEL_SIZE_STORAGE_KEY);
+    if (storedValue === null) return 40;
+    const stored = Number(storedValue);
+    return Number.isFinite(stored) ? Math.max(20, Math.min(70, stored)) : 40;
+  });
+  const changesLayout = useMemo(
+    () =>
+      inspector
+        ? { workspace: 100 - changesPanelSize, changes: changesPanelSize }
+        : { workspace: 100 },
+    [inspector, changesPanelSize],
+  );
+  const terminalLayout = useMemo(
+    () =>
+      terminalOpen ? { chat: 100 - terminalPanelSize, terminal: terminalPanelSize } : { chat: 100 },
+    [terminalOpen, terminalPanelSize],
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const transcriptViewportRef = useRef<HTMLDivElement>(null);
   const dragDepthRef = useRef(0);
@@ -3880,8 +4066,9 @@ function Conversation({
             type="button"
             variant="ghost"
             size="sm"
-            aria-label="Open changes"
-            onClick={() => setInspector('changes')}
+            aria-label={changesOpen ? 'Close changes' : 'Open changes'}
+            aria-pressed={changesOpen}
+            onClick={() => setInspector(changesOpen ? undefined : 'changes')}
           >
             <FileDiffIcon />
             <span className="hidden lg:inline">Changes</span>
@@ -3890,8 +4077,20 @@ function Conversation({
             type="button"
             variant="ghost"
             size="sm"
-            aria-label="Open terminal"
-            onClick={() => setInspector('terminal')}
+            aria-label={debugOpen ? 'Close debug log' : 'Open debug log'}
+            aria-pressed={debugOpen}
+            onClick={() => setInspector(debugOpen ? undefined : 'debug')}
+          >
+            <BugIcon />
+            <span className="hidden lg:inline">Debug</span>
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label={terminalOpen ? 'Close terminal' : 'Open terminal'}
+            aria-pressed={terminalOpen}
+            onClick={() => setTerminalOpen((open) => !open)}
           >
             <SquareTerminalIcon />
             <span className="hidden lg:inline">Terminal</span>
@@ -3936,383 +4135,512 @@ function Conversation({
           </AnimatePresence>
         </motion.div>
       </motion.header>
-      <Dialog
-        open={inspector !== undefined}
-        onOpenChange={(open) => {
-          if (!open) setInspector(undefined);
+      <ResizablePanelGroup
+        orientation="horizontal"
+        className="min-h-0 flex-1"
+        defaultLayout={changesLayout}
+        onLayoutChanged={(layout, meta) => {
+          if (!meta.isUserInteraction || !inspector) return;
+          const nextSize = layout.changes;
+          if (nextSize === undefined) return;
+          setChangesPanelSize(nextSize);
+          window.localStorage.setItem(CHANGES_PANEL_SIZE_STORAGE_KEY, String(nextSize));
         }}
       >
-        <DialogContent className="flex h-[min(48rem,calc(100svh-2rem))] max-w-[min(72rem,calc(100vw-2rem))] flex-col overflow-hidden p-0 sm:max-w-[min(72rem,calc(100vw-2rem))]">
-          <DialogHeader className="border-b px-5 py-4">
-            <DialogTitle>
-              {inspector === 'changes' ? 'Workspace changes' : 'Terminal session'}
-            </DialogTitle>
-            <DialogDescription>
-              {inspector === 'changes'
-                ? 'Diffs are read from the run workspace by the supervisor.'
-                : 'Commands run as bounded argv processes inside the managed workspace.'}
-            </DialogDescription>
-          </DialogHeader>
-          {inspector === 'changes' ? (
-            <ChangesPanel client={client} runId={run.id} />
-          ) : (
-            <TerminalPanel client={client} cwd={run.cwd} />
-          )}
-        </DialogContent>
-      </Dialog>
-      <AnimatePresence>
-        {dragActive ? (
-          <motion.div
-            className="pointer-events-none absolute inset-x-3 top-15 bottom-3 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary bg-background/90 px-6 text-center shadow-lg"
-            role="status"
-            initial={{ opacity: 0, scale: 0.98 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.98 }}
+        <ResizablePanel id="workspace" minSize="25" className="min-h-0 min-w-0">
+          <ResizablePanelGroup
+            orientation="vertical"
+            className="min-h-0"
+            defaultLayout={terminalLayout}
+            onLayoutChanged={(layout, meta) => {
+              if (!meta.isUserInteraction || !terminalOpen) return;
+              const nextSize = layout.terminal;
+              if (nextSize === undefined) return;
+              setTerminalPanelSize(nextSize);
+              window.localStorage.setItem(TERMINAL_PANEL_SIZE_STORAGE_KEY, String(nextSize));
+            }}
           >
-            <div>
-              <p className="font-medium">Drop images to attach</p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                PNG, JPEG, GIF, or WebP · up to 4 images, 6 MB each
-              </p>
-            </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
-      <MessageScrollerProvider autoScroll defaultScrollPosition="end">
-        <MessageScroller className="flex-1">
-          <MessageScrollerViewport
-            ref={transcriptViewportRef}
-            aria-label={`${agent?.name ?? 'Agent'} conversation`}
-          >
-            <MessageScrollerContent className="mx-auto w-[calc(100vw-2.5rem)] max-w-4xl px-5 py-8 md:w-full md:px-8">
-              {hasOlderEvents ? (
-                <MessageScrollerItem messageId="load-older-transcript">
-                  <div className="flex justify-center">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      onClick={loadOlderTranscript}
-                      disabled={loadingOlderEvents}
-                    >
-                      {loadingOlderEvents ? 'Loading older activity…' : 'Load older activity'}
-                    </Button>
-                  </div>
-                </MessageScrollerItem>
-              ) : null}
-              <MessageScrollerItem messageId={`prompt-${run.id}`} scrollAnchor>
-                <motion.div
-                  layout="position"
-                  initial={{ opacity: 0, y: 14, scale: 0.98 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                >
-                  <Message align="end">
-                    <MessageContent>
-                      <MessageHeader>You</MessageHeader>
-                      <Bubble align="end">
-                        <BubbleContent>
-                          <MarkdownContent content={run.prompt} />
-                        </BubbleContent>
-                      </Bubble>
-                      <PromptAttachments attachments={promptAttachments} />
-                      <MessageFooter>{formatTime(run.createdAt)}</MessageFooter>
-                    </MessageContent>
-                  </Message>
-                </motion.div>
-              </MessageScrollerItem>
-              <MessageScrollerItem messageId="event-stream">
-                <motion.div
-                  layout="position"
-                  initial={{ opacity: 0, scaleX: 0.94 }}
-                  animate={{ opacity: 1, scaleX: 1 }}
-                  transition={{
-                    duration: 0.18,
-                    delay: 0.06,
-                    ease: [0.22, 1, 0.36, 1],
-                  }}
-                >
-                  <Marker variant="separator">
-                    <MarkerContent>Activity</MarkerContent>
-                  </Marker>
-                </motion.div>
-              </MessageScrollerItem>
-              {transcript.map((item, index) => (
-                <TranscriptRow key={item.id} item={item} index={index} />
-              ))}
-              <AnimatePresence initial={false}>
-                {runIsActive && transcript.length === 0 ? (
-                  <MessageScrollerItem key="waiting" messageId="waiting">
+            <ResizablePanel id="chat" minSize="25" className="min-h-0">
+              <div className="relative flex h-full min-h-0 flex-col">
+                <AnimatePresence>
+                  {dragActive ? (
                     <motion.div
-                      initial={{ opacity: 0, y: 8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -6 }}
-                      transition={{ duration: 0.14 }}
+                      className="pointer-events-none absolute inset-x-3 top-15 bottom-3 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary bg-background/90 px-6 text-center shadow-lg"
+                      role="status"
+                      initial={{ opacity: 0, scale: 0.98 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.98 }}
                     >
-                      <Marker variant="separator">
-                        <MarkerContent>Waiting for PI…</MarkerContent>
-                      </Marker>
+                      <div>
+                        <p className="font-medium">Drop images to attach</p>
+                        <p className="mt-1 text-sm text-muted-foreground">
+                          PNG, JPEG, GIF, or WebP · up to 4 images, 6 MB each
+                        </p>
+                      </div>
                     </motion.div>
-                  </MessageScrollerItem>
-                ) : null}
-              </AnimatePresence>
-            </MessageScrollerContent>
-          </MessageScrollerViewport>
-          <MessageScrollerButton />
-        </MessageScroller>
-        {canChat ? (
-          <motion.form
-            aria-label="Chat with agent"
-            className="bg-background px-3 pb-3 pt-2 md:px-6 md:pb-4"
-            onSubmit={submitMessage}
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.18 }}
-          >
-            <div className="mx-auto flex max-w-4xl flex-col gap-2">
-              {attachmentError ? (
-                <p role="alert" className="text-xs text-destructive">
-                  {attachmentError}
-                </p>
-              ) : null}
-              {attachments.length > 0 ? (
-                <AttachmentGroup aria-label="Attached files">
-                  {attachments.map((attachment) => {
-                    const isImage = attachment.file.type.startsWith('image/');
-                    if (isImage && attachment.previewUrl) {
-                      return (
-                        <ImageAttachmentCard
-                          key={attachment.id}
-                          name={attachment.file.name}
-                          src={attachment.previewUrl}
-                          description={`${attachmentTypeLabel(attachment.file)} · ${formatFileSize(attachment.file.size)} · Ready to send`}
-                          state="idle"
-                          onRemove={() => removeAttachment(attachment.id)}
-                        />
-                      );
-                    }
-
-                    return (
-                      <Attachment
-                        key={attachment.id}
-                        state="idle"
-                        size="sm"
-                        orientation={isImage ? 'vertical' : 'horizontal'}
-                      >
-                        <AttachmentMedia variant={isImage ? 'image' : 'icon'}>
-                          {isImage ? (
-                            <ImageIcon aria-hidden="true" />
-                          ) : (
-                            attachmentIcon(attachment.file)
-                          )}
-                        </AttachmentMedia>
-                        <AttachmentContent>
-                          <AttachmentTitle>{attachment.file.name}</AttachmentTitle>
-                          <AttachmentDescription>
-                            {attachmentTypeLabel(attachment.file)} {'·'}
-                            {formatFileSize(attachment.file.size)} {'·'} Ready to send
-                          </AttachmentDescription>
-                        </AttachmentContent>
-                        <AttachmentActions>
-                          <AttachmentAction
-                            type="button"
-                            aria-label={`Remove ${attachment.file.name}`}
-                            onClick={() => removeAttachment(attachment.id)}
-                          >
-                            <XIcon />
-                          </AttachmentAction>
-                        </AttachmentActions>
-                      </Attachment>
-                    );
-                  })}
-                </AttachmentGroup>
-              ) : null}
-              <div className="overflow-hidden rounded-[1.75rem] border border-border/70 bg-card transition-colors focus-within:border-foreground/25">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  accept={IMAGE_INPUT_ACCEPT}
-                  className="sr-only"
-                  aria-label="Images to attach"
-                  onChange={handleFileInput}
-                  tabIndex={-1}
-                />
-                {activeInboxItem ? (
-                  <section className="border-b border-border/60 px-5 py-4" aria-live="polite">
-                    <div className="flex items-start gap-3">
-                      <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
-                        <InboxIcon className="size-3.5" aria-hidden="true" />
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="text-sm font-semibold">{activeInboxItem.title}</p>
-                          <Badge variant="outline">
-                            {inboxItems.length > 1
-                              ? `1 of ${inboxItems.length}`
-                              : activeInboxItem.kind}
-                          </Badge>
-                        </div>
-                        {activeInboxItem.body ? (
-                          <p className="mt-1.5 whitespace-pre-wrap text-sm leading-5 text-muted-foreground">
-                            {activeInboxItem.body}
-                          </p>
-                        ) : null}
-                        {inboxError ? (
-                          <p role="alert" className="mt-2 text-xs text-destructive">
-                            {inboxError}
-                          </p>
-                        ) : null}
-                        <div className="mt-3 flex flex-wrap items-center gap-2">
-                          {(activeInboxItem.options.length > 0
-                            ? activeInboxItem.options
-                            : activeInboxItem.kind === 'approval'
-                              ? ['Approve', 'Reject']
-                              : []
-                          ).map((option) => (
-                            <Button
-                              key={option}
-                              type="button"
-                              size="sm"
-                              variant={
-                                option.toLowerCase() === 'reject' ? 'destructive' : 'outline'
-                              }
-                              disabled={respondingToInbox}
-                              onClick={() => void respondToInbox(option)}
-                            >
-                              {option}
-                            </Button>
-                          ))}
-                          {activeInboxItem.kind === 'question' &&
-                          activeInboxItem.options.length === 0 ? (
-                            <>
-                              <Input
-                                aria-label={`Answer ${activeInboxItem.title}`}
-                                value={inboxResponse}
-                                onChange={(event) => setInboxResponse(event.target.value)}
-                                className="min-w-52 flex-1"
-                                placeholder="Type your answer"
-                              />
+                  ) : null}
+                </AnimatePresence>
+                <MessageScrollerProvider autoScroll defaultScrollPosition="end">
+                  <MessageScroller className="flex-1">
+                    <MessageScrollerViewport
+                      ref={transcriptViewportRef}
+                      aria-label={`${agent?.name ?? 'Agent'} conversation`}
+                    >
+                      <MessageScrollerContent className="mx-auto w-[calc(100vw-2.5rem)] max-w-4xl px-5 py-8 md:w-full md:px-8">
+                        {hasOlderEvents ? (
+                          <MessageScrollerItem messageId="load-older-transcript">
+                            <div className="flex justify-center">
                               <Button
                                 type="button"
+                                variant="ghost"
                                 size="sm"
-                                disabled={respondingToInbox || !inboxResponse.trim()}
-                                onClick={() => void respondToInbox(inboxResponse)}
+                                onClick={loadOlderTranscript}
+                                disabled={loadingOlderEvents}
                               >
-                                Answer
+                                {loadingOlderEvents
+                                  ? 'Loading older activity…'
+                                  : 'Load older activity'}
                               </Button>
-                            </>
-                          ) : null}
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            disabled={respondingToInbox}
-                            onClick={() => void cancelInboxItem()}
+                            </div>
+                          </MessageScrollerItem>
+                        ) : null}
+                        <MessageScrollerItem messageId={`prompt-${run.id}`} scrollAnchor>
+                          <motion.div
+                            layout="position"
+                            initial={{ opacity: 0, y: 14, scale: 0.98 }}
+                            animate={{ opacity: 1, y: 0, scale: 1 }}
+                            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
                           >
-                            Cancel request
-                          </Button>
+                            <Message align="end">
+                              <MessageContent>
+                                <MessageHeader>You</MessageHeader>
+                                <Bubble align="end">
+                                  <BubbleContent>
+                                    <MarkdownContent content={run.prompt} />
+                                  </BubbleContent>
+                                </Bubble>
+                                <PromptAttachments attachments={promptAttachments} />
+                                <MessageFooter>{formatTime(run.createdAt)}</MessageFooter>
+                              </MessageContent>
+                            </Message>
+                          </motion.div>
+                        </MessageScrollerItem>
+                        <MessageScrollerItem messageId="event-stream">
+                          <motion.div
+                            layout="position"
+                            initial={{ opacity: 0, scaleX: 0.94 }}
+                            animate={{ opacity: 1, scaleX: 1 }}
+                            transition={{
+                              duration: 0.18,
+                              delay: 0.06,
+                              ease: [0.22, 1, 0.36, 1],
+                            }}
+                          >
+                            <Marker variant="separator">
+                              <MarkerContent>Activity</MarkerContent>
+                            </Marker>
+                          </motion.div>
+                        </MessageScrollerItem>
+                        {transcript.map((item, index) => (
+                          <TranscriptRow key={item.id} item={item} index={index} />
+                        ))}
+                        <AnimatePresence initial={false}>
+                          {runIsActive && transcript.length === 0 ? (
+                            <MessageScrollerItem key="waiting" messageId="waiting">
+                              <motion.div
+                                initial={{ opacity: 0, y: 8 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, y: -6 }}
+                                transition={{ duration: 0.14 }}
+                              >
+                                <Marker variant="separator">
+                                  <MarkerContent>Waiting for PI…</MarkerContent>
+                                </Marker>
+                              </motion.div>
+                            </MessageScrollerItem>
+                          ) : null}
+                        </AnimatePresence>
+                      </MessageScrollerContent>
+                    </MessageScrollerViewport>
+                    <MessageScrollerButton />
+                  </MessageScroller>
+                  {canChat ? (
+                    <motion.form
+                      aria-label="Chat with agent"
+                      className="bg-background px-3 pb-3 pt-2 md:px-6 md:pb-4"
+                      onSubmit={submitMessage}
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.18 }}
+                    >
+                      <div className="mx-auto flex max-w-4xl flex-col gap-2">
+                        {attachmentError ? (
+                          <p role="alert" className="text-xs text-destructive">
+                            {attachmentError}
+                          </p>
+                        ) : null}
+                        {attachments.length > 0 ? (
+                          <AttachmentGroup aria-label="Attached files">
+                            {attachments.map((attachment) => {
+                              const isImage = attachment.file.type.startsWith('image/');
+                              if (isImage && attachment.previewUrl) {
+                                return (
+                                  <ImageAttachmentCard
+                                    key={attachment.id}
+                                    name={attachment.file.name}
+                                    src={attachment.previewUrl}
+                                    description={`${attachmentTypeLabel(attachment.file)} · ${formatFileSize(attachment.file.size)} · Ready to send`}
+                                    state="idle"
+                                    onRemove={() => removeAttachment(attachment.id)}
+                                  />
+                                );
+                              }
+
+                              return (
+                                <Attachment
+                                  key={attachment.id}
+                                  state="idle"
+                                  size="sm"
+                                  orientation={isImage ? 'vertical' : 'horizontal'}
+                                >
+                                  <AttachmentMedia variant={isImage ? 'image' : 'icon'}>
+                                    {isImage ? (
+                                      <ImageIcon aria-hidden="true" />
+                                    ) : (
+                                      attachmentIcon(attachment.file)
+                                    )}
+                                  </AttachmentMedia>
+                                  <AttachmentContent>
+                                    <AttachmentTitle>{attachment.file.name}</AttachmentTitle>
+                                    <AttachmentDescription>
+                                      {attachmentTypeLabel(attachment.file)} {'·'}
+                                      {formatFileSize(attachment.file.size)} {'·'} Ready to send
+                                    </AttachmentDescription>
+                                  </AttachmentContent>
+                                  <AttachmentActions>
+                                    <AttachmentAction
+                                      type="button"
+                                      aria-label={`Remove ${attachment.file.name}`}
+                                      onClick={() => removeAttachment(attachment.id)}
+                                    >
+                                      <XIcon />
+                                    </AttachmentAction>
+                                  </AttachmentActions>
+                                </Attachment>
+                              );
+                            })}
+                          </AttachmentGroup>
+                        ) : null}
+                        <div className="overflow-hidden rounded-[1.75rem] border border-border/70 bg-card transition-colors focus-within:border-foreground/25">
+                          <input
+                            ref={fileInputRef}
+                            type="file"
+                            multiple
+                            accept={IMAGE_INPUT_ACCEPT}
+                            className="sr-only"
+                            aria-label="Images to attach"
+                            onChange={handleFileInput}
+                            tabIndex={-1}
+                          />
+                          {activeInboxItem ? (
+                            <section
+                              className="border-b border-border/60 px-5 py-4"
+                              aria-live="polite"
+                            >
+                              <div className="flex items-start gap-3">
+                                <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
+                                  <InboxIcon className="size-3.5" aria-hidden="true" />
+                                </span>
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <p className="text-sm font-semibold">{activeInboxItem.title}</p>
+                                    <Badge variant="outline">
+                                      {inboxItems.length > 1
+                                        ? `1 of ${inboxItems.length}`
+                                        : activeInboxItem.kind}
+                                    </Badge>
+                                  </div>
+                                  {activeInboxItem.body ? (
+                                    <p className="mt-1.5 whitespace-pre-wrap text-sm leading-5 text-muted-foreground">
+                                      {activeInboxItem.body}
+                                    </p>
+                                  ) : null}
+                                  {inboxError ? (
+                                    <p role="alert" className="mt-2 text-xs text-destructive">
+                                      {inboxError}
+                                    </p>
+                                  ) : null}
+                                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                                    {(activeInboxItem.options.length > 0
+                                      ? activeInboxItem.options
+                                      : activeInboxItem.kind === 'approval'
+                                        ? ['Approve', 'Reject']
+                                        : []
+                                    ).map((option) => (
+                                      <Button
+                                        key={option}
+                                        type="button"
+                                        size="sm"
+                                        variant={
+                                          option.toLowerCase() === 'reject'
+                                            ? 'destructive'
+                                            : 'outline'
+                                        }
+                                        disabled={respondingToInbox}
+                                        onClick={() => void respondToInbox(option)}
+                                      >
+                                        {option}
+                                      </Button>
+                                    ))}
+                                    {activeInboxItem.kind === 'question' &&
+                                    activeInboxItem.options.length === 0 ? (
+                                      <>
+                                        <Input
+                                          aria-label={`Answer ${activeInboxItem.title}`}
+                                          value={inboxResponse}
+                                          onChange={(event) => setInboxResponse(event.target.value)}
+                                          className="min-w-52 flex-1"
+                                          placeholder="Type your answer"
+                                        />
+                                        <Button
+                                          type="button"
+                                          size="sm"
+                                          disabled={respondingToInbox || !inboxResponse.trim()}
+                                          onClick={() => void respondToInbox(inboxResponse)}
+                                        >
+                                          Answer
+                                        </Button>
+                                      </>
+                                    ) : null}
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="sm"
+                                      disabled={respondingToInbox}
+                                      onClick={() => void cancelInboxItem()}
+                                    >
+                                      Cancel request
+                                    </Button>
+                                  </div>
+                                </div>
+                              </div>
+                            </section>
+                          ) : null}
+                          <ComposerInput
+                            ariaLabel="Message agent"
+                            value={message}
+                            onChange={setMessage}
+                            cwd={run.cwd}
+                            client={client}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' && !event.shiftKey) {
+                                event.preventDefault();
+                                event.currentTarget.form?.requestSubmit();
+                              }
+                            }}
+                            placeholder={
+                              composerBlocked
+                                ? 'Resolve the request above to continue'
+                                : runIsActive && deliveryMode === 'steer'
+                                  ? 'Steer the active run at the next safe point'
+                                  : 'Ask for follow-up changes or attach images'
+                            }
+                            disabled={submitting || composerBlocked}
+                            rows={1}
+                            maxLength={MAX_COMPOSER_CHARACTERS}
+                            placement="top"
+                            className="max-h-48 min-h-24 resize-none rounded-none border-0 bg-transparent px-5 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-28"
+                          />
+                          <div className="flex min-w-0 items-center gap-1 px-4 pb-4 md:px-5">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label="Attach images"
+                              title="Attach images"
+                              onClick={() => fileInputRef.current?.click()}
+                              disabled={submitting || composerBlocked}
+                              className="rounded-full"
+                            >
+                              <PaperclipIcon />
+                            </Button>
+                            <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
+                              <span className="hidden shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground sm:flex">
+                                <ModelLogo provider={modelProvider(run.model)} />
+                                <span>{modelDisplayName(run.model, models)}</span>
+                              </span>
+                              <Separator
+                                orientation="vertical"
+                                className="hidden h-5 shrink-0 sm:block"
+                              />
+                              <span className="hidden shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground sm:flex">
+                                <BrainIcon className="size-4" aria-hidden="true" />
+                                {titleCase(run.thinkingLevel ?? 'default')}
+                              </span>
+                              <Separator
+                                orientation="vertical"
+                                className="hidden h-5 shrink-0 sm:block"
+                              />
+                              {runIsActive ? (
+                                <Select
+                                  value={deliveryMode}
+                                  onValueChange={(value) =>
+                                    setDeliveryMode(value as 'follow-up' | 'steer')
+                                  }
+                                >
+                                  <SelectTrigger
+                                    aria-label="Message delivery"
+                                    size="sm"
+                                    className="shrink-0 border-0 bg-transparent shadow-none"
+                                  >
+                                    {deliveryMode === 'steer' ? <RouteIcon /> : <ListEndIcon />}
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectGroup>
+                                      <SelectItem value="follow-up">Queue follow-up</SelectItem>
+                                      <SelectItem value="steer">Steer now</SelectItem>
+                                    </SelectGroup>
+                                  </SelectContent>
+                                </Select>
+                              ) : (
+                                <span className="flex shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground">
+                                  <ListEndIcon className="size-4" aria-hidden="true" />
+                                  Follow-up
+                                </span>
+                              )}
+                            </div>
+                            <Button
+                              type="submit"
+                              size="icon-lg"
+                              className="ml-auto shrink-0 rounded-full"
+                              aria-label={
+                                deliveryMode === 'steer' && runIsActive
+                                  ? 'Steer run'
+                                  : 'Send follow-up'
+                              }
+                              title={
+                                deliveryMode === 'steer' && runIsActive
+                                  ? 'Steer run'
+                                  : 'Send follow-up'
+                              }
+                              disabled={
+                                submitting ||
+                                composerBlocked ||
+                                (!message.trim() && attachments.length === 0)
+                              }
+                            >
+                              <ArrowUpIcon />
+                            </Button>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </section>
-                ) : null}
-                <ComposerInput
-                  ariaLabel="Message agent"
-                  value={message}
-                  onChange={setMessage}
-                  cwd={run.cwd}
-                  client={client}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' && !event.shiftKey) {
-                      event.preventDefault();
-                      event.currentTarget.form?.requestSubmit();
-                    }
-                  }}
-                  placeholder={
-                    composerBlocked
-                      ? 'Resolve the request above to continue'
-                      : runIsActive && deliveryMode === 'steer'
-                        ? 'Steer the active run at the next safe point'
-                        : 'Ask for follow-up changes or attach images'
-                  }
-                  disabled={submitting || composerBlocked}
-                  rows={1}
-                  maxLength={MAX_COMPOSER_CHARACTERS}
-                  placement="top"
-                  className="max-h-48 min-h-24 resize-none rounded-none border-0 bg-transparent px-5 py-4 text-base leading-6 shadow-none focus-visible:ring-0 md:min-h-28"
-                />
-                <div className="flex min-w-0 items-center gap-1 px-4 pb-4 md:px-5">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="Attach images"
-                    title="Attach images"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={submitting || composerBlocked}
-                    className="rounded-full"
-                  >
-                    <PaperclipIcon />
-                  </Button>
-                  <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none]">
-                    <span className="hidden shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground sm:flex">
-                      <ModelLogo provider={modelProvider(run.model)} />
-                      <span>{modelDisplayName(run.model, models)}</span>
-                    </span>
-                    <Separator orientation="vertical" className="hidden h-5 shrink-0 sm:block" />
-                    <span className="hidden shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground sm:flex">
-                      <BrainIcon className="size-4" aria-hidden="true" />
-                      {titleCase(run.thinkingLevel ?? 'default')}
-                    </span>
-                    <Separator orientation="vertical" className="hidden h-5 shrink-0 sm:block" />
-                    {runIsActive ? (
-                      <Select
-                        value={deliveryMode}
-                        onValueChange={(value) => setDeliveryMode(value as 'follow-up' | 'steer')}
-                      >
-                        <SelectTrigger
-                          aria-label="Message delivery"
-                          size="sm"
-                          className="shrink-0 border-0 bg-transparent shadow-none"
-                        >
-                          {deliveryMode === 'steer' ? <RouteIcon /> : <ListEndIcon />}
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectGroup>
-                            <SelectItem value="follow-up">Queue follow-up</SelectItem>
-                            <SelectItem value="steer">Steer now</SelectItem>
-                          </SelectGroup>
-                        </SelectContent>
-                      </Select>
-                    ) : (
-                      <span className="flex shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground">
-                        <ListEndIcon className="size-4" aria-hidden="true" />
-                        Follow-up
-                      </span>
-                    )}
-                  </div>
-                  <Button
-                    type="submit"
-                    size="icon-lg"
-                    className="ml-auto shrink-0 rounded-full"
-                    aria-label={
-                      deliveryMode === 'steer' && runIsActive ? 'Steer run' : 'Send follow-up'
-                    }
-                    title={deliveryMode === 'steer' && runIsActive ? 'Steer run' : 'Send follow-up'}
-                    disabled={
-                      submitting || composerBlocked || (!message.trim() && attachments.length === 0)
-                    }
-                  >
-                    <ArrowUpIcon />
-                  </Button>
-                </div>
+                    </motion.form>
+                  ) : null}
+                </MessageScrollerProvider>
               </div>
-            </div>
-          </motion.form>
+            </ResizablePanel>
+            {terminalOpen ? (
+              <>
+                <ResizableHandle
+                  orientation="vertical"
+                  aria-label="Resize chat and terminal"
+                  onDoubleClick={() => {
+                    setTerminalPanelSize(40);
+                    window.localStorage.setItem(TERMINAL_PANEL_SIZE_STORAGE_KEY, '40');
+                  }}
+                />
+                <ResizablePanel id="terminal" defaultSize="40" minSize="20" className="min-h-0">
+                  <motion.div
+                    role="region"
+                    aria-label="Session terminals"
+                    className="h-full min-h-0 bg-neutral-950"
+                    initial={
+                      reducedMotion
+                        ? { opacity: 0.86 }
+                        : { opacity: 0.82, y: 10, clipPath: 'inset(7% 0 0 0)' }
+                    }
+                    animate={{ opacity: 1, y: 0, clipPath: 'inset(0% 0 0 0)' }}
+                    transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+                  >
+                    <Suspense
+                      fallback={
+                        <div
+                          className="grid h-full place-items-center text-xs text-neutral-400"
+                          role="status"
+                        >
+                          Loading terminal renderer…
+                        </div>
+                      }
+                    >
+                      <GhosttyMultiplexer
+                        key={run.id}
+                        client={client}
+                        sessionId={run.id}
+                        cwd={run.cwd}
+                        onClosePanel={() => setTerminalOpen(false)}
+                      />
+                    </Suspense>
+                  </motion.div>
+                </ResizablePanel>
+              </>
+            ) : null}
+          </ResizablePanelGroup>
+        </ResizablePanel>
+        {inspector ? (
+          <>
+            <ResizableHandle
+              orientation="horizontal"
+              aria-label={`Resize workspace and ${inspector === 'changes' ? 'changes' : 'debug log'}`}
+              onDoubleClick={() => {
+                setChangesPanelSize(42);
+                window.localStorage.setItem(CHANGES_PANEL_SIZE_STORAGE_KEY, '42');
+              }}
+            />
+            <ResizablePanel id="changes" defaultSize="42" minSize="20" className="min-h-0 min-w-0">
+              <motion.div
+                key={inspector}
+                className="h-full min-h-0 overflow-hidden"
+                initial={
+                  reducedMotion
+                    ? { opacity: 0.86 }
+                    : { opacity: 0.82, x: 14, clipPath: 'inset(0 0 0 5%)' }
+                }
+                animate={{ opacity: 1, x: 0, clipPath: 'inset(0 0 0 0%)' }}
+                transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
+              >
+                <Suspense
+                  fallback={
+                    <div
+                      className="grid h-full place-items-center text-xs text-muted-foreground"
+                      role="status"
+                    >
+                      Loading {inspector} renderer…
+                    </div>
+                  }
+                >
+                  {inspector === 'changes' ? (
+                    <ChangesPanel
+                      key={run.id}
+                      client={client}
+                      runId={run.id}
+                      onClose={() => setInspector(undefined)}
+                    />
+                  ) : (
+                    <DebugPanel
+                      key={run.id}
+                      client={client}
+                      runId={run.id}
+                      runIsActive={runIsActive}
+                      onClose={() => setInspector(undefined)}
+                    />
+                  )}
+                </Suspense>
+              </motion.div>
+            </ResizablePanel>
+          </>
         ) : null}
-      </MessageScrollerProvider>
+      </ResizablePanelGroup>
     </motion.div>
   );
 }

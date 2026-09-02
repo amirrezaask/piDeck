@@ -4,7 +4,9 @@ import { dirname, relative, resolve } from 'node:path';
 import type {
   AgentSession,
   AgentSessionEvent,
+  ExtensionUIContext,
   ModelRuntime,
+  Theme,
 } from '@earendil-works/pi-coding-agent';
 import type {
   AgentModel,
@@ -45,6 +47,19 @@ export interface ManagedPiSession {
   dispose(): Promise<void>;
 }
 
+export interface PiExtensionUIRequest {
+  readonly kind: 'approval' | 'question';
+  readonly title: string;
+  readonly body: string;
+  readonly options: string[];
+  readonly timeoutMs?: number;
+}
+
+export interface PiExtensionUI {
+  request(input: PiExtensionUIRequest): Promise<string | undefined>;
+  notify(message: string, type?: 'info' | 'warning' | 'error'): void;
+}
+
 export interface CreatePiSessionOptions {
   readonly systemPrompt: string;
   readonly systemPromptMode: AgentSystemPromptMode;
@@ -52,6 +67,7 @@ export interface CreatePiSessionOptions {
   readonly tools?: AgentToolName[];
   readonly model?: AgentModel;
   readonly thinkingLevel?: AgentThinkingLevel;
+  readonly extensionUI?: PiExtensionUI;
 }
 
 export interface ResumePiSessionOptions extends CreatePiSessionOptions {
@@ -71,8 +87,22 @@ export interface SdkPiSessionFactoryOptions {
   readonly sessionDirectory?: string;
 }
 
+export class PiExtensionRequestCancelledError extends Error {
+  constructor() {
+    super('A PI extension request was declined by the operator');
+    this.name = 'PiExtensionRequestCancelledError';
+  }
+}
+
+interface ExtensionUIState {
+  cancelled: boolean;
+}
+
 class SdkManagedPiSession implements ManagedPiSession {
-  constructor(private readonly session: AgentSession) {}
+  constructor(
+    private readonly session: AgentSession,
+    private readonly extensionUIState?: ExtensionUIState,
+  ) {}
 
   get sessionId(): string {
     return this.session.sessionId;
@@ -111,7 +141,9 @@ class SdkManagedPiSession implements ManagedPiSession {
       images?: PiImageContent[];
     },
   ): Promise<void> {
+    if (this.extensionUIState) this.extensionUIState.cancelled = false;
     await this.session.prompt(prompt, options);
+    if (this.extensionUIState?.cancelled) throw new PiExtensionRequestCancelledError();
   }
 
   async steer(message: string, images?: PiImageContent[]): Promise<void> {
@@ -133,6 +165,89 @@ class SdkManagedPiSession implements ManagedPiSession {
   async dispose(): Promise<void> {
     this.session.dispose();
   }
+}
+
+const unavailableTheme = new Proxy(
+  {},
+  {
+    get() {
+      return () => '';
+    },
+  },
+) as Theme;
+
+function extensionUIContext(ui: PiExtensionUI, state: ExtensionUIState): ExtensionUIContext {
+  return {
+    select: (title, options, opts) =>
+      ui.request({
+        kind: 'question',
+        title,
+        body: title,
+        options,
+        ...(opts?.timeout === undefined ? {} : { timeoutMs: opts.timeout }),
+      }),
+    confirm: async (title, message, opts) => {
+      const confirmed =
+        (await ui.request({
+          kind: 'approval',
+          title,
+          body: message,
+          options: ['Confirm', 'Cancel'],
+          ...(opts?.timeout === undefined ? {} : { timeoutMs: opts.timeout }),
+        })) === 'Confirm';
+      if (!confirmed) state.cancelled = true;
+      return confirmed;
+    },
+    input: (title, placeholder, opts) =>
+      ui.request({
+        kind: 'question',
+        title,
+        body: placeholder ?? '',
+        options: [],
+        ...(opts?.timeout === undefined ? {} : { timeoutMs: opts.timeout }),
+      }),
+    notify: (message, type) => ui.notify(message, type),
+    onTerminalInput: () => () => undefined,
+    setStatus: () => undefined,
+    setWorkingMessage: () => undefined,
+    setWorkingVisible: () => undefined,
+    setWorkingIndicator: () => undefined,
+    setHiddenThinkingLabel: () => undefined,
+    setWidget: () => undefined,
+    setFooter: () => undefined,
+    setHeader: () => undefined,
+    setTitle: () => undefined,
+    async custom<T>(): Promise<T> {
+      throw new Error('Custom extension UI is unavailable in piDeck');
+    },
+    pasteToEditor: () => undefined,
+    setEditorText: () => undefined,
+    getEditorText: () => '',
+    editor: async () => undefined,
+    addAutocompleteProvider: () => undefined,
+    setEditorComponent: () => undefined,
+    getEditorComponent: () => undefined,
+    theme: unavailableTheme,
+    getAllThemes: () => [],
+    getTheme: () => undefined,
+    setTheme: () => ({ success: false, error: 'Theme switching is unavailable in piDeck' }),
+    getToolsExpanded: () => false,
+    setToolsExpanded: () => undefined,
+  };
+}
+
+async function bindExtensionUI(
+  session: AgentSession,
+  ui: PiExtensionUI | undefined,
+): Promise<ExtensionUIState | undefined> {
+  if (!ui) return undefined;
+  const state: ExtensionUIState = { cancelled: false };
+  await session.bindExtensions({
+    uiContext: extensionUIContext(ui, state),
+    mode: 'rpc',
+    onError: (error) => ui.notify(`${error.extensionPath}: ${error.error}`, 'error'),
+  });
+  return state;
 }
 
 function modelOption(model: { provider: string; id: string; name: string }): AgentModelOption {
@@ -216,7 +331,8 @@ export class SdkPiSessionFactory implements PiSessionFactory {
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
     });
 
-    return new SdkManagedPiSession(result.session);
+    const extensionUIState = await bindExtensionUI(result.session, options.extensionUI);
+    return new SdkManagedPiSession(result.session, extensionUIState);
   }
 
   async resume(options: ResumePiSessionOptions): Promise<ManagedPiSession> {
@@ -259,7 +375,8 @@ export class SdkPiSessionFactory implements PiSessionFactory {
       ...(options.tools?.length === 0 ? { noTools: 'all' as const } : {}),
       ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
     });
-    return new SdkManagedPiSession(result.session);
+    const extensionUIState = await bindExtensionUI(result.session, options.extensionUI);
+    return new SdkManagedPiSession(result.session, extensionUIState);
   }
 
   private getPiModule(): Promise<typeof import('@earendil-works/pi-coding-agent')> {

@@ -40,6 +40,7 @@ import {
   ManagedProjectListResponseSchema,
   ResolveInboxItemRequestSchema,
   RunChangesResponseSchema,
+  RunDebugLogResponseSchema,
   SessionSearchQuerySchema,
   SessionSearchResponseSchema,
   TerminalSessionListResponseSchema,
@@ -59,6 +60,7 @@ import {
 } from '@nextflow/database';
 import { createLogger } from '@nextflow/observability';
 import { createTestAgentFactory } from '@nextflow/test-agents';
+import { SessionTerminalMultiplexer } from '@pideck/terminal-multiplexer';
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import type { Kysely } from 'kysely';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -175,12 +177,15 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     options.piExtensionService ?? new PiExtensionService({ cwd: defaultCwd });
   const composer = new ComposerCatalog({ defaultCwd });
   const workspace = new WorkspaceService(database.db);
+  const terminalMultiplexer = new SessionTerminalMultiplexer();
   const agents = new ManagedAgentService({
     db: database.db,
     sessionFactory,
     defaultCwd,
     logger: serviceLogger,
     projectService: projects,
+    extensionUI: (runId) => workspace.extensionUI(runId),
+    cancelExtensionRequests: (runId) => workspace.cancelExtensionRequests(runId),
     ...(options.shutdownTimeoutMs === undefined
       ? {}
       : { shutdownTimeoutMs: options.shutdownTimeoutMs }),
@@ -242,11 +247,16 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     }
     const runMatch = requestUrl.pathname.match(/^\/v1\/runs\/([^/]+)\/stream$/);
     const agentMatch = requestUrl.pathname.match(/^\/v1\/agents\/([^/]+)\/stream$/);
+    const terminalMatch = requestUrl.pathname.match(
+      /^\/v1\/runs\/([^/]+)\/terminal-multiplexer\/terminals\/([^/]+)\/socket$/,
+    );
     const resource = runMatch
       ? { type: 'run' as const, id: runMatch[1] }
       : agentMatch
         ? { type: 'agent' as const, id: agentMatch[1] }
-        : undefined;
+        : terminalMatch
+          ? { type: 'terminal' as const, id: terminalMatch[1], terminalId: terminalMatch[2] }
+          : undefined;
     if (!resource) {
       rejectUpgrade(socket, 404, 'Not Found');
       return;
@@ -286,10 +296,13 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
       return;
     }
 
-    const query = ManagedAgentEventsQuerySchema.safeParse({
-      afterSequence: requestUrl.searchParams.get('afterSequence') ?? 0,
-      limit: requestUrl.searchParams.get('limit') ?? undefined,
-    });
+    const query =
+      resource.type === 'terminal'
+        ? { success: true as const, data: { afterSequence: 0 } }
+        : ManagedAgentEventsQuerySchema.safeParse({
+            afterSequence: requestUrl.searchParams.get('afterSequence') ?? 0,
+            limit: requestUrl.searchParams.get('limit') ?? undefined,
+          });
     if (!query.success) {
       socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
       socket.destroy();
@@ -305,6 +318,7 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
         resource.id,
         query.data.afterSequence,
         credential,
+        resource.type === 'terminal' ? resource.terminalId : undefined,
       );
     });
   });
@@ -314,12 +328,20 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     (
       socket: WebSocket,
       _request: unknown,
-      resourceType: 'agent' | 'run',
+      resourceType: 'agent' | 'run' | 'terminal',
       resourceId: string,
       afterSequence: number,
       credential: string,
+      terminalId?: string,
     ) => {
       eventSockets.set(socket, credential);
+      socket.once('close', () => eventSockets.delete(socket));
+      if (resourceType === 'terminal') {
+        if (!terminalId || !terminalMultiplexer.attach(resourceId, terminalId, socket)) {
+          socket.close(1008, 'Terminal not found');
+        }
+        return;
+      }
       let unsubscribe: (() => void) | undefined;
       let closed = false;
       let alive = true;
@@ -556,6 +578,15 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
       );
     }
     return reply.send(ManagedAgentRunListResponseSchema.parse(await agents.listRuns(parsed.data)));
+  });
+
+  server.get('/v1/runs/:runId/debug-log', async (request, reply) => {
+    const params = AgentRunParamsSchema.parse(request.params);
+    try {
+      return reply.send(RunDebugLogResponseSchema.parse(await agents.getRunDebugLog(params.runId)));
+    } catch (error) {
+      return handleError(reply, error);
+    }
   });
 
   server.get('/v1/runs/:runId/attachments', async (request, reply) => {
@@ -826,6 +857,28 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     );
   });
 
+  server.get('/v1/runs/:runId/terminal-multiplexer/terminals', async (request, reply) => {
+    const { runId } = AgentRunParamsSchema.parse(request.params);
+    const run = await agents.getRun(runId);
+    if (!run)
+      return reply.code(404).send({ error: { code: 'not_found', message: 'Run not found' } });
+    return reply.send({ terminals: terminalMultiplexer.list(runId) });
+  });
+  server.post('/v1/runs/:runId/terminal-multiplexer/terminals', async (request, reply) => {
+    const { runId } = AgentRunParamsSchema.parse(request.params);
+    const run = await agents.getRun(runId);
+    if (!run)
+      return reply.code(404).send({ error: { code: 'not_found', message: 'Run not found' } });
+    return reply.code(201).send(terminalMultiplexer.create(runId, run.cwd));
+  });
+  server.delete('/v1/runs/:runId/terminal-multiplexer/terminals/:id', async (request, reply) => {
+    const params = AgentRunParamsSchema.merge(ResourceParamsSchema).parse(request.params);
+    if (!terminalMultiplexer.closeTerminal(params.runId, params.id)) {
+      return reply.code(404).send({ error: { code: 'not_found', message: 'Terminal not found' } });
+    }
+    return reply.code(204).send();
+  });
+
   server.post('/v1/terminal-sessions', async (request, reply) =>
     reply
       .code(202)
@@ -1038,6 +1091,7 @@ export function buildSupervisorApp(options: SupervisorAppOptions): SupervisorApp
     websocketTickets.clear();
     clearInterval(ticketCleanup);
     eventWebSocketServer.close();
+    terminalMultiplexer.close();
     await workspace.close();
     await agents.close();
     await service.close();

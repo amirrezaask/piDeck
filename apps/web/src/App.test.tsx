@@ -181,9 +181,26 @@ function createClient(overrides: Partial<SupervisorClientApi> = {}): SupervisorC
       patch: '',
       truncated: false,
     }),
+    getRunDebugLog: vi.fn().mockResolvedValue({
+      runId: run.id,
+      sessionId: null,
+      sessionFile: null,
+      available: false,
+      unavailableReason: 'No journal',
+      content: '',
+      bytesRead: 0,
+      fileSize: null,
+      truncated: false,
+      diagnostics: [],
+      supervisorEvents: [],
+    }),
     createWorktree: vi.fn(),
     listWorktrees: vi.fn().mockResolvedValue({ worktrees: [] }),
     releaseWorktree: vi.fn(),
+    listSessionTerminals: vi.fn().mockResolvedValue({ terminals: [] }),
+    createSessionTerminal: vi.fn().mockRejectedValue(new Error('PTY unavailable in jsdom')),
+    closeSessionTerminal: vi.fn().mockResolvedValue(undefined),
+    openSessionTerminalSocket: vi.fn(),
     createTerminalSession: vi.fn(),
     listTerminalSessions: vi.fn().mockResolvedValue({ sessions: [] }),
     getTerminalSession: vi.fn(),
@@ -1107,22 +1124,127 @@ describe('App', () => {
     );
   });
 
-  it('opens API-backed changes and terminal inspectors for a session', async () => {
+  it('opens resizable changes and terminal splits without closing terminal processes', async () => {
     const user = userEvent.setup();
     const client = createClient({
       listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
       listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+      getRunChanges: vi.fn().mockResolvedValue({
+        runId: run.id,
+        scope: 'working_tree',
+        available: true,
+        unavailableReason: null,
+        baseRef: null,
+        files: [
+          {
+            path: 'src/example.ts',
+            status: 'M',
+            additions: null,
+            deletions: null,
+          },
+        ],
+        patch:
+          'diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1 +1 @@\n-export const value = 1;\n+export const value = 2;\n',
+        truncated: false,
+      }),
     });
     render(<App client={client} />);
 
     await user.click(await screen.findByRole('button', { name: 'Open changes' }));
-    expect(await screen.findByRole('dialog', { name: 'Workspace changes' })).toBeVisible();
-    expect(await screen.findByText('No changes in this scope.')).toBeVisible();
-    await user.keyboard('{Escape}');
+    expect(await screen.findByRole('region', { name: 'Workspace changes' })).toBeVisible();
+    expect(screen.queryByRole('dialog', { name: 'Workspace changes' })).not.toBeInTheDocument();
+    expect(screen.getByRole('separator', { name: 'Resize workspace and changes' })).toBeVisible();
+    expect(await screen.findByLabelText('Changed file tree')).toBeVisible();
+    await waitFor(() => {
+      expect(document.querySelector('file-tree-container')).not.toBeNull();
+      expect(document.querySelector('diffs-container')).not.toBeNull();
+    });
 
     await user.click(screen.getByRole('button', { name: 'Open terminal' }));
-    expect(await screen.findByRole('dialog', { name: 'Terminal session' })).toBeVisible();
-    expect(screen.getByRole('textbox', { name: 'Terminal command' })).toBeVisible();
+    expect(await screen.findByRole('region', { name: 'Session terminals' })).toBeVisible();
+    expect(screen.getByRole('separator', { name: 'Resize chat and terminal' })).toBeVisible();
+    expect(await screen.findByText('PTY unavailable in jsdom')).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Close terminal panel' }));
+    expect(screen.queryByRole('region', { name: 'Session terminals' })).not.toBeInTheDocument();
+    expect(client.closeSessionTerminal).not.toHaveBeenCalled();
+  });
+
+  it('asks extension approval questions globally while a new run is still being admitted', async () => {
+    window.history.replaceState({}, '', '/new');
+    const user = userEvent.setup();
+    const request = {
+      id: '018bcfe4-7a4b-7000-8000-000000000778',
+      kind: 'approval' as const,
+      runId: run.id,
+      title: 'Expensive model consent',
+      body: 'Send this prompt to openai-codex/GPT-5.6 Sol?',
+      options: ['Confirm', 'Cancel'],
+      status: 'pending' as const,
+      response: null,
+      createdAt: timestamp,
+      resolvedAt: null,
+    };
+    const resolveInbox = vi.fn().mockResolvedValue({
+      ...request,
+      status: 'resolved',
+      response: 'Confirm',
+      resolvedAt: timestamp,
+    });
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+      listInbox: vi.fn().mockResolvedValue({ items: [request] }),
+      resolveInbox,
+    });
+    render(<App client={client} />);
+
+    const dialog = await screen.findByRole('dialog', { name: 'Expensive model consent' });
+    expect(within(dialog).getByText(/GPT-5\.6 Sol/)).toBeVisible();
+    await user.click(within(dialog).getByRole('button', { name: 'Confirm' }));
+
+    await waitFor(() => expect(resolveInbox).toHaveBeenCalledWith(request.id, 'Confirm'));
+    window.history.replaceState({}, '', '/');
+  });
+
+  it('shows the raw PI journal and supervisor lifecycle in the debug drawer', async () => {
+    const user = userEvent.setup();
+    const getRunDebugLog = vi.fn().mockResolvedValue({
+      runId: run.id,
+      sessionId: '018bcfe4-7a4b-7000-8000-000000000777',
+      sessionFile: '/tmp/pi-session.jsonl',
+      available: true,
+      unavailableReason: null,
+      content: '{"type":"message","message":{"role":"user","content":"hello"}}\n',
+      bytesRead: 64,
+      fileSize: 64,
+      truncated: false,
+      diagnostics: [],
+      supervisorEvents: [
+        {
+          agentId: agent.id,
+          runId: run.id,
+          sequence: 4,
+          type: 'supervisor.prompt_accepted',
+          payload: {},
+          createdAt: timestamp,
+        },
+      ],
+    });
+    const client = createClient({
+      listAgents: vi.fn().mockResolvedValue({ agents: [agent], nextCursor: null }),
+      listRuns: vi.fn().mockResolvedValue({ runs: [run], nextCursor: null }),
+      getRunDebugLog,
+    });
+    render(<App client={client} />);
+
+    await user.click(await screen.findByRole('button', { name: 'Open debug log' }));
+    expect(await screen.findByRole('region', { name: 'Run debug log' })).toBeVisible();
+    expect(screen.getByRole('separator', { name: 'Resize workspace and debug log' })).toBeVisible();
+    expect(await screen.findByText(/"role":"user"/)).toBeVisible();
+    await user.click(screen.getByRole('tab', { name: /Lifecycle/ }));
+    expect(screen.getByText(/supervisor\.prompt_accepted/)).toBeVisible();
+    expect(getRunDebugLog).toHaveBeenCalledWith(run.id);
   });
 
   it('keeps command-k focused exclusively on switching sessions', async () => {

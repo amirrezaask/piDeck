@@ -1,0 +1,7 @@
+Symbols Nerd Font Mono Regular (WOFF2)
+Upstream: https://github.com/ryanoasis/nerd-fonts/tree/v3.4.0/patched-fonts/NerdFontsSymbolsOnly
+File: SymbolsNerdFontMono-Regular.ttf → WOFF2 via fontTools
+License: MIT (LICENSE-nerd-fonts.txt)
+Family name: "Symbols Nerd Font Mono"
+Purpose: icon/PUA fallback so terminals can render Nerd Font glyphs
+without replacing the primary mono face.

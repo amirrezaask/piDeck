@@ -1,0 +1,19 @@
+{
+  "name": "@pideck/ghostty-react",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./styles.css": "./src/styles.css"
+  },
+  "dependencies": {
+    "@pideck/ghostty-core": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19.0.0"
+  },
+  "devDependencies": {
+    "react": "^19.2.8"
+  }
+}

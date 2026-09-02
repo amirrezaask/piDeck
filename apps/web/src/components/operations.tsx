@@ -4,7 +4,7 @@ import type {
   InboxItemResponse,
   ManagedProjectResponse,
   RunChangesResponse,
-  TerminalSessionResponse,
+  RunDebugLogResponse,
   WorktreeResponse,
 } from '@nextflow/contracts';
 import {
@@ -16,11 +16,10 @@ import {
   NetworkIcon,
   SearchIcon,
   ServerIcon,
-  SquareTerminalIcon,
   Trash2Icon,
   XIcon,
 } from 'lucide-react';
-import { type FormEvent, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -45,16 +44,11 @@ import { Separator } from '@/components/ui/separator';
 export interface OperationsClient {
   getFleet(): Promise<import('@nextflow/contracts').FleetOverviewResponse>;
   getRunChanges(runId: string, scope: ChangeScope, baseRef?: string): Promise<RunChangesResponse>;
+  getRunDebugLog(runId: string): Promise<RunDebugLogResponse>;
   listInbox(): Promise<{ items: InboxItemResponse[] }>;
   resolveInbox(id: string, response: string): Promise<InboxItemResponse>;
   cancelInbox(id: string): Promise<InboxItemResponse>;
   searchSessions(q: string): Promise<import('@nextflow/contracts').SessionSearchResponse>;
-  listTerminalSessions(): Promise<{ sessions: TerminalSessionResponse[] }>;
-  createTerminalSession(
-    input: import('@nextflow/contracts').CreateTerminalSessionRequest,
-  ): Promise<TerminalSessionResponse>;
-  writeTerminalSession(id: string, data: string): Promise<TerminalSessionResponse>;
-  cancelTerminalSession(id: string): Promise<TerminalSessionResponse>;
   listWorktrees(): Promise<{ worktrees: WorktreeResponse[] }>;
   createWorktree(
     input: import('@nextflow/contracts').CreateWorktreeRequest,
@@ -362,133 +356,6 @@ export function InboxView({ servers }: { servers: ServerOperationsClient[] }) {
         )}
       </div>
     </section>
-  );
-}
-
-export function ChangesPanel({ client, runId }: { client: OperationsClient; runId: string }) {
-  const scopes: ChangeScope[] = ['last_turn', 'working_tree', 'staged', 'branch'];
-  const [scope, setScope] = useState<ChangeScope>('working_tree');
-  const [data, setData] = useState<RunChangesResponse>();
-  const [error, setError] = useState<string>();
-  useEffect(() => {
-    let active = true;
-    setData(undefined);
-    setError(undefined);
-    void client
-      .getRunChanges(runId, scope)
-      .then((next) => {
-        if (active) setData(next);
-      })
-      .catch((reason) => {
-        if (active) setError(reason instanceof Error ? reason.message : 'Changes unavailable');
-      });
-    return () => {
-      active = false;
-    };
-  }, [client, runId, scope]);
-  return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex gap-1 border-b p-2">
-        {scopes.map((value) => (
-          <Button
-            key={value}
-            size="sm"
-            variant={scope === value ? 'secondary' : 'ghost'}
-            onClick={() => setScope(value)}
-          >
-            {value.replace('_', ' ')}
-          </Button>
-        ))}
-      </div>
-      <div className="min-h-0 flex-1 overflow-auto p-4">
-        {error ? (
-          <p className="text-sm text-destructive">{error}</p>
-        ) : !data ? (
-          <p className="text-sm text-muted-foreground">Loading changes…</p>
-        ) : !data.available ? (
-          <p className="text-sm text-muted-foreground">{data.unavailableReason}</p>
-        ) : (
-          <>
-            <div className="mb-3 flex flex-wrap gap-2">
-              {data.files.map((file) => (
-                <Badge key={file.path} variant="outline">
-                  {file.status} {file.path}
-                </Badge>
-              ))}
-              {data.truncated ? <Badge variant="destructive">Truncated</Badge> : null}
-            </div>
-            <pre className="min-w-max rounded-lg bg-muted/40 p-4 font-mono text-xs leading-5">
-              {data.patch || 'No changes in this scope.'}
-            </pre>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-export function TerminalPanel({ client, cwd }: { client: OperationsClient; cwd: string }) {
-  const [sessions, setSessions] = useState<TerminalSessionResponse[]>([]);
-  const [command, setCommand] = useState('git status --short');
-  const [busy, setBusy] = useState(false);
-  const active = sessions[0];
-  const load = () =>
-    void client.listTerminalSessions().then((result) => setSessions(result.sessions));
-  useEffect(load, [client]);
-  useEffect(() => {
-    if (!sessions.some((session) => session.status === 'running')) return;
-    const timer = setInterval(load, 1000);
-    return () => clearInterval(timer);
-  }, [sessions, client]);
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    const parts = command.trim().split(/\s+/);
-    const executable = parts.shift();
-    if (!executable) return;
-    setBusy(true);
-    try {
-      await client.createTerminalSession({
-        cwd,
-        command: executable,
-        args: parts,
-        timeoutMs: 900000,
-        maxOutputBytes: 1000000,
-      });
-      load();
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <form className="flex gap-2 border-b p-3" onSubmit={submit}>
-        <Input
-          value={command}
-          onChange={(event) => setCommand(event.target.value)}
-          aria-label="Terminal command"
-          className="font-mono"
-        />
-        <Button type="submit" disabled={busy || !command.trim()}>
-          <SquareTerminalIcon />
-          Run
-        </Button>
-        {active?.status === 'running' ? (
-          <Button
-            type="button"
-            variant="destructive"
-            onClick={() => void client.cancelTerminalSession(active.id).then(load)}
-          >
-            Stop
-          </Button>
-        ) : null}
-      </form>
-      <div className="min-h-0 flex-1 overflow-auto bg-neutral-950 p-4 text-neutral-100">
-        <pre className="font-mono text-xs leading-5 whitespace-pre-wrap">
-          {active?.output ||
-            'Run an argv-based command in this workspace. No renderer shell access is exposed.'}
-        </pre>
-      </div>
-    </div>
   );
 }
 

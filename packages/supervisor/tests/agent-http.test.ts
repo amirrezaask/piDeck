@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -231,6 +231,43 @@ describe('Supervisor managed-agent HTTP API', () => {
       expect(
         (await server.inject({ method: 'GET', url: `/v1/agents/${created.id}` })).json(),
       ).not.toHaveProperty('status');
+    });
+  });
+
+  it('returns the raw PI journal with supervisor lifecycle events', async () => {
+    await withAgentApp(async ({ server, factory, directory }) => {
+      const created = await server.inject({
+        method: 'POST',
+        url: '/v1/agents',
+        payload: { ...createPayload, cwd: directory },
+      });
+      const agent = created.json<{ id: string }>();
+      const started = await server.inject({
+        method: 'POST',
+        url: '/v1/runs',
+        payload: { agentId: agent.id, prompt: 'Inspect this.' },
+      });
+      const runId = started.json<{ id: string }>().id;
+      const session = factory.sessions[0];
+      if (!session) throw new Error('Expected a fake PI session');
+      writeFileSync(session.sessionFile, '{"type":"message","role":"user"}\n');
+
+      const response = await server.inject({
+        method: 'GET',
+        url: `/v1/runs/${runId}/debug-log`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        runId,
+        available: true,
+        content: '{"type":"message","role":"user"}\n',
+        truncated: false,
+        supervisorEvents: expect.arrayContaining([
+          expect.objectContaining({ type: 'supervisor.prompt_accepted' }),
+        ]),
+      });
+      rmSync(session.sessionFile, { force: true });
     });
   });
 

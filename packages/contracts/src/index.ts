@@ -50,6 +50,7 @@ export type {
   ManagedAgentRunListResponse,
   ManagedAgentRunResponse,
   ManagedAgentRunStatus,
+  RunDebugLogResponse,
   UpdateManagedAgentRequest,
   UpdateManagedExtensionsRequest,
 } from './supervisor-agent';
@@ -88,6 +89,7 @@ export {
   ManagedAgentRunListResponseSchema,
   ManagedAgentRunResponseSchema,
   ManagedAgentRunStatusSchema,
+  RunDebugLogResponseSchema,
   UpdateManagedAgentRequestSchema,
   UpdateManagedExtensionsRequestSchema,
 } from './supervisor-agent';

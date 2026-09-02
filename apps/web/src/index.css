@@ -223,6 +223,71 @@
   background-clip: padding-box;
 }
 
+.pideck-changes-browser {
+  display: grid;
+  grid-template-columns: minmax(10rem, 13rem) minmax(0, 1fr);
+  height: 100%;
+}
+
+.pideck-changes-tree {
+  display: block;
+  height: 100%;
+  --trees-fg-override: var(--foreground);
+  --trees-fg-muted-override: var(--muted-foreground);
+  --trees-bg-override: var(--background);
+  --trees-bg-muted-override: color-mix(in oklch, var(--muted) 45%, var(--background));
+  --trees-accent-override: var(--accent);
+  --trees-border-color-override: var(--border);
+  --trees-focus-ring-color-override: var(--ring);
+  --trees-selected-fg-override: var(--accent-foreground);
+  --trees-selected-bg-override: var(--accent);
+  --trees-selected-focused-border-color-override: var(--ring);
+}
+
+.pideck-changes-tree > file-tree-container,
+.pideck-pierre-diff > diffs-container {
+  display: block;
+  height: 100%;
+}
+
+.pideck-pierre-diff {
+  display: block;
+  min-height: 100%;
+  color: var(--foreground);
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+}
+
+@container (max-width: 25rem) {
+  .pideck-changes-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .pideck-changes-scopes {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .pideck-changes-close {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .pideck-changes-browser {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(7rem, 28%) minmax(0, 1fr);
+  }
+
+  .pideck-changes-browser > aside {
+    border-right-width: 0;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;

@@ -1,0 +1,206 @@
+@import "@pideck/ghostty-react/styles.css";
+
+.pideck-mux {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: #0a0a0b;
+  color: #e8e8e5;
+}
+
+.pideck-mux__tabs {
+  display: flex;
+  min-height: 2.5rem;
+  align-items: center;
+  gap: 0.375rem;
+  border-bottom: 1px solid rgb(255 255 255 / 0.09);
+  background: #141416;
+  padding: 0.25rem 0.375rem 0.25rem 0.5rem;
+}
+
+.pideck-mux__tab-strip {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 0.125rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.pideck-mux__tab-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.pideck-mux__tab-group {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: center;
+  border-radius: 0.4rem;
+  isolation: isolate;
+}
+
+.pideck-mux__active-tab {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border: 1px solid rgb(255 255 255 / 0.04);
+  border-radius: 0.4rem;
+  background: #27272a;
+}
+
+.pideck-mux__tab,
+.pideck-mux__new,
+.pideck-mux__close,
+.pideck-mux__panel-close,
+.pideck-mux__empty-action {
+  border: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pideck-mux__tab {
+  display: flex;
+  height: 1.9rem;
+  align-items: center;
+  gap: 0.4rem;
+  border-radius: 0.4rem 0 0 0.4rem;
+  background: transparent;
+  padding: 0 0.5rem;
+  color: #a1a1aa;
+  font-size: 0.75rem;
+  transition: color 120ms ease-out;
+}
+
+.pideck-mux__tab[aria-selected="true"] {
+  color: #fafafa;
+}
+
+.pideck-mux__close,
+.pideck-mux__panel-close {
+  display: grid;
+  height: 1.9rem;
+  width: 1.7rem;
+  flex: none;
+  place-items: center;
+  background: transparent;
+  color: #71717a;
+  transition:
+    color 120ms ease-out,
+    background-color 120ms ease-out;
+}
+
+.pideck-mux__close {
+  border-radius: 0 0.4rem 0.4rem 0;
+}
+
+.pideck-mux__panel-close {
+  border-radius: 0.4rem;
+}
+
+.pideck-mux__close:hover,
+.pideck-mux__new:hover,
+.pideck-mux__panel-close:hover {
+  background: #27272a;
+  color: #fafafa;
+}
+
+.pideck-mux__new {
+  display: flex;
+  height: 1.9rem;
+  flex: none;
+  align-items: center;
+  gap: 0.35rem;
+  border-radius: 0.4rem;
+  background: transparent;
+  padding: 0 0.55rem;
+  color: #a1a1aa;
+  font-size: 0.72rem;
+  transition:
+    color 120ms ease-out,
+    background-color 120ms ease-out;
+}
+
+.pideck-mux__cwd {
+  max-width: min(28rem, 30vw);
+  flex: none;
+  overflow: hidden;
+  color: #71717a;
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pideck-mux__body {
+  position: relative;
+  min-height: 0;
+  flex: 1;
+}
+
+.pideck-mux__surface-frame,
+.pideck-mux__surface {
+  position: absolute;
+  inset: 0;
+}
+
+.pideck-mux__connection {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.75rem;
+  z-index: 3;
+  border: 1px solid rgb(254 202 202 / 0.12);
+  border-radius: 0.4rem;
+  background: #3f1d20;
+  padding: 0.35rem 0.55rem;
+  color: #fecaca;
+  font-size: 0.7rem;
+}
+
+.pideck-mux__empty,
+.pideck-mux__empty-action {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: #0a0a0b;
+  color: #a1a1aa;
+  font-size: 0.8rem;
+}
+
+.pideck-mux__empty-action {
+  width: 100%;
+}
+
+.pideck-mux__error {
+  color: #fca5a5;
+}
+
+.pideck-mux__exit {
+  color: #71717a;
+  font-size: 0.65rem;
+}
+
+.pideck-mux button:focus-visible {
+  outline: 2px solid #a1a1aa;
+  outline-offset: -2px;
+}
+
+@media (max-width: 640px) {
+  .pideck-mux__cwd {
+    display: none;
+  }
+
+  .pideck-mux__new span {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pideck-mux * {
+    scroll-behavior: auto !important;
+  }
+}

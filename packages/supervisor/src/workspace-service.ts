@@ -25,6 +25,7 @@ import {
 } from '@nextflow/contracts';
 import { createId, nowIso, type SupervisorDatabase } from '@nextflow/database';
 import { type Kysely, type Selectable, sql } from 'kysely';
+import type { PiExtensionUI, PiExtensionUIRequest } from './pi-session.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_GIT_OUTPUT = 2_000_000;
@@ -44,6 +45,10 @@ export class WorkspaceCapabilityError extends Error {
 export class WorkspaceService {
   private readonly processes = new Map<string, ChildProcessWithoutNullStreams>();
   private readonly processCompletions = new Map<string, Promise<void>>();
+  private readonly pendingInboxResponses = new Map<
+    string,
+    (response: string | undefined) => void
+  >();
   private closing = false;
   constructor(private readonly db: Kysely<SupervisorDatabase>) {}
 
@@ -61,6 +66,8 @@ export class WorkspaceService {
 
   async close(): Promise<void> {
     this.closing = true;
+    for (const resolveResponse of this.pendingInboxResponses.values()) resolveResponse(undefined);
+    this.pendingInboxResponses.clear();
     for (const child of this.processes.values()) child.kill('SIGTERM');
     const completions = [...this.processCompletions.values()];
     if (completions.length > 0) {
@@ -469,6 +476,67 @@ export class WorkspaceService {
     return this.requireTerminal(id);
   }
 
+  extensionUI(runId: string): PiExtensionUI {
+    return {
+      request: (input) => this.requestExtensionInput(runId, input),
+      notify: () => undefined,
+    };
+  }
+
+  async cancelExtensionRequests(runId: string): Promise<void> {
+    const pending = await this.db
+      .selectFrom('supervisor_inbox_items')
+      .select('id')
+      .where('run_id', '=', runId)
+      .where('status', '=', 'pending')
+      .execute();
+    if (pending.length === 0) return;
+    await this.db
+      .updateTable('supervisor_inbox_items')
+      .set({ status: 'cancelled', resolved_at: nowIso() })
+      .where(
+        'id',
+        'in',
+        pending.map((item) => item.id),
+      )
+      .execute();
+    for (const item of pending) this.settleInboxResponse(item.id, undefined);
+  }
+
+  private async requestExtensionInput(
+    runId: string,
+    input: PiExtensionUIRequest,
+  ): Promise<string | undefined> {
+    const item = await this.createInbox({
+      kind: input.kind,
+      runId,
+      title: input.title,
+      body: input.body,
+      options: input.options,
+    });
+    return new Promise<string | undefined>((resolveResponse) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settle = (response: string | undefined) => {
+        if (timer) clearTimeout(timer);
+        this.pendingInboxResponses.delete(item.id);
+        resolveResponse(response);
+      };
+      this.pendingInboxResponses.set(item.id, settle);
+      if (input.timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          void this.cancelInbox(item.id).catch(() => settle(undefined));
+        }, input.timeoutMs);
+      }
+      void this.requireInbox(item.id).then((current) => {
+        if (current.status !== 'pending') settle(current.response ?? undefined);
+      });
+    });
+  }
+
+  private settleInboxResponse(id: string, response: string | undefined): void {
+    this.pendingInboxResponses.get(id)?.(response);
+  }
+
   async createInbox(input: InboxInput): Promise<InboxItemResponse> {
     const id = createId();
     const createdAt = nowIso();
@@ -511,7 +579,9 @@ export class WorkspaceService {
         'invalid_state_transition',
         'Inbox item is no longer pending',
       );
-    return this.requireInbox(id);
+    const item = await this.requireInbox(id);
+    this.settleInboxResponse(id, response);
+    return item;
   }
   async cancelInbox(id: string): Promise<InboxItemResponse> {
     const result = await this.db
@@ -525,7 +595,9 @@ export class WorkspaceService {
         'invalid_state_transition',
         'Inbox item is no longer pending',
       );
-    return this.requireInbox(id);
+    const item = await this.requireInbox(id);
+    this.settleInboxResponse(id, undefined);
+    return item;
   }
 
   async search(q: string, limit: number): Promise<SessionSearchResponse> {
