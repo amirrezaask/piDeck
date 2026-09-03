@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "decoders": [
+    {
+      "id": "terminal.protocol-v4",
+      "owner": "rust",
+      "path": "crates/terminal-protocol/src/lib.rs",
+      "boundary": "wire",
+      "maximumInputBytes": 8388608,
+      "currentVersion": 4,
+      "previousSupportedVersion": 1,
+      "corpus": "tests/conformance/vectors/terminal-protocol.json",
+      "fuzzTarget": "terminal_protocol_decode",
+      "compatibility": "previous-current"
+    },
+    {
+      "id": "terminal.ws-client",
+      "owner": "typescript",
+      "path": "packages/yaade-rpc/src/terminal-ws.ts",
+      "boundary": "wire",
+      "maximumInputBytes": 8388608,
+      "currentVersion": 4,
+      "previousSupportedVersion": 1,
+      "corpus": "tests/conformance/vectors/terminal-protocol.json",
+      "fuzzTarget": "terminal_ws_decode",
+      "compatibility": "previous-current"
+    },
+    {
+      "id": "terminal.semantic-v3",
+      "owner": "typescript",
+      "path": "packages/yaade-rpc/src/terminal-stream-v3-codec.ts",
+      "boundary": "wire",
+      "maximumInputBytes": 8388608,
+      "currentVersion": 3,
+      "previousSupportedVersion": null,
+      "corpus": "packages/yaade-rpc/src/terminal-stream-v3-codec.test.ts",
+      "fuzzTarget": "terminal_semantic_v3_decode",
+      "compatibility": "compatibility-only"
+    },
+    {
+      "id": "ghostty.native-wasm",
+      "owner": "native-wasm",
+      "path": "crates/ghostty-vt/src/lib.rs",
+      "boundary": "parser",
+      "maximumInputBytes": 1048576,
+      "currentVersion": "07bccf7a311acdfa6afc77f2016160d49b1f1982",
+      "previousSupportedVersion": null,
+      "corpus": "tests/fixtures/terminal-corpus/manifest.json",
+      "fuzzTarget": "ghostty_input_chunking",
+      "compatibility": "current-only"
+    },
+    {
+      "id": "terminal.checkpoint-v2",
+      "owner": "native-wasm",
+      "path": "packages/yaade-server/src/terminal.rs",
+      "boundary": "persistence",
+      "maximumInputBytes": 8388608,
+      "currentVersion": 2,
+      "previousSupportedVersion": null,
+      "corpus": "tests/conformance/vectors/terminal-protocol.json",
+      "fuzzTarget": "terminal_checkpoint_restore",
+      "compatibility": "current-only"
+    },
+    {
+      "id": "terminal.history-v2",
+      "owner": "rust",
+      "path": "packages/yaade-server/src/terminal_history.rs",
+      "boundary": "persistence",
+      "maximumInputBytes": 67108864,
+      "currentVersion": 2,
+      "previousSupportedVersion": null,
+      "corpus": "packages/yaade-server/src/terminal_history.rs",
+      "fuzzTarget": "terminal_history_recovery",
+      "compatibility": "reset-only"
+    },
+    {
+      "id": "host.rpc-effect-schema",
+      "owner": "typescript",
+      "path": "packages/yaade-rpc/src/routes.ts",
+      "boundary": "wire",
+      "maximumInputBytes": 1048576,
+      "currentVersion": 1,
+      "previousSupportedVersion": null,
+      "corpus": "packages/yaade-rpc/src/routes.test.ts",
+      "fuzzTarget": "host_route_schema_decode",
+      "compatibility": "current-only"
+    },
+    {
+      "id": "device.auth",
+      "owner": "rust",
+      "path": "packages/yaade-server/src/device_auth.rs",
+      "boundary": "auth",
+      "maximumInputBytes": 1048576,
+      "currentVersion": 1,
+      "previousSupportedVersion": null,
+      "corpus": "tests/security/pairing.security.spec.ts",
+      "fuzzTarget": "device_auth_decode",
+      "compatibility": "current-only"
+    },
+    {
+      "id": "host.url-origin",
+      "owner": "rust",
+      "path": "packages/yaade-server/src/server.rs",
+      "boundary": "url-storage",
+      "maximumInputBytes": 16384,
+      "currentVersion": 1,
+      "previousSupportedVersion": null,
+      "corpus": "packages/yaade-server/src/server.rs",
+      "fuzzTarget": "url_origin_normalization",
+      "compatibility": "current-only"
+    },
+    {
+      "id": "workspace.persisted-records",
+      "owner": "typescript",
+      "path": "packages/yaade-workspace/src/types.ts",
+      "boundary": "url-storage",
+      "maximumInputBytes": 1048576,
+      "currentVersion": 1,
+      "previousSupportedVersion": null,
+      "corpus": "packages/yaade-workspace/src",
+      "fuzzTarget": "workspace_record_decode",
+      "compatibility": "reset-only"
+    }
+  ]
+}

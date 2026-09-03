@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "sampleIntervalMs": 1000,
+  "maximumHeapBytes": 536870912,
+  "maximumRssBytes": 1073741824,
+  "maximumHeapSlopeBytesPerSecond": 65536,
+  "maximumRssSlopeBytesPerSecond": 262144,
+  "maximumHandleGrowth": 4,
+  "maximumQueueBytes": 8388608,
+  "maximumRetainedMarkers": 4096
+}

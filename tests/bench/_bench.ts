@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import { cpus, platform, release, totalmem } from "node:os"
-import { readFileSync, readdirSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs"
 import { resolve } from "node:path"
 import { expect } from "@playwright/test"
 import { Schema } from "effect"
@@ -13,12 +13,6 @@ export type BenchResult = {
   p95: number
   p99: number
   samples: number[]
-}
-
-export type BenchBudget = {
-  medianMs: number
-  p95Ms: number
-  p99Ms: number
 }
 
 export type BenchContext = {
@@ -136,22 +130,52 @@ export async function runBench(opts: RunBenchOptions): Promise<BenchResult> {
   }
 }
 
-const budgetsPath = resolve(process.cwd(), "tests/bench/budgets.json")
-const budgets = Schema.decodeUnknownSync(Schema.Record({
-  key: Schema.String,
-  value: Schema.Struct({
-    medianMs: Schema.Number,
-    p95Ms: Schema.Number,
-    p99Ms: Schema.Number,
+const sloRegistryPath = resolve(process.cwd(), "tests/bench/slos.json")
+const SloObjective = Schema.Struct({
+  metric: Schema.String,
+  unit: Schema.Literal("ms"),
+  percentile: Schema.Literal("median", "p95", "p99", "max"),
+  ceiling: Schema.Number,
+  corpus: Schema.String,
+  startFence: Schema.String,
+  endFence: Schema.String,
+  warmup: Schema.Number,
+  iterations: Schema.Number,
+  owner: Schema.String,
+})
+const sloRegistry = Schema.decodeUnknownSync(Schema.Struct({
+  version: Schema.Literal(1),
+  profile: Schema.Struct({
+    id: Schema.String,
+    hardware: Schema.String,
+    browser: Schema.String,
+    network: Schema.String,
   }),
-}))(JSON.parse(readFileSync(budgetsPath, "utf8")))
+  objectives: Schema.Array(SloObjective),
+  zeroTolerance: Schema.Array(Schema.String),
+}))(JSON.parse(readFileSync(sloRegistryPath, "utf8")))
 
 export function assertBudget(result: BenchResult): void {
-  const budget = budgets[result.name]
-  if (budget == null) return
-  expect(result.median, `${result.name} median ${result.median}ms > ${budget.medianMs}ms`).toBeLessThanOrEqual(budget.medianMs)
-  expect(result.p95, `${result.name} p95 ${result.p95}ms > ${budget.p95Ms}ms`).toBeLessThanOrEqual(budget.p95Ms)
-  expect(result.p99, `${result.name} p99 ${result.p99}ms > ${budget.p99Ms}ms`).toBeLessThanOrEqual(budget.p99Ms)
+  const observations = sloRegistry.objectives.flatMap(objective => {
+    if (objective.metric !== result.name || objective.percentile === "max") return []
+    const observed = objective.percentile === "median"
+      ? result.median
+      : objective.percentile === "p95"
+        ? result.p95
+        : result.p99
+    return [{ objective, observed, passed: observed <= objective.ceiling }]
+  })
+  const reportPath = process.env.YAADE_BENCH_REPORT
+  if (reportPath) {
+    mkdirSync(resolve(reportPath, ".."), { recursive: true })
+    appendFileSync(reportPath, `${JSON.stringify({ result, observations })}\n`)
+  }
+  for (const { objective, observed } of observations) {
+    expect(
+      observed,
+      `${result.name} ${objective.percentile} ${observed}ms > ${objective.ceiling}ms (${sloRegistry.profile.id})`,
+    ).toBeLessThanOrEqual(objective.ceiling)
+  }
 }
 
 export function logBenchResult(result: BenchResult): void {

@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "id": "v4-pty-one-byte",
+      "source": "yaade",
+      "format": "terminal-protocol",
+      "formatVersion": 4,
+      "inputHex": "50440406000000240000000000000001000000000000000200000000000000010000000161",
+      "expected": {
+        "type": "pty-data",
+        "streamId": 1,
+        "epoch": 2,
+        "offset": 1,
+        "payloadHex": "61"
+      },
+      "maximumInputBytes": 8388608,
+      "license": "MIT"
+    },
+    {
+      "id": "v4-empty-pty-rejected",
+      "source": "yaade",
+      "format": "terminal-protocol",
+      "formatVersion": 4,
+      "inputHex": "504404060000002400000000000000010000000000000002000000000000000000000000",
+      "expectedError": "invalid-payload-length",
+      "maximumInputBytes": 8388608,
+      "license": "MIT"
+    },
+    {
+      "id": "v4-trailing-byte-rejected",
+      "source": "yaade",
+      "format": "terminal-protocol",
+      "formatVersion": 4,
+      "inputHex": "504404050000002400000000000000010000000000000002000000000000000000000000ff",
+      "expectedError": "length-mismatch",
+      "maximumInputBytes": 8388608,
+      "license": "MIT"
+    },
+    {
+      "id": "v4-unknown-type-rejected",
+      "source": "yaade",
+      "format": "terminal-protocol",
+      "formatVersion": 4,
+      "inputHex": "504404ff0000002400000000000000010000000000000002000000000000000000000000",
+      "expectedError": "unknown-frame-type",
+      "maximumInputBytes": 8388608,
+      "license": "MIT"
+    }
+  ]
+}

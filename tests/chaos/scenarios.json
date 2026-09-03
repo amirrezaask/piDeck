@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "defaults": {
+    "maximumRecoveryMs": 10000,
+    "maximumQueueBytes": 8388608,
+    "maximumHandleGrowth": 2
+  },
+  "scenarios": [
+    {
+      "id": "transport-frame-disorder",
+      "layer": "transport",
+      "seed": 1,
+      "topology": "one-host-two-viewers",
+      "workload": "ordered-markers",
+      "faults": ["drop", "duplicate", "delay", "reorder", "ack-loss"],
+      "fence": "replica-position-equals-authority",
+      "expected": "resynchronized"
+    },
+    {
+      "id": "history-publish-crash",
+      "layer": "storage",
+      "seed": 2,
+      "topology": "one-host",
+      "workload": "history-rotation",
+      "faults": ["write-tail", "crash-before-rename"],
+      "fence": "committed-manifest-recovered",
+      "expected": "typed-degraded-or-exact"
+    },
+    {
+      "id": "host-destructive-restart",
+      "layer": "host",
+      "seed": 3,
+      "topology": "one-host-one-browser",
+      "workload": "live-pty",
+      "faults": ["host-kill", "restart"],
+      "fence": "catalog-interrupted-and-no-child",
+      "expected": "interrupted"
+    },
+    {
+      "id": "worker-renderer-recovery",
+      "layer": "renderer",
+      "seed": 4,
+      "topology": "one-host-one-browser",
+      "workload": "tui-flood",
+      "faults": ["worker-crash", "context-loss"],
+      "fence": "painted-hash-equals-authority",
+      "expected": "recovered-or-fallback"
+    },
+    {
+      "id": "auth-revoke-reconnect",
+      "layer": "auth",
+      "seed": 5,
+      "topology": "one-host-two-devices",
+      "workload": "replay-and-control",
+      "faults": ["expire", "revoke"],
+      "fence": "revoked-device-disconnected",
+      "expected": "denied"
+    },
+    {
+      "id": "multi-host-isolation",
+      "layer": "multi-host",
+      "seed": 6,
+      "topology": "two-hosts-overlapping-ids",
+      "workload": "independent-streams",
+      "faults": ["partition-host-a", "revoke-host-a", "flood-host-b"],
+      "fence": "server-qualified-streams-converged",
+      "expected": "isolated"
+    },
+    {
+      "id": "pty-exit-during-attach",
+      "layer": "pty",
+      "seed": 7,
+      "topology": "one-host-one-viewer",
+      "workload": "attach-replay",
+      "faults": ["pty-exit"],
+      "fence": "exit-after-ordered-tail",
+      "expected": "exited"
+    },
+    {
+      "id": "clock-movement",
+      "layer": "host",
+      "seed": 8,
+      "topology": "one-host",
+      "workload": "lease-renewal",
+      "faults": ["wall-clock-backward", "wall-clock-forward"],
+      "fence": "monotonic-lease-state",
+      "expected": "one-writer"
+    }
+  ],
+  "invariants": [
+    "one-writer",
+    "ordered-raw-bytes",
+    "no-ack-beyond-sent",
+    "bounded-queues",
+    "resync-convergence",
+    "no-unauthorized-reconnect",
+    "no-process-handle-task-leak",
+    "content-free-artifacts"
+  ]
+}

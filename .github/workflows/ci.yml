@@ -3,12 +3,73 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "17 2 * * *"
+    - cron: "41 3 * * 0"
+  workflow_dispatch:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 permissions:
   contents: read
 jobs:
+  terminal-quality:
+    name: Terminal conformance, fuzz, compatibility, chaos
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.15.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:terminal:protocol
+      - run: pnpm test:fuzz:smoke
+      - run: pnpm test:compatibility
+      - run: pnpm test:chaos
+      - run: pnpm test:diagnostics
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terminal-quality-artifacts
+          path: test-results
+          retention-days: 30
+  terminal-nightly:
+    name: Terminal nightly sanitizer and soak
+    if: github.event_name == 'schedule' && github.event.schedule == '17 2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.15.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:server:sanitizers
+      - run: pnpm test:soak -- --duration=2h --seed=1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: terminal-nightly, path: test-results, retention-days: 30 }
+  terminal-weekly:
+    name: Terminal weekly bounded soak shard
+    if: github.event_name == 'schedule' && github.event.schedule == '41 3 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.15.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:soak -- --duration=5h --seed=41
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: terminal-weekly-shard, path: test-results, retention-days: 90 }
   source:
     name: Source, recovery, browser, security
     runs-on: ubuntu-latest
@@ -18,7 +79,7 @@ jobs:
       - uses: pnpm/action-setup@v4
         with: { version: 9.15.0 }
       - uses: actions/setup-node@v4
-        with: { node-version: 22.19.0, cache: pnpm }
+        with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm check
@@ -42,7 +103,7 @@ jobs:
       - uses: pnpm/action-setup@v4
         with: { version: 9.15.0 }
       - uses: actions/setup-node@v4
-        with: { node-version: 22.19.0, cache: pnpm }
+        with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:soak:ci
       - uses: actions/upload-artifact@v4
@@ -60,7 +121,7 @@ jobs:
       - uses: pnpm/action-setup@v4
         with: { version: 9.15.0 }
       - uses: actions/setup-node@v4
-        with: { node-version: 22.19.0, cache: pnpm }
+        with: { node-version: 24, cache: pnpm }
       - uses: oven-sh/setup-bun@v2
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -69,12 +130,12 @@ jobs:
         if: runner.os == 'Linux'
         run: xvfb-run --auto-servernum pnpm test:electron:packaged
         env:
-          ELECTRON_DISABLE_SECURITY_WARNINGS: 'false'
+          ELECTRON_DISABLE_SECURITY_WARNINGS: "false"
       - name: Packaged smoke (macOS/Windows)
         if: runner.os != 'Linux'
         run: pnpm test:electron:packaged
         env:
-          ELECTRON_DISABLE_SECURITY_WARNINGS: 'false'
+          ELECTRON_DISABLE_SECURITY_WARNINGS: "false"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

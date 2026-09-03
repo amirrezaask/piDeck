@@ -1,0 +1,20 @@
+[package]
+name = "terminal-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1.10"
+libfuzzer-sys = "0.4"
+terminal-protocol = { path = ".." }
+
+[[bin]]
+name = "terminal_protocol_decode"
+path = "fuzz_targets/terminal_protocol_decode.rs"
+test = false
+doc = false
+bench = false

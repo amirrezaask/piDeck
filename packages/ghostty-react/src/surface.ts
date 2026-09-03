@@ -55,6 +55,11 @@ import type {
   TerminalRenderer,
   TerminalRendererSubmissionDiagnostics,
 } from "./renderers/terminal-renderer.js";
+import type {
+  TerminalColdRowPage,
+  TerminalColdRowProvider,
+  TerminalColdSearchPage,
+} from "./cold-row-provider.js";
 
 export const DEFAULT_TERMINAL_FONT_SIZE = 12;
 const MIN_TERMINAL_FONT_SIZE = 6;
@@ -606,6 +611,8 @@ export interface GhosttyTerminalSurfaceOptions {
   readonly onRuntimeError?: (error: Error) => void;
   /** Request an authoritative host replay after worker generation recovery. */
   readonly onRuntimeRecoveryRequired?: () => void;
+  /** Optional bounded provider for immutable rows older than Ghostty's hot window. */
+  readonly coldRows?: TerminalColdRowProvider;
 }
 
 export interface TerminalRendererCpuPercentiles {
@@ -692,6 +699,7 @@ export class GhosttyTerminalSurface {
     originY: CONTENT_PADDING,
   };
   private readonly options: GhosttyTerminalSurfaceOptions;
+  private readonly coldRows: TerminalColdRowProvider | null;
   private lastTitle = "";
   private metrics: GhosttyCellMetrics;
   private fontFamily: string;
@@ -811,6 +819,7 @@ export class GhosttyTerminalSurface {
     this.core = core;
     this.metrics = metrics;
     this.options = options;
+    this.coldRows = options.coldRows ?? null;
     this.theme = options.theme;
     this.visible = options.visible ?? true;
     mount.dataset.ghosttyTerminalRuntime = core.kind;
@@ -1465,6 +1474,20 @@ export class GhosttyTerminalSurface {
     return this.viewportModel.bufferText();
   }
 
+  /** Load one bounded immutable row page without routing its text through React state. */
+  readColdRows(options: Parameters<TerminalColdRowProvider["readRows"]>[0] = {}): Promise<TerminalColdRowPage> {
+    if (this.disposed) return Promise.reject(new Error("Terminal surface is disposed"));
+    if (!this.coldRows) return Promise.reject(new Error("Terminal cold-row provider is unavailable"));
+    return this.coldRows.readRows(options);
+  }
+
+  /** Search the cold index; revealing a hit remains a viewport operation. */
+  searchColdRows(options: Parameters<TerminalColdRowProvider["search"]>[0]): Promise<TerminalColdSearchPage> {
+    if (this.disposed) return Promise.reject(new Error("Terminal surface is disposed"));
+    if (!this.coldRows) return Promise.reject(new Error("Terminal cold-row provider is unavailable"));
+    return this.coldRows.search(options);
+  }
+
   async capturePixelStats(): Promise<{
     readonly width: number;
     readonly height: number;
@@ -1602,6 +1625,7 @@ export class GhosttyTerminalSurface {
     }
     this.removeEvents();
     this.viewportActivity.dispose();
+    this.coldRows?.dispose();
     this.rendererController.dispose();
     this.core.dispose();
     if (

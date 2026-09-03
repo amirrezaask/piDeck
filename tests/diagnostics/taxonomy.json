@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "fields": [
+    {
+      "name": "build.version",
+      "owner": "runtime",
+      "type": "version",
+      "cardinality": 64,
+      "sensitivity": "public",
+      "retention": "bundle"
+    },
+    {
+      "name": "platform.os",
+      "owner": "runtime",
+      "type": "enum",
+      "cardinality": 8,
+      "sensitivity": "public",
+      "retention": "bundle"
+    },
+    {
+      "name": "terminal.phase",
+      "owner": "terminal-runtime",
+      "type": "enum",
+      "cardinality": 8,
+      "sensitivity": "operational",
+      "retention": "bounded-trace"
+    },
+    {
+      "name": "terminal.thermal",
+      "owner": "terminal-runtime",
+      "type": "enum",
+      "cardinality": 3,
+      "sensitivity": "operational",
+      "retention": "bounded-trace"
+    },
+    {
+      "name": "terminal.pty_bytes",
+      "owner": "terminal-runtime",
+      "type": "counter",
+      "cardinality": 1,
+      "sensitivity": "operational",
+      "retention": "process"
+    },
+    {
+      "name": "terminal.queue_bytes",
+      "owner": "terminal-transport",
+      "type": "gauge",
+      "cardinality": 1,
+      "sensitivity": "operational",
+      "retention": "process"
+    },
+    {
+      "name": "terminal.queue_high_water_bytes",
+      "owner": "terminal-transport",
+      "type": "gauge",
+      "cardinality": 1,
+      "sensitivity": "operational",
+      "retention": "bundle"
+    },
+    {
+      "name": "terminal.resync_total",
+      "owner": "terminal-transport",
+      "type": "counter",
+      "cardinality": 1,
+      "sensitivity": "operational",
+      "retention": "process"
+    },
+    {
+      "name": "terminal.snapshot_duration_ms",
+      "owner": "terminal-runtime",
+      "type": "histogram",
+      "cardinality": 1,
+      "sensitivity": "operational",
+      "retention": "process"
+    },
+    {
+      "name": "history.bytes",
+      "owner": "history-owner",
+      "type": "gauge",
+      "cardinality": 1,
+      "sensitivity": "operational",
+      "retention": "bundle"
+    },
+    {
+      "name": "history.ingest_rejections",
+      "owner": "history-owner",
+      "type": "counter",
+      "cardinality": 1,
+      "sensitivity": "operational",
+      "retention": "process"
+    },
+    {
+      "name": "rpc.route_class",
+      "owner": "server",
+      "type": "enum",
+      "cardinality": 16,
+      "sensitivity": "operational",
+      "retention": "bounded-trace"
+    },
+    {
+      "name": "rpc.duration_ms",
+      "owner": "server",
+      "type": "histogram",
+      "cardinality": 16,
+      "sensitivity": "operational",
+      "retention": "process"
+    },
+    {
+      "name": "error.code",
+      "owner": "runtime",
+      "type": "enum",
+      "cardinality": 128,
+      "sensitivity": "operational",
+      "retention": "bounded-trace"
+    },
+    {
+      "name": "correlation.alias",
+      "owner": "runtime",
+      "type": "bundle-alias",
+      "cardinality": 4096,
+      "sensitivity": "local-alias",
+      "retention": "bundle"
+    }
+  ],
+  "prohibited": [
+    "terminal-input",
+    "terminal-output",
+    "command",
+    "cwd",
+    "environment",
+    "title",
+    "token",
+    "secret",
+    "password",
+    "cookie",
+    "authorization",
+    "url",
+    "path",
+    "device-id",
+    "invitation"
+  ]
+}

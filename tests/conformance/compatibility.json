@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "supportWindow": "current release and one explicitly supported legacy edge protocol",
+  "pairs": [
+    {
+      "id": "current-client-current-host",
+      "client": 4,
+      "host": 4,
+      "expected": "supported",
+      "path": "protocol-v4"
+    },
+    {
+      "id": "previous-client-current-host",
+      "client": 1,
+      "host": 4,
+      "expected": "supported",
+      "path": "protocol-v1-edge-adapter"
+    },
+    {
+      "id": "current-client-previous-host",
+      "client": 4,
+      "host": 1,
+      "expected": "unsupported",
+      "reason": "previous host cannot negotiate checkpoint plus ordered protocol-v4 bytes"
+    },
+    {
+      "id": "semantic-v3-capable-client",
+      "client": 3,
+      "host": 4,
+      "expected": "unsupported",
+      "reason": "semantic v3 is compatibility-only and cannot become the capable-client data plane"
+    }
+  ]
+}

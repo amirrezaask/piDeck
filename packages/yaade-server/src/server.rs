@@ -122,7 +122,10 @@ pub async fn serve(mut config: HostConfig) -> Result<RunningServer, Box<dyn std:
     let agent_router = crate::agents::router(Arc::clone(&runtime))?;
     let terminal_router = Router::new()
         .route("/health", get(health))
+        .route("/api/v1/readiness", get(readiness))
         .route("/api/v1/system", get(system))
+        .route("/api/v1/status", get(diagnostics))
+        .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/diagnostics", get(diagnostics))
         .route("/api/v1/security/pair", post(pair_device))
         .route("/api/v1/security/challenge", post(device_challenge))
@@ -312,6 +315,22 @@ async fn health(State(state): State<AppState>) -> Response {
     )
 }
 
+async fn readiness(State(state): State<AppState>) -> Response {
+    let ready = state.runtime.store.health();
+    json_response(
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        json!({
+            "status": if ready { "ready" } else { "not-ready" },
+            "store": if ready { "available" } else { "unavailable" },
+            "terminalRuntime": "available",
+        }),
+    )
+}
+
 async fn system(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     let Some(_) = request_principal(&state.runtime, &headers, &uri, None) else {
         return unauthorized();
@@ -365,6 +384,41 @@ async fn diagnostics(State(state): State<AppState>, headers: HeaderMap, uri: Uri
                 "revokedAt": device.revoked_at,
             })).collect::<Vec<_>>(),
             "capabilities": state.runtime.capabilities,
+        }),
+    )
+}
+
+async fn metrics(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let Some(_) = request_principal(&state.runtime, &headers, &uri, None) else {
+        return unauthorized();
+    };
+    let terminal = state.runtime.terminal.runtime_diagnostics();
+    let history = state.runtime.terminal.history_capacity_diagnostics();
+    let transport = ConnectionOutbound::global_diagnostics();
+    json_response(
+        StatusCode::OK,
+        json!({
+            "version": 1,
+            "sessions": {
+                "active": terminal.terminal_sessions_active,
+                "parked": terminal.terminal_sessions_parked,
+                "attachedClients": terminal.terminal_clients_attached,
+            },
+            "pty": {
+                "bytesReadTotal": terminal.pty_bytes_read_total,
+                "bytesWrittenTotal": terminal.pty_bytes_written_total,
+            },
+            "snapshots": {
+                "total": terminal.terminal_snapshots_total,
+                "bytesTotal": terminal.terminal_snapshot_bytes,
+                "durationNanosecondsTotal": terminal.terminal_snapshot_duration_ns_total,
+            },
+            "history": {
+                "ingestQueueBytes": history.ingest_queue_bytes,
+                "bytesAcceptedTotal": history.history_bytes_accepted_total,
+                "ingestRejectionsTotal": history.history_ingest_rejections_total,
+            },
+            "transport": transport,
         }),
     )
 }

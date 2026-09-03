@@ -23,6 +23,15 @@ export type {
   TerminalViewportActivityMode,
 } from "./viewport-activity.js"
 export {
+  TerminalColdRowProvider,
+  type TerminalColdRow,
+  type TerminalColdRowPage,
+  type TerminalColdRowProviderOptions,
+  type TerminalColdRowSource,
+  type TerminalColdSearchHit,
+  type TerminalColdSearchPage,
+} from "./cold-row-provider.js"
+export {
   GHOSTTY_CELL_WIDE,
   ghosttyColorsEqual,
   type GhosttyCell,
