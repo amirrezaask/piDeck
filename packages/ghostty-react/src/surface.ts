@@ -1071,7 +1071,13 @@ export class GhosttyTerminalSurface {
     this.snapshot = null
     this.forceFullRender = true
     this.terminalStateDirty = true
-    await this.core.restoreSnapshot(snapshot)
+    await this.core.restoreSnapshot(
+      snapshot,
+      this.cols,
+      this.rows,
+      this.metrics.width,
+      this.metrics.height,
+    )
     this.snapshotRestoreCount += 1
     this.mount.dataset.ghosttyTerminalSnapshotRestoreCount = String(this.snapshotRestoreCount)
     this.contentGeneration += 1

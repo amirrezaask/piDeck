@@ -234,6 +234,63 @@ test.describe("terminal compatibility", () => {
     expect(await terminalText()).not.toContain("YAADE_TERMINAL_THEME_ERROR")
   })
 
+  test("checkpoint restore refits the browser replica before accepting input", async ({
+    launchApp,
+  }) => {
+    const { page } = await launchApp()
+    const panel = page.locator(
+      '[data-yaade-terminal-panel][data-yaade-terminal-status="running"]',
+    ).filter({ visible: true }).first()
+    await expect(panel).toBeVisible({ timeout: 30_000 })
+    await expect(panel.locator("[data-ghostty-terminal]")).toHaveAttribute(
+      "data-ghostty-terminal-snapshot-restore-count",
+      "1",
+      { timeout: 30_000 },
+    )
+
+    const terminal = await page.evaluate(() => {
+      const state = window.__yaadeTest?.getState()
+      const id = state?.activeMuxTerminalId
+      const entry = state?.muxTerminals.find(candidate => candidate.id === id)
+      const ptyId = entry?.output.kind === "process" ? entry.output.ptyId : null
+      const cols = id ? window.__yaadeTest?.getTerminalDims(id)?.cols : null
+      return { id: id ?? null, ptyId: ptyId ?? null, cols: cols ?? null }
+    })
+    if (!terminal.id || !terminal.ptyId || !terminal.cols) {
+      throw new Error("running terminal geometry is unavailable")
+    }
+    expect(terminal.cols).toBeGreaterThan(100)
+
+    const source = [
+      "process.stdin.setRawMode(true)",
+      "const cols=process.stdout.columns",
+      "process.stdout.write('\\x1b[2J\\x1b[HGEOMETRY:'+cols+'\\x1b[3;'+(cols-1)+'H')",
+      "process.stdin.once('data',data=>{process.stdout.write(data);setTimeout(()=>process.exit(),250)})",
+    ].join(";")
+    await page.evaluate(
+      async ({ ptyId, command }) => {
+        if (!window.yaade?.terminal) throw new Error("terminal API is unavailable")
+        await window.yaade.terminal.write(ptyId, `node -e ${JSON.stringify(command)}\n`)
+      },
+      { ptyId: terminal.ptyId, command: source },
+    )
+
+    const terminalText = () => page.evaluate(
+      id => window.__yaadeTest?.getTerminalText(id) ?? "",
+      terminal.id,
+    )
+    await expect.poll(terminalText, { timeout: 15_000 }).toContain(`GEOMETRY:${terminal.cols}`)
+    await focusTerminal(page)
+    await page.keyboard.type("X")
+    await expect.poll(async () => (await terminalText()).split("\n")[2] ?? "").toHaveLength(
+      terminal.cols - 1,
+    )
+    const inputRow = (await terminalText()).split("\n")[2] ?? ""
+    expect(inputRow.endsWith("X")).toBe(true)
+    expect(inputRow.indexOf("X")).toBe(terminal.cols - 2)
+    await expect(page.locator("[data-yaade-connection]")).toHaveCount(0)
+  })
+
   test("default worker runtime preserves key and Unicode input order", async ({
     launchApp,
   }) => {

@@ -287,6 +287,16 @@ function process(command: TerminalWorkerCommand, entry: RuntimeEntry): void {
       try {
         cancelPendingUpdate(command.terminalId)
         core.restoreBinarySnapshot(command.data)
+        // A server snapshot carries the authority's PTY geometry. The browser
+        // replica is viewport-owned, so restore and refit as one worker command;
+        // exposing an intermediate server-sized frame misplaces wrapped prompts
+        // and cursor input until an unrelated resize occurs.
+        core.resize(
+          command.cols,
+          command.rows,
+          command.cellWidth,
+          command.cellHeight,
+        )
         requestPresentation(command, entry, true)
         post({ ...envelope(command), type: "snapshotRestored" })
       } catch (error) {

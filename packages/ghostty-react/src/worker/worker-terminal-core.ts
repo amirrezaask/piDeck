@@ -31,7 +31,13 @@ export interface TerminalCoreRuntime {
   readonly runtimeGeneration: number;
   write(data: string | Uint8Array, parsed?: ParsedCallback): void;
   writeReplay(chunks: readonly Uint8Array[], parsed?: ParsedCallback): void;
-  restoreSnapshot(data: Uint8Array): Promise<void>;
+  restoreSnapshot(
+    data: Uint8Array,
+    cols: number,
+    rows: number,
+    cellWidth: number,
+    cellHeight: number,
+  ): Promise<void>;
   resetAndWrite(data: string | Uint8Array, parsed?: ParsedCallback): void;
   resize(cols: number, rows: number, cellWidth: number, cellHeight: number): void;
   setTheme(theme: GhosttyTheme): void;
@@ -79,8 +85,17 @@ export class MainThreadTerminalCore implements TerminalCoreRuntime {
   }
   write(data: string | Uint8Array, parsed?: ParsedCallback): void { this.core.write(data); parsed?.(); }
   writeReplay(chunks: readonly Uint8Array[], parsed?: ParsedCallback): void { this.core.writeReplay(chunks); parsed?.(); }
-  restoreSnapshot(data: Uint8Array): Promise<void> {
-    return Promise.resolve().then(() => this.core.restoreBinarySnapshot(data))
+  restoreSnapshot(
+    data: Uint8Array,
+    cols: number,
+    rows: number,
+    cellWidth: number,
+    cellHeight: number,
+  ): Promise<void> {
+    return Promise.resolve().then(() => {
+      this.core.restoreBinarySnapshot(data)
+      this.core.resize(cols, rows, cellWidth, cellHeight)
+    })
   }
   resetAndWrite(data: string | Uint8Array, parsed?: ParsedCallback): void { this.core.resetAndWrite(data); parsed?.(); }
   resize(cols: number, rows: number, cellWidth: number, cellHeight: number): void { this.core.resize(cols, rows, cellWidth, cellHeight); }
@@ -336,12 +351,25 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
     if (owned.length === 0) { parsed?.(); return }
     this.command({ type: "writeReplayBytes", chunks: owned }, parsed)
   }
-  restoreSnapshot(data: Uint8Array): Promise<void> {
+  restoreSnapshot(
+    data: Uint8Array,
+    cols: number,
+    rows: number,
+    cellWidth: number,
+    cellHeight: number,
+  ): Promise<void> {
     if (this.disposed || this.recovering || data.byteLength === 0) {
       return Promise.reject(new Error("Terminal runtime cannot restore a snapshot"))
     }
     const owned = ownedTerminalBytes(data)
-    const sequence = this.send({ type: "restoreSnapshot", data: owned })
+    const sequence = this.send({
+      type: "restoreSnapshot",
+      data: owned,
+      cols,
+      rows,
+      cellWidth,
+      cellHeight,
+    })
     return new Promise((resolve, reject) => {
       this.snapshotRestores.set(sequence, { resolve, reject })
     })

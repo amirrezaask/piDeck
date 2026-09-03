@@ -36,7 +36,7 @@ export type TerminalWorkerCommandPayload =
   | { readonly type: "writeBytes"; readonly data: Uint8Array<ArrayBuffer> }
   | { readonly type: "writeReplayBytes"; readonly chunks: readonly Uint8Array<ArrayBuffer>[] }
   | { readonly type: "resetAndWriteBytes"; readonly data: Uint8Array<ArrayBuffer> }
-  | { readonly type: "restoreSnapshot"; readonly data: Uint8Array<ArrayBuffer> }
+  | { readonly type: "restoreSnapshot"; readonly data: Uint8Array<ArrayBuffer>; readonly cols: number; readonly rows: number; readonly cellWidth: number; readonly cellHeight: number }
   | { readonly type: "recycleRenderUpdate"; readonly slotId: number; readonly leaseToken: number; readonly buffers: GhosttyRenderUpdateBuffers }
   | { readonly type: "resize"; readonly cols: number; readonly rows: number; readonly cellWidth: number; readonly cellHeight: number }
   | { readonly type: "setTheme"; readonly theme: GhosttyTheme }
@@ -121,8 +121,14 @@ const COMMAND_TYPES = new Set([
 export function validateTerminalWorkerCommand(value: unknown): value is TerminalWorkerCommand {
   if (!isRecord(value) || !validEnvelope(value) || !COMMAND_TYPES.has(String(value.type))) return false;
   switch (value.type) {
-    case "writeBytes": case "restoreSnapshot":
+    case "writeBytes":
       return value.data instanceof Uint8Array && value.data.byteLength > 0 && value.data.buffer.byteLength > 0;
+    case "restoreSnapshot":
+      return value.data instanceof Uint8Array && value.data.byteLength > 0 && value.data.buffer.byteLength > 0 &&
+        Number.isFinite(value.cols) && Number(value.cols) > 0 &&
+        Number.isFinite(value.rows) && Number(value.rows) > 0 &&
+        Number.isFinite(value.cellWidth) && Number(value.cellWidth) > 0 &&
+        Number.isFinite(value.cellHeight) && Number(value.cellHeight) > 0;
     case "resetAndWriteBytes":
       return value.data instanceof Uint8Array;
     case "writeReplayBytes":

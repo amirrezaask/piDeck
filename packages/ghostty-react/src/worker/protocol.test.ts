@@ -53,7 +53,7 @@ test("validates every worker command family and rejects malformed envelopes", ()
     { ...envelope, type: "writeBytes", data: new Uint8Array([120]) },
     { ...envelope, type: "writeReplayBytes", chunks: [new Uint8Array([120])] },
     { ...envelope, type: "resetAndWriteBytes", data: new Uint8Array([120]) },
-    { ...envelope, type: "restoreSnapshot", data: new Uint8Array([120]) },
+    { ...envelope, type: "restoreSnapshot", data: new Uint8Array([120]), cols: 80, rows: 24, cellWidth: 8, cellHeight: 16 },
     {
       ...envelope,
       type: "recycleRenderUpdate",
@@ -96,6 +96,11 @@ test("validates every worker command family and rejects malformed envelopes", ()
   assert.equal(validateTerminalWorkerCommand({ ...envelope, sequence: -1, type: "dispose" }), false)
   assert.equal(validateTerminalWorkerCommand({ ...envelope, type: "writeBytes", data: "x" }), false)
   assert.equal(validateTerminalWorkerCommand({ ...envelope, type: "writeBytes", data: new Uint8Array() }), false)
+  assert.equal(validateTerminalWorkerCommand({
+    ...envelope,
+    type: "restoreSnapshot",
+    data: new Uint8Array([120]),
+  }), false)
   assert.equal(validateTerminalWorkerCommand({ ...envelope, type: "unknown" }), false)
 })
 
