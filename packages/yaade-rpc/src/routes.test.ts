@@ -165,7 +165,7 @@ test("terminal checkpoints preserve compatibility metadata and reject unsafe bou
   )
   assert.throws(() => decodeHostRouteResult("terminal:attach", {
     ...attach,
-    checkpoint: { ...checkpoint, payloadBytes: 384 * 1024 + 1 },
+    checkpoint: { ...checkpoint, payloadBytes: 8 * 1024 * 1024 + 1 },
   }))
 })
 

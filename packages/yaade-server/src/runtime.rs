@@ -182,8 +182,7 @@ impl HostRuntime {
                 "device authentication initialization failed: {error}"
             ))
         })?);
-        let capabilities =
-            ServerCapabilities::parity(&identity, config.features.terminal_checkpoints);
+        let capabilities = ServerCapabilities::parity(&identity, true);
         let runtime = Arc::new(Self {
             home_dir: std::env::var("HOME").unwrap_or_default(),
             machine_hostname,

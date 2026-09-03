@@ -8,13 +8,17 @@ YAADE uses one host process as the terminal multiplexer:
 browser  <->  host server  <->  TerminalHost  <->  portable-pty children
 ```
 
-`TerminalHost` maps terminal IDs to handles. One owner thread per terminal constructs,
-mutates, and drops its `ghostty_vt::Terminal`. The same thread owns the PTY master,
-writer, child, replay, restorable checkpoint state, and writer leases. Native Ghostty
-never enters an `Arc`, mutex, async task, history worker, or socket path. A
-small 256 KiB-stack reader thread only reads the blocking PTY and sends at most
-64 immutable 64 KiB chunks over a bounded channel. The 1 MiB-stack owner
-services 64-entry urgent and normal command lanes between 1 MiB output quanta.
+`TerminalHost` maps terminal IDs to handles. One 512 KiB-stack owner thread per
+terminal constructs, mutates, and drops its `ghostty_vt::Terminal`. The same
+thread owns the PTY master, writer, child, replay, restorable checkpoint state,
+thermal state, attachment phase, and writer leases. Native Ghostty never enters
+an `Arc`, mutex, async task, history worker, or socket path. Unix PTY masters are
+nonblocking and registered once with the process-wide `PtyPoller`, which uses
+`polling`'s epoll/kqueue backend. Poll registrations have monotonically unique
+generations so a reused descriptor cannot receive stale events. There is no
+reader thread per Unix PTY; Windows retains a clearly separated fallback until
+a measured ConPTY completion design exists. The owner services 64-entry urgent
+and normal command lanes between 1 MiB output quanta.
 It drains up to 64 immediately available adjacent writes into one bounded 256
 KiB scratch batch and flushes once; a lone keystroke is never timer-delayed.
 Consecutive resize bursts are latest-wins within the same owner turn, all
@@ -23,7 +27,9 @@ and checkpoint together. Terminal-map cleanup also uses a bounded 256-entry lane
 Queue saturation returns a typed runtime error.
 
 The history owner accepts records through a 1,024-message / 32 MiB ingest
-mailbox. A separate bounded 1,024-message close lane reserves lifecycle progress;
+mailbox. Live PTY owners use its nonblocking append operation: saturation is
+reported as degraded history and never stalls PTY fanout. A separate bounded
+1,024-message close lane reserves lifecycle progress;
 a full or stopped lane returns a typed error rather than dropping finalization.
 The owner writes a checksummed append-only active segment before adding each
 record to its 512 KiB binary block batch. Startup keeps complete records and
@@ -55,34 +61,42 @@ fallback. It never adopts the old PTY or signals a reused PID.
 
 ## Data path
 
-Each PTY output chunk enters one native Ghostty write on its owner thread. The
-owner copies bounded query responses, title, working directory, and bell effects
-after the native call returns. It writes and flushes PTY responses before it
-publishes the original opaque bytes to replay, history, or live clients. PTY
-output remains ordered `Bytes` through immutable replay/history/live frames,
-binary WebSocket payloads, browser
-`Uint8Array` replay coordination, and the Ghostty worker. Only terminal IDs and completed textual protocol metadata are UTF-8 decoded.
+Each PTY read creates one immutable `Bytes` chunk. In one owner turn the byte
+position advances, Ghostty consumes that exact chunk, in-band query responses
+return to the PTY input sequencer, and the same allocation is submitted to live
+fanout and the lower-priority history lane. Live fanout happens before the
+nonblocking history submission. `EventHub` encodes one shared protocol-v4
+`PTY_DATA` message per chunk; attached clients clone handles, not payloads.
+WebSocket libraries may perform the final contiguous-message copy. PTY and
+input payloads remain opaque binary through server, WebSocket, browser
+`Uint8Array`, and Ghostty worker. Only terminal IDs and completed textual
+protocol metadata are UTF-8 decoded.
 Ghostty's public snapshot encoder produces bounded, CRC-protected checkpoint-v2
 payloads with exact parser continuation. The history owner atomically persists the
 opaque public payload and its YAADE envelope; private parser memory is never
 serialized. Durable history stores a
 versioned big-endian binary record stream inside compressed blocks, so malformed
-or incomplete UTF-8 replays exactly. Output is batched by byte count to reduce
-framing overhead, while small interactive chunks flush immediately. A
-fresh browser renderer attaches behind a replay barrier: history pages are
-parsed in order, concurrent live bytes remain bounded, and only bytes newer
-than the replay cursor are released afterward. Each admitted WebSocket has one writer task as the sole sink owner. The reader
+or incomplete UTF-8 replays exactly. Output is batched by byte count to reduce framing overhead, while small
+interactive chunks flush immediately. Capable clients use the transport-neutral
+36-byte protocol-v4 header and inclusive epoch/byte positions. Attach takes an
+owner-side atomic cut `N`, then queues the small attach result, opaque binary
+`SNAPSHOT @ N`, `READY @ N`, and only `PTY_DATA` after `N`. The client validates
+the stream ID, epoch, and contiguous byte range and does not restore or send
+input before the snapshot/READY barrier. Input and resize use binary frames with
+independent monotonic positions. A per-client overflow emits binary
+`RESYNC_BEGIN`, drops stale deltas, and starts the same attach transaction.
+Protocol 1 remains a network-edge compatibility adapter only. Each admitted
+WebSocket has one writer task as the sole sink owner. The reader
 handles commands and ACKs without awaiting network output; every producer uses
-a non-awaiting `ConnectionOutbound` backed by bounded reliable, ordered raw, and
-replaceable semantic lanes. `EventHub` indexes weak subscribers by terminal and
+a non-awaiting `ConnectionOutbound` backed by bounded reliable and ordered raw
+lanes. Semantic snapshot/patch frames are not connected to the capable-client
+runtime. `EventHub` indexes weak subscribers by terminal and
 connection, so a raw terminal frame visits only attached clients while metadata
 retains the shared sequence source. On raw/flow overflow the connection rejects
-later live bytes for that terminal and enqueues one reliable replay-required
-fence at the parser-acknowledged sequence; reliable overflow closes with 1013.
+later live bytes for that terminal and enqueues one reliable binary resync fence
+at the parser-acknowledged byte position; reliable overflow closes with 1013.
 A successful attach/replay resets the fence. Consequently a slow viewer cannot
-pause the PTY, another viewer, or its own inbound command task. Semantic
-snapshots use a replaceable binary lane rather than the reliable control
-mailbox. The history archive can rebuild terminal bytes after the live replay ring trims
+pause the PTY, another viewer, or its own inbound command task. The history archive can rebuild terminal bytes after the live replay ring trims
 old chunks and can serve validated pages without a live terminal entry. It does
 not keep the PTY alive across host restarts. Mailbox acceptance is a bounded
 in-memory fence, not an `fsync` promise. `flush_all` waits for accepted records,
@@ -92,10 +106,26 @@ recovery retains complete checksummed active records and rejects missing or
 corrupt archives instead of presenting partial output as exact.
 
 Input, resize, paste, focus, mouse, and close operations use per-connection
-writer leases. The terminal owner authorizes a mutation and applies it in one
-command, so queue rejection cannot consume a command fence. Authenticated
+writer leases. Input and resize are rejected until that connection has completed
+its `READY` barrier. The terminal owner authorizes a mutation and applies it in
+one command, so queue rejection cannot consume a command fence. Authenticated
 connections with control scope may mutate the same terminal concurrently;
 observe-only connections remain read-only.
+
+## Thermal lifecycle
+
+Every authority has an explicit `Hot`, `Warm`, or `Parked` state. Recent IO or
+attachments promote it to hot. Idle owner turns run Ghostty incremental
+compression for warm sessions and full compression plus transient replay
+capacity trimming for parked sessions. PTY descriptors remain registered with
+the shared poller, so readiness promotes a parked session without descriptor
+handoff. Diagnostics expose session counts, attached clients, PTY bytes,
+snapshot bytes/counts, compression runs, and thermal transitions. This is
+memory compaction, not process persistence; host death still ends PTYs.
+
+The remaining scaling seam is explicit: mutable Ghostty authority still has one
+owner thread per terminal. The normative target requires fixed owner shards
+before the runtime may claim resource use independent of idle session count.
 
 ## Browser parser and presentation
 
@@ -125,7 +155,7 @@ buffers.
 1. Keep PTY ownership in `TerminalHost` and lifecycle in the host Effect scope.
 2. Never block PTY output on a browser or WebSocket.
 3. Keep replay and queues bounded; a detected gap must trigger resynchronization.
-4. Keep reliable control, ordered raw output, and replaceable semantic state in separate lanes.
+4. Keep reliable control, ordered raw output, and asynchronous history in separate bounded lanes; semantic screen diffs are not the capable-client data plane.
 5. Prefer direct calls over process boundaries, adapters, and recovery state.
 6. Test a real interactive shell and a directly launched command through
    `portable-pty`.

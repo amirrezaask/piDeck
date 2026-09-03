@@ -290,6 +290,32 @@ test("a cold archive fetches its newest page before ordered history replay", asy
   )
 })
 
+test("binary snapshot and READY complete the attach barrier before restore", async () => {
+  const transport = new FakeTransport()
+  const snapshot = await checkpoint("epoch-binary", 7)
+  transport.queueAttach({
+    id: "pty-binary-checkpoint",
+    terminalEpoch: "epoch-binary",
+    checkpoint: { ...snapshot, snapshotBytes: new Uint8Array() },
+    outputChunks: [],
+    output: new Uint8Array(),
+    lastSequence: 7,
+    status: "running",
+  })
+  const api = createYaadeApi(transport)
+  let restored: Uint8Array | undefined
+  const attached = api.terminal.attach("pty-binary-checkpoint", {
+    replay: "full",
+    onCheckpoint: value => { restored = value.snapshotBytes },
+  })
+  queueMicrotask(() => {
+    transport.emit("terminal:snapshot-bytes", "pty-binary-checkpoint", snapshot.snapshotBytes, 7)
+    transport.emit("terminal:ready", "pty-binary-checkpoint", 7)
+  })
+  await attached
+  assert.deepEqual(restored, snapshot.snapshotBytes)
+})
+
 test("a validated checkpoint restores before ordered post-cut bytes", async () => {
   const transport = new FakeTransport()
   const snapshot = await checkpoint("epoch-1", 3)

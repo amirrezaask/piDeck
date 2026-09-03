@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -21,6 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, delete, get, post},
 };
+use base64::Engine as _;
 use futures_util::{
     SinkExt as _, StreamExt as _,
     stream::{SplitSink, SplitStream},
@@ -354,6 +355,7 @@ async fn diagnostics(State(state): State<AppState>, headers: HeaderMap, uri: Uri
                 "runningTerminals": state.runtime.running_terminal_count(),
             },
             "memory": {
+                "terminalRuntime": state.runtime.terminal.runtime_diagnostics(),
                 "terminalHistory": state.runtime.terminal.history_capacity_diagnostics(),
             },
             "devices": state.runtime.devices.list().unwrap_or_default().into_iter().map(|device| json!({
@@ -664,6 +666,7 @@ async fn handle_socket(
     });
     let mut attached = HashSet::<String>::new();
     let mut raw = HashSet::<String>::new();
+    let mut terminal_streams = HashMap::<u64, (String, u64, u64, u64)>::new();
     let mut queued_commands = 0_usize;
 
     loop {
@@ -714,13 +717,15 @@ async fn handle_socket(
                         {
                             attached.remove(id);
                             raw.remove(id);
+                            terminal_streams.retain(|_, (terminal_id, _, _, _)| terminal_id != id);
                             outbound.detach(id);
                             runtime.events.detach_terminal(id, &principal.connection_id);
                         }
                         let result = runtime.dispatch(&principal, &command.op, &command.args);
                         queued_commands = queued_commands.saturating_sub(1);
                         let mut attach_snapshot = None;
-                        let response = match result {
+                        let mut attach_stream = None;
+                        let mut response = match result {
                             Ok(value) => {
                                 if command.op == "terminal:attach" {
                                     let last_sequence = value
@@ -728,6 +733,15 @@ async fn handle_socket(
                                         .and_then(Value::as_u64)
                                         .unwrap_or(0);
                                     attach_snapshot = Some(last_sequence);
+                                    attach_stream = value
+                                        .get("streamId")
+                                        .and_then(Value::as_u64)
+                                        .zip(value.get("streamEpoch").and_then(Value::as_u64));
+                                    if let Some((stream_id, epoch)) = attach_stream
+                                        && let Some(id) = command.args.first().and_then(Value::as_str)
+                                    {
+                                        terminal_streams.insert(stream_id, (id.to_owned(), epoch, 0, 0));
+                                    }
                                 }
                                 json!({
                                     "type": "terminal:result",
@@ -752,14 +766,106 @@ async fn handle_socket(
                                 })
                             }
                         };
+                        let attach_snapshot_payload = if protocol == 2 && command.op == "terminal:attach" {
+                            response
+                                .get_mut("value")
+                                .and_then(Value::as_object_mut)
+                                .and_then(|value| value.get_mut("checkpoint"))
+                                .and_then(Value::as_object_mut)
+                                .and_then(|checkpoint| checkpoint.get_mut("snapshotBytes"))
+                                .and_then(|encoded| {
+                                    let decoded = base64::engine::general_purpose::STANDARD
+                                        .decode(encoded.as_str()?)
+                                        .ok()?;
+                                    *encoded = Value::String(String::new());
+                                    Some(Bytes::from(decoded))
+                                })
+                        } else {
+                            None
+                        };
                         let accepted = if command.op == "terminal:attach" {
                             command.args.first().and_then(Value::as_str).is_some_and(|id| {
-                                outbound.enqueue_attach_result(id, attach_snapshot, &response)
+                                outbound.enqueue_attach_result(
+                                    id,
+                                    attach_snapshot,
+                                    attach_stream,
+                                    attach_snapshot_payload,
+                                    &response,
+                                )
                             })
                         } else {
                             outbound.enqueue_reliable(&response)
                         };
                         if !accepted { break; }
+                    }
+                    Message::Binary(data) => {
+                        let mut input = bytes::BytesMut::from(data.as_ref());
+                        let decoded = terminal_protocol::Codec::default().decode(&mut input);
+                        let Ok(Some(frame)) = decoded else {
+                            outbound.close(1002, "invalid terminal binary frame");
+                            break;
+                        };
+                        if !input.is_empty() {
+                            outbound.close(1002, "multiple terminal frames in one websocket message");
+                            break;
+                        }
+                        let Some((terminal_id, epoch, input_position, control_position)) = terminal_streams.get_mut(&frame.stream_id) else {
+                            outbound.close(1002, "unknown terminal stream");
+                            break;
+                        };
+                        if frame.position.epoch != *epoch {
+                            outbound.close(1002, "stale terminal stream epoch");
+                            break;
+                        }
+                        let result = match frame.kind {
+                            terminal_protocol::FrameType::Input => {
+                                let expected = input_position.saturating_add(frame.payload.len() as u64);
+                                if frame.position.sequence != expected {
+                                    outbound.close(1002, "terminal input sequence gap");
+                                    break;
+                                }
+                                *input_position = expected;
+                                runtime.terminal.authorize_and_write(
+                                    terminal_id,
+                                    &principal.principal_id,
+                                    &principal.connection_id,
+                                    None,
+                                    frame.payload,
+                                )
+                            }
+                            terminal_protocol::FrameType::Resize if frame.payload.len() == 4 => {
+                                let expected = control_position.saturating_add(1);
+                                if frame.position.sequence != expected {
+                                    outbound.close(1002, "terminal control sequence gap");
+                                    break;
+                                }
+                                let cols = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                                let rows = u16::from_be_bytes([frame.payload[2], frame.payload[3]]);
+                                *control_position = expected;
+                                runtime.terminal.authorize_and_resize(
+                                    terminal_id,
+                                    &principal.principal_id,
+                                    &principal.connection_id,
+                                    None,
+                                    cols,
+                                    rows,
+                                )
+                            }
+                            _ => {
+                                outbound.close(1002, "unsupported terminal binary frame");
+                                break;
+                            }
+                        };
+                        if let Err(error) = result
+                            && !outbound.enqueue_reliable(&json!({
+                                "type": "terminal:error",
+                                "terminalId": terminal_id,
+                                "code": error.wire_code(),
+                                "message": error.to_string(),
+                            }))
+                        {
+                            break;
+                        }
                     }
                     Message::Close(_) => break,
                     _ => {}

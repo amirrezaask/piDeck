@@ -12,6 +12,7 @@ pub mod diagnostics;
 pub mod event_hub;
 pub mod model;
 pub mod outbound_mailbox;
+mod pty_poller;
 pub mod runtime;
 pub mod server;
 pub mod service;

@@ -168,7 +168,7 @@ export const TERMINAL_CHECKPOINT_VERSION = 2 as const;
 export const GHOSTTY_ENGINE_REVISION =
   "07bccf7a311acdfa6afc77f2016160d49b1f1982" as const;
 export const GHOSTTY_SNAPSHOT_FORMAT_VERSION = 1 as const;
-export const MAX_TERMINAL_CHECKPOINT_BYTES = 384 * 1024;
+export const MAX_TERMINAL_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 
 export class TerminalCheckpoint extends Schema.Class<TerminalCheckpoint>(
   "TerminalCheckpoint",

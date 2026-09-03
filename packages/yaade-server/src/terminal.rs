@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::{
@@ -16,8 +16,9 @@ use base64::Engine as _;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select_biased};
 use ghostty_vt::{
-    ColorScheme, DeviceAttributes, EffectOptions, Mode, Rgb, Terminal as GhosttyTerminal,
-    TerminalOptions as GhosttyTerminalOptions, TerminalSize, build_revision,
+    ColorScheme, CompressionMode, DeviceAttributes, EffectOptions, Mode, Rgb,
+    Terminal as GhosttyTerminal, TerminalOptions as GhosttyTerminalOptions, TerminalSize,
+    build_revision,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,7 @@ use uuid::Uuid;
 use crate::{
     event_hub::EventHub,
     model::ProcessIdentity,
+    pty_poller::{PtyOutput, PtyPoller},
     terminal_control::{
         RuntimeTerminalLease, TerminalControlError, TerminalControlRegistry, TerminalLeaseRequest,
     },
@@ -39,7 +41,7 @@ use crate::{
     wire::{TerminalLeaseMode, TerminalMutationFence},
 };
 
-const MAX_ENTRIES: usize = 64;
+const MAX_ENTRIES: usize = 1_000;
 const MAX_REPLAY_BYTES: usize = 2 * 1024 * 1024;
 const HOT_SCROLLBACK_ROWS: usize = 10_000;
 const EXITED_REPLAY_BYTES: usize = 256 * 1024;
@@ -48,13 +50,17 @@ const OWNER_COMMAND_BATCH_MESSAGES: usize = 64;
 const OWNER_WRITE_BATCH_BYTES: usize = 256 * 1024;
 const CLEANUP_QUEUE_CAPACITY: usize = 256;
 const CHECKPOINT_BYTES: usize = 512 * 1024;
-// Base64 checkpoint plus a 256 KiB replay tail must fit the 1 MiB WS frame.
-const MAX_CHECKPOINT_BYTES: usize = 384 * 1024;
+// Snapshot payloads use their own bounded binary frame and never base64-expand.
+const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 const CHECKPOINT_MAGIC: &str = "YAADECP2";
 const CHECKPOINT_VERSION: u8 = 2;
 const GHOSTTY_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const EXITED_DISPOSE_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+const WARM_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+const PARK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const THERMAL_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+const PARKED_THERMAL_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +136,9 @@ pub struct TerminalInspect {
     pub os_pid: Option<u32>,
     pub process_identity: Option<ProcessIdentity>,
     pub terminal_epoch: String,
+    pub output_position: u64,
+    pub thermal_state: ThermalState,
+    pub attached_clients: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -137,6 +146,53 @@ pub struct TerminalInspect {
 pub enum TerminalProcessStatus {
     Running,
     Exited,
+}
+
+/// Independent memory/readiness lifecycle for a durable PTY session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThermalState {
+    Hot,
+    Warm,
+    Parked,
+}
+
+/// Exact position in one logical PTY output stream. `sequence` is the
+/// inclusive byte offset of the final published byte; the first byte is 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamPosition {
+    pub epoch: u64,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Default)]
+struct TerminalMetrics {
+    sessions_total: AtomicU64,
+    pty_bytes_read_total: AtomicU64,
+    pty_bytes_written_total: AtomicU64,
+    snapshots_total: AtomicU64,
+    snapshot_bytes_total: AtomicU64,
+    compression_runs_total: AtomicU64,
+    hot_to_parked_total: AtomicU64,
+    parked_to_hot_total: AtomicU64,
+}
+
+/// Content-free terminal runtime metrics and current resource classes.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalRuntimeDiagnostics {
+    pub terminal_sessions_total: u64,
+    pub terminal_sessions_active: usize,
+    pub terminal_sessions_parked: usize,
+    pub terminal_clients_attached: usize,
+    pub pty_bytes_read_total: u64,
+    pub pty_bytes_written_total: u64,
+    pub terminal_snapshots_total: u64,
+    pub terminal_snapshot_bytes: u64,
+    pub terminal_compression_runs_total: u64,
+    pub terminal_hot_to_parked_total: u64,
+    pub terminal_parked_to_hot_total: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -172,6 +228,8 @@ pub struct TerminalAttach {
     pub id: String,
     pub title: Option<String>,
     pub terminal_epoch: String,
+    pub stream_id: u64,
+    pub stream_epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<TerminalCheckpoint>,
     pub replay_quality: &'static str,
@@ -192,8 +250,10 @@ pub struct TerminalAttach {
 pub enum TerminalError {
     #[error("terminal not found: {0}")]
     NotFound(String),
-    #[error("too many terminals (max 64); close a terminal before creating another")]
+    #[error("too many terminals (max 1000); close a terminal before creating another")]
     Limit,
+    #[error("terminal client is synchronizing; input is disabled until READY")]
+    NotReady,
     #[error("invalid terminal input: {0}")]
     Invalid(String),
     #[error("terminal runtime failure: {0}")]
@@ -209,6 +269,7 @@ impl TerminalError {
     pub const fn wire_code(&self) -> &'static str {
         match self {
             Self::NotFound(_) => "NOT_FOUND",
+            Self::NotReady => "TERMINAL_NOT_READY",
             Self::Limit | Self::Invalid(_) | Self::Runtime(_) | Self::History(_) => {
                 "OPERATION_FAILED"
             }
@@ -242,6 +303,10 @@ struct EntryState {
     checkpoint: Option<TerminalCheckpoint>,
     bytes_since_checkpoint: usize,
     last_checkpoint_at: Instant,
+    thermal_state: ThermalState,
+    last_activity_at: Instant,
+    attached_clients: HashSet<String>,
+    compression_activity: u64,
 }
 
 type Reply<T> = Sender<Result<T, TerminalError>>;
@@ -367,12 +432,6 @@ impl TerminalCommand {
     }
 }
 
-enum OutputMessage {
-    Bytes(Bytes),
-    Eof,
-    ReadFailed(std::io::ErrorKind),
-}
-
 struct TerminalEntry {
     id: String,
     title: Option<String>,
@@ -392,22 +451,27 @@ pub struct TerminalHost {
     cleanup_tx: tokio::sync::mpsc::Sender<(String, String)>,
     history: TerminalHistoryArchive,
     checkpoints: bool,
+    pty_poller: Arc<PtyPoller>,
+    metrics: TerminalMetrics,
 }
 
 impl TerminalHost {
     pub fn new(
         events: Arc<EventHub>,
         history_root: &Path,
-        checkpoints: bool,
+        _checkpoints: bool,
     ) -> Result<Arc<Self>, TerminalError> {
         let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::channel(CLEANUP_QUEUE_CAPACITY);
+        let pty_poller = PtyPoller::new().map_err(TerminalError::Runtime)?;
         let host = Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             events,
             next_id: AtomicU64::new(0),
             cleanup_tx,
             history: TerminalHistoryArchive::open(history_root)?,
-            checkpoints,
+            checkpoints: true,
+            pty_poller,
+            metrics: TerminalMetrics::default(),
         });
         let weak = Arc::downgrade(&host);
         tokio::spawn(async move {
@@ -511,10 +575,16 @@ impl TerminalHost {
         drop(pair.slave);
         let os_pid = child.process_id();
         let process_identity = os_pid.and_then(capture_process_identity);
-        let mut reader = pair
+        let reader = pair
             .master
             .try_clone_reader()
             .map_err(|error| TerminalError::Runtime(error.to_string()))?;
+        #[cfg(unix)]
+        let raw_fd = pair.master.as_raw_fd().ok_or_else(|| {
+            TerminalError::Runtime(
+                "PTY master does not expose a pollable Unix descriptor".to_owned(),
+            )
+        })?;
         let writer = pair
             .master
             .take_writer()
@@ -563,13 +633,17 @@ impl TerminalHost {
             checkpoint: None,
             bytes_since_checkpoint: 0,
             last_checkpoint_at: Instant::now(),
+            thermal_state: ThermalState::Hot,
+            last_activity_at: Instant::now(),
+            attached_clients: HashSet::new(),
+            compression_activity: 0,
         };
         let weak = Arc::downgrade(self);
         let owner_entry = Arc::clone(&entry);
         let (init_tx, init_rx) = bounded(1);
         thread::Builder::new()
             .name(format!("yaade-terminal-owner-{id}"))
-            .stack_size(1024 * 1024)
+            .stack_size(512 * 1024)
             .spawn(move || {
                 terminal_owner_loop(
                     weak,
@@ -590,16 +664,20 @@ impl TerminalHost {
             .map_err(|_| {
                 TerminalError::Runtime("terminal owner initialization timed out".to_owned())
             })??;
+        #[cfg(unix)]
+        let registration = self.pty_poller.register(raw_fd, reader, output_tx);
+        #[cfg(not(unix))]
+        let registration = self.pty_poller.register(0, reader, output_tx);
+        if let Err(error) = registration {
+            let _ = self.request(&entry, |reply| TerminalCommand::Dispose { reply });
+            return Err(TerminalError::Runtime(error));
+        }
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(id.clone(), Arc::clone(&entry));
-        thread::Builder::new()
-            .name(format!("yaade-pty-reader-{id}"))
-            .stack_size(256 * 1024)
-            .spawn(move || pty_reader_loop(output_tx, &mut reader))
-            .map_err(|error| TerminalError::Runtime(error.to_string()))?;
 
+        self.metrics.sessions_total.fetch_add(1, Ordering::Relaxed);
         Ok(TerminalCreateResult {
             id,
             title,
@@ -770,6 +848,8 @@ impl TerminalHost {
                     id: id.to_owned(),
                     title: None,
                     terminal_epoch: id.to_owned(),
+                    stream_id: terminal_stream_id(id),
+                    stream_epoch: terminal_stream_epoch(id),
                     checkpoint: None,
                     replay_quality: "exact",
                     output_chunks: Vec::new(),
@@ -815,6 +895,40 @@ impl TerminalHost {
     #[must_use]
     pub fn history_capacity_diagnostics(&self) -> TerminalHistoryCapacityDiagnostics {
         self.history.capacity_diagnostics()
+    }
+
+    #[must_use]
+    pub fn runtime_diagnostics(&self) -> TerminalRuntimeDiagnostics {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut diagnostics = TerminalRuntimeDiagnostics {
+            terminal_sessions_total: self.metrics.sessions_total.load(Ordering::Relaxed),
+            terminal_sessions_active: entries.len(),
+            pty_bytes_read_total: self.metrics.pty_bytes_read_total.load(Ordering::Relaxed),
+            pty_bytes_written_total: self.metrics.pty_bytes_written_total.load(Ordering::Relaxed),
+            terminal_snapshots_total: self.metrics.snapshots_total.load(Ordering::Relaxed),
+            terminal_snapshot_bytes: self.metrics.snapshot_bytes_total.load(Ordering::Relaxed),
+            terminal_compression_runs_total: self
+                .metrics
+                .compression_runs_total
+                .load(Ordering::Relaxed),
+            terminal_hot_to_parked_total: self.metrics.hot_to_parked_total.load(Ordering::Relaxed),
+            terminal_parked_to_hot_total: self.metrics.parked_to_hot_total.load(Ordering::Relaxed),
+            ..TerminalRuntimeDiagnostics::default()
+        };
+        for entry in entries {
+            if let Ok(inspect) = self.request(&entry, |reply| TerminalCommand::Inspect { reply }) {
+                diagnostics.terminal_clients_attached += inspect.attached_clients;
+                diagnostics.terminal_sessions_parked +=
+                    usize::from(inspect.thermal_state == ThermalState::Parked);
+            }
+        }
+        diagnostics
     }
 
     pub fn terminate_stale_process(
@@ -1066,33 +1180,6 @@ impl TerminalHost {
     }
 }
 
-fn pty_reader_loop(output: Sender<OutputMessage>, reader: &mut Box<dyn Read + Send>) {
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => {
-                let _ = output.send(OutputMessage::Eof);
-                break;
-            }
-            Ok(read) => {
-                if output
-                    .send(OutputMessage::Bytes(Bytes::copy_from_slice(
-                        &buffer[..read],
-                    )))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                let _ = output.send(OutputMessage::ReadFailed(error.kind()));
-                break;
-            }
-        }
-    }
-}
-
 fn ghostty_error(error: ghostty_vt::GhosttyError) -> TerminalError {
     TerminalError::Runtime(format!("native Ghostty terminal failure: {error}"))
 }
@@ -1155,7 +1242,7 @@ fn terminal_owner_loop(
     mut state: EntryState,
     urgent_commands: Receiver<TerminalCommand>,
     normal_commands: Receiver<TerminalCommand>,
-    output: Receiver<OutputMessage>,
+    output: Receiver<PtyOutput>,
     initialized: Sender<Result<(), TerminalError>>,
 ) {
     let mut terminal = match create_ghostty_terminal(&state) {
@@ -1167,6 +1254,7 @@ fn terminal_owner_loop(
             return;
         }
     };
+    state.compression_activity = terminal.compression_activity().unwrap_or(0);
     let mut control = TerminalControlRegistry::new();
     if let Err(error) = control.register_terminal(&entry.id, &entry.terminal_epoch) {
         let _ = child.kill();
@@ -1234,23 +1322,27 @@ fn terminal_owner_loop(
         let mut output_bytes = 0_usize;
         while output_open && output_bytes < 1024 * 1024 {
             match output.try_recv() {
-                Ok(OutputMessage::Bytes(data)) => {
+                Ok(PtyOutput::Bytes(data)) => {
                     output_bytes = output_bytes.saturating_add(data.len());
-                    process_terminal_output(
+                    if !process_terminal_output(
                         &host,
                         &entry,
                         &mut writer,
                         &mut state,
                         &mut terminal,
                         data,
-                    );
+                    ) {
+                        let _ = child.kill();
+                        output_open = false;
+                        break;
+                    }
                 }
-                Ok(OutputMessage::ReadFailed(kind)) => {
-                    eprintln!("[terminal-reader] {} failed: {kind:?}", entry.id);
+                Ok(PtyOutput::ReadFailed(kind)) => {
+                    eprintln!("[terminal-poller] {} failed: {kind:?}", entry.id);
                     output_open = false;
                     break;
                 }
-                Ok(OutputMessage::Eof) | Err(TryRecvError::Disconnected) => {
+                Ok(PtyOutput::Eof) | Err(TryRecvError::Disconnected) => {
                     output_open = false;
                     break;
                 }
@@ -1264,6 +1356,7 @@ fn terminal_owner_loop(
                 Err(TryRecvError::Disconnected) => return,
             }
         }
+        maintain_terminal_thermal_state(&host, &mut state, &mut terminal);
         if !output_open && !exit_observed {
             observe_terminal_exit(&host, &entry, &mut child, &mut state, &mut terminal);
             exit_observed = true;
@@ -1278,29 +1371,38 @@ fn terminal_owner_loop(
             }
             continue;
         }
+        let thermal_tick = if state.thermal_state == ThermalState::Parked {
+            PARKED_THERMAL_TICK
+        } else {
+            THERMAL_TICK
+        };
         select_biased! {
             recv(urgent_commands) -> command => {
                 let first = match command { Ok(value) => value, Err(_) => return };
                 handle_batch!(collect_command_batch(first, &urgent_commands), &mut write_scratch);
             },
             recv(output) -> message => match message {
-                Ok(OutputMessage::Bytes(data)) => {
-                    process_terminal_output(
+                Ok(PtyOutput::Bytes(data)) => {
+                    if !process_terminal_output(
                         &host,
                         &entry,
                         &mut writer,
                         &mut state,
                         &mut terminal,
                         data,
-                    );
+                    ) {
+                        let _ = child.kill();
+                        output_open = false;
+                    }
                 }
-                Ok(OutputMessage::ReadFailed(kind)) => {
-                    eprintln!("[terminal-reader] {} failed: {kind:?}", entry.id);
+                Ok(PtyOutput::ReadFailed(kind)) => {
+                    eprintln!("[terminal-poller] {} failed: {kind:?}", entry.id);
                     output_open = false;
                 }
-                Ok(OutputMessage::Eof) | Err(_) => output_open = false,
+                Ok(PtyOutput::Eof) | Err(_) => output_open = false,
             },
             recv(normal_commands) -> command => handle!(match command { Ok(value) => value, Err(_) => return }),
+            default(thermal_tick) => {},
         }
     }
 }
@@ -1400,13 +1502,9 @@ fn handle_terminal_command_batch(
                         fence,
                         data,
                         reply,
-                    } => match authorize_terminal(
-                        control,
-                        entry,
-                        &principal_id,
-                        &connection_id,
-                        fence,
-                    ) {
+                    } => match require_ready(state, &connection_id).and_then(|()| {
+                        authorize_terminal(control, entry, &principal_id, &connection_id, fence)
+                    }) {
                         Ok(lease) => {
                             write_scratch.extend_from_slice(&data);
                             replies.push(BatchedWriteReply::Authorized { reply, lease });
@@ -1421,6 +1519,12 @@ fn handle_terminal_command_batch(
             let write_error = if write_scratch.is_empty() {
                 None
             } else {
+                mark_terminal_hot(state);
+                if let Some(host) = host.upgrade() {
+                    host.metrics
+                        .pty_bytes_written_total
+                        .fetch_add(write_scratch.len() as u64, Ordering::Relaxed);
+                }
                 writer
                     .write_all(write_scratch)
                     .and_then(|()| writer.flush())
@@ -1470,13 +1574,9 @@ fn handle_terminal_command_batch(
                         cols,
                         rows,
                         reply,
-                    } => match authorize_terminal(
-                        control,
-                        entry,
-                        &principal_id,
-                        &connection_id,
-                        fence,
-                    ) {
+                    } => match require_ready(state, &connection_id).and_then(|()| {
+                        authorize_terminal(control, entry, &principal_id, &connection_id, fence)
+                    }) {
                         Ok(lease) => {
                             latest = Some((cols, rows));
                             replies.push(BatchedResizeReply::Authorized { reply, lease });
@@ -1487,6 +1587,9 @@ fn handle_terminal_command_batch(
                     },
                     _ => unreachable!("resize batch contains only resize commands"),
                 }
+            }
+            if latest.is_some() {
+                mark_terminal_hot(state);
             }
             let resize_error = latest
                 .and_then(|(cols, rows)| {
@@ -1519,6 +1622,14 @@ fn handle_terminal_command_batch(
         }
     }
     true
+}
+
+fn require_ready(state: &EntryState, connection_id: &str) -> Result<(), TerminalError> {
+    state
+        .replay_ready_clients
+        .contains(connection_id)
+        .then_some(())
+        .ok_or(TerminalError::NotReady)
 }
 
 fn authorize_terminal(
@@ -1625,9 +1736,13 @@ fn handle_terminal_command(
                 os_pid: entry.os_pid,
                 process_identity: entry.process_identity.clone(),
                 terminal_epoch: entry.terminal_epoch.clone(),
+                output_position: state.sequence,
+                thermal_state: state.thermal_state,
+                attached_clients: state.attached_clients.len(),
             }));
         }
         TerminalCommand::Write { data, reply } => {
+            mark_terminal_hot(state);
             let _ = reply.send(write_terminal(writer, &data));
         }
         TerminalCommand::Authorize {
@@ -1651,7 +1766,10 @@ fn handle_terminal_command(
             data,
             reply,
         } => {
-            let result = authorize_terminal(control, entry, &principal_id, &connection_id, fence)
+            let result = require_ready(state, &connection_id)
+                .and_then(|()| {
+                    authorize_terminal(control, entry, &principal_id, &connection_id, fence)
+                })
                 .and_then(|lease| write_terminal(writer, &data).map(|()| lease));
             let _ = reply.send(result);
         }
@@ -1683,6 +1801,7 @@ fn handle_terminal_command(
             let _ = reply.send(result);
         }
         TerminalCommand::Resize { cols, rows, reply } => {
+            mark_terminal_hot(state);
             let _ = reply.send(resize_terminal(
                 host, master, entry, writer, state, terminal, cols, rows,
             ));
@@ -1707,18 +1826,27 @@ fn handle_terminal_command(
             after_sequence,
             reply,
         } => {
+            state.attached_clients.insert(client_id.clone());
+            mark_terminal_hot(state);
+            // The owner is the sole parser mutator, so this fresh snapshot and
+            // `state.sequence` form one atomic cut. PTY readiness may continue
+            // filling the bounded owner mailbox but cannot mutate the authority
+            // until this command completes.
+            if !store_checkpoint(host, &entry.id, &entry.terminal_epoch, state, terminal) {
+                let _ = reply.send(Err(TerminalError::Runtime(
+                    "authoritative terminal snapshot exceeds the protocol budget".to_owned(),
+                )));
+                return true;
+            }
             let archive_available = host
                 .upgrade()
                 .is_some_and(|host| host.history.available(&entry.id));
-            let replay_floor = state
-                .replay
-                .front()
-                .map_or(state.sequence + 1, |chunk| chunk.sequence);
-            let checkpoint = state
-                .checkpoint
-                .as_ref()
-                .filter(|checkpoint| state.replay_truncated && after_sequence < checkpoint.sequence)
-                .cloned();
+            let replay_floor = state.replay.front().map_or(state.sequence + 1, |chunk| {
+                chunk
+                    .sequence
+                    .saturating_sub(chunk.data.len().saturating_sub(1) as u64)
+            });
+            let checkpoint = state.checkpoint.clone();
             let raw_after = checkpoint.as_ref().map_or(after_sequence, |checkpoint| {
                 after_sequence.max(checkpoint.sequence)
             });
@@ -1737,6 +1865,8 @@ fn handle_terminal_command(
                 id: entry.id.clone(),
                 title: state.title.clone(),
                 terminal_epoch: entry.terminal_epoch.clone(),
+                stream_id: terminal_stream_id(&entry.id),
+                stream_epoch: terminal_stream_epoch(&entry.terminal_epoch),
                 replay_quality: if checkpoint.is_some() {
                     "checkpoint"
                 } else if truncated {
@@ -1759,11 +1889,18 @@ fn handle_terminal_command(
             }));
         }
         TerminalCommand::MarkReplayReady { client_id, reply } => {
-            state.replay_ready_clients.insert(client_id);
-            let _ = reply.send(Ok(()));
+            let result = if state.attached_clients.contains(&client_id) {
+                state.replay_ready_clients.insert(client_id);
+                Ok(())
+            } else {
+                Err(TerminalError::NotReady)
+            };
+            let _ = reply.send(result);
         }
         TerminalCommand::Detach { client_id, reply } => {
             state.replay_ready_clients.remove(&client_id);
+            state.attached_clients.remove(&client_id);
+            state.last_activity_at = Instant::now();
             let _ = reply.send(Ok(()));
         }
         TerminalCommand::GetLiveCwd { reply } => {
@@ -1850,6 +1987,9 @@ fn handle_terminal_command(
         }
         TerminalCommand::ReleaseConnection { connection_id } => {
             control.release_connection(&connection_id);
+            state.replay_ready_clients.remove(&connection_id);
+            state.attached_clients.remove(&connection_id);
+            state.last_activity_at = Instant::now();
         }
         TerminalCommand::AuthorizeAndDispose {
             principal_id,
@@ -1910,6 +2050,71 @@ fn handle_terminal_command(
     true
 }
 
+fn mark_terminal_hot(state: &mut EntryState) {
+    state.last_activity_at = Instant::now();
+    state.thermal_state = ThermalState::Hot;
+}
+
+fn maintain_terminal_thermal_state(
+    host: &Weak<TerminalHost>,
+    state: &mut EntryState,
+    terminal: &mut GhosttyTerminal,
+) {
+    if state.status != TerminalProcessStatus::Running {
+        return;
+    }
+    let idle = state.last_activity_at.elapsed();
+    let target = if !state.attached_clients.is_empty() || idle < WARM_AFTER {
+        ThermalState::Hot
+    } else if idle < PARK_AFTER {
+        ThermalState::Warm
+    } else {
+        ThermalState::Parked
+    };
+    let activity = terminal
+        .compression_activity()
+        .unwrap_or(state.compression_activity);
+    let previous = state.thermal_state;
+    match target {
+        ThermalState::Hot => {}
+        ThermalState::Warm => {
+            if activity != state.compression_activity || state.thermal_state == ThermalState::Hot {
+                let _ = terminal.compress(CompressionMode::Incremental);
+                if let Some(host) = host.upgrade() {
+                    host.metrics
+                        .compression_runs_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        ThermalState::Parked => {
+            if state.thermal_state != ThermalState::Parked || activity != state.compression_activity
+            {
+                let _ = terminal.compress(CompressionMode::Full);
+                state.replay.shrink_to_fit();
+                if let Some(host) = host.upgrade() {
+                    host.metrics
+                        .compression_runs_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    if let Some(host) = host.upgrade() {
+        if previous != ThermalState::Parked && target == ThermalState::Parked {
+            host.metrics
+                .hot_to_parked_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else if previous == ThermalState::Parked && target == ThermalState::Hot {
+            host.metrics
+                .parked_to_hot_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    state.compression_activity = activity;
+    state.thermal_state = target;
+}
+
 fn process_terminal_output(
     host: &Weak<TerminalHost>,
     entry: &TerminalEntry,
@@ -1917,9 +2122,19 @@ fn process_terminal_output(
     state: &mut EntryState,
     terminal: &mut GhosttyTerminal,
     data: Bytes,
-) {
+) -> bool {
     if state.disposed {
-        return;
+        return true;
+    }
+    if let Some(host) = host.upgrade() {
+        host.metrics
+            .pty_bytes_read_total
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        if state.thermal_state == ThermalState::Parked {
+            host.metrics
+                .parked_to_hot_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
     let (responses, title, working_directory, bells) = match terminal.write(&data) {
         Ok(effects) => (
@@ -1932,8 +2147,11 @@ fn process_terminal_output(
             effects.bells(),
         ),
         Err(error) => {
-            eprintln!("[terminal-ghostty] {}: {error}", entry.id);
-            (Vec::new(), None, None, 0)
+            eprintln!(
+                "[terminal-ghostty] {} authority quarantined after parser failure: {error}",
+                entry.id
+            );
+            return false;
         }
     };
     let mut response_failed = false;
@@ -1954,7 +2172,8 @@ fn process_terminal_output(
         state.live_cwd = decode_terminal_working_directory(&value);
     }
 
-    state.sequence += 1;
+    mark_terminal_hot(state);
+    state.sequence = state.sequence.saturating_add(data.len() as u64);
     let sequence = state.sequence;
     state.replay.push_back(ReplayChunk {
         sequence,
@@ -1975,15 +2194,25 @@ fn process_terminal_output(
             store_checkpoint(host, &entry.id, &entry.terminal_epoch, state, terminal);
         }
     }
-    let Some(host) = host.upgrade() else { return };
-    if let Err(error) = host.history.append(&entry.id, sequence, data.clone()) {
+    let Some(host) = host.upgrade() else {
+        return true;
+    };
+    // Publish the same immutable allocation before touching the lower-priority
+    // history lane. History saturation cannot delay this chunk or any client.
+    host.events.emit_terminal(
+        Arc::<str>::from(entry.id.as_str()),
+        terminal_stream_id(&entry.id),
+        terminal_stream_epoch(&entry.terminal_epoch),
+        sequence,
+        data.clone(),
+    );
+    if let Err(error) = host.history.try_append(&entry.id, sequence, data) {
         eprintln!("[terminal-history] {error}");
     }
-    host.events
-        .emit_terminal(Arc::<str>::from(entry.id.as_str()), sequence, data);
     for _ in 0..bells {
         host.events.emit("terminal:bell", vec![json!(entry.id)]);
     }
+    true
 }
 
 fn observe_terminal_exit(
@@ -2035,7 +2264,7 @@ fn store_checkpoint(
     terminal_epoch: &str,
     state: &mut EntryState,
     terminal: &GhosttyTerminal,
-) {
+) -> bool {
     let checkpoint = match encode_checkpoint(
         terminal_epoch,
         state.sequence,
@@ -2052,7 +2281,8 @@ fn store_checkpoint(
             // snapshot traversal.
             state.bytes_since_checkpoint = 0;
             state.last_checkpoint_at = Instant::now();
-            return;
+            state.checkpoint = None;
+            return false;
         }
     };
     if let Some(host) = host.upgrade()
@@ -2063,9 +2293,16 @@ fn store_checkpoint(
     {
         eprintln!("[terminal-checkpoint] {error}");
     }
+    if let Some(host) = host.upgrade() {
+        host.metrics.snapshots_total.fetch_add(1, Ordering::Relaxed);
+        host.metrics
+            .snapshot_bytes_total
+            .fetch_add(checkpoint.payload_bytes as u64, Ordering::Relaxed);
+    }
     state.checkpoint = Some(checkpoint);
     state.bytes_since_checkpoint = 0;
     state.last_checkpoint_at = Instant::now();
+    true
 }
 
 fn encode_checkpoint(
@@ -2139,6 +2376,21 @@ fn osc7_path(value: &str) -> Option<PathBuf> {
         .decode_utf8()
         .ok()?;
     (!decoded.is_empty()).then(|| PathBuf::from(decoded.as_ref()))
+}
+
+pub(crate) fn terminal_stream_id(value: &str) -> u64 {
+    // Stable FNV-1a is shared with the browser codec. Zero is reserved for the
+    // connection control stream.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash & ((1_u64 << 53) - 1)).max(1)
+}
+
+pub(crate) fn terminal_stream_epoch(value: &str) -> u64 {
+    terminal_stream_id(value)
 }
 
 fn signal_number(signal: &str) -> Option<i32> {

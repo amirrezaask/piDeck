@@ -351,6 +351,70 @@ impl TerminalHistoryArchive {
         Ok(())
     }
 
+    /// Non-blocking hot-path append. Saturation is explicit so the PTY owner
+    /// can preserve live interactivity and report history degradation instead
+    /// of waiting behind compression or disk IO.
+    pub fn try_append(
+        &self,
+        terminal_id: &str,
+        sequence: u64,
+        data: Bytes,
+    ) -> Result<(), HistoryError> {
+        if sequence == 0 || data.is_empty() {
+            return Ok(());
+        }
+        if data.len() > MAX_RECORD_BYTES {
+            return Err(HistoryError::Corrupt(format!(
+                "history record exceeds {MAX_RECORD_BYTES} bytes"
+            )));
+        }
+        let previous = {
+            let mut accepted = self
+                .shared
+                .accepted_sequences
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.shared.pending_closes().contains(terminal_id) {
+                return Err(HistoryError::Corrupt(format!(
+                    "append after close for {terminal_id}"
+                )));
+            }
+            let previous = accepted.get(terminal_id).copied().unwrap_or(0);
+            if sequence <= previous {
+                return Err(HistoryError::Corrupt(format!(
+                    "history sequence {sequence} does not follow {previous}"
+                )));
+            }
+            accepted.insert(terminal_id.to_owned(), sequence);
+            previous
+        };
+        if !self.shared.try_reserve_ingest_bytes(data.len()) {
+            self.shared
+                .rollback_accepted_sequence(terminal_id, sequence, previous);
+            return Err(HistoryError::Corrupt(
+                "history ingest byte budget is full".to_owned(),
+            ));
+        }
+        let bytes = data.len();
+        match self
+            .ingest_tx
+            .try_send(IngestCommand::Append(AppendCommand {
+                terminal_id: terminal_id.to_owned(),
+                sequence,
+                data,
+            })) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.shared.release_ingest_bytes(bytes);
+                self.shared
+                    .rollback_accepted_sequence(terminal_id, sequence, previous);
+                Err(HistoryError::Corrupt(
+                    "history ingest mailbox is full".to_owned(),
+                ))
+            }
+        }
+    }
+
     /// Queue an opaque validated checkpoint for atomic replacement by the
     /// history owner. The previous file remains valid until rename commits.
     pub fn persist_checkpoint(&self, terminal_id: &str, data: Bytes) -> Result<(), HistoryError> {
@@ -730,6 +794,34 @@ impl HistoryShared {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .trim_idle_staging(now);
+        }
+    }
+
+    fn try_reserve_ingest_bytes(&self, bytes: usize) -> bool {
+        let mut used = self
+            .budget
+            .bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if used.saturating_add(bytes) > INGEST_MAX_BYTES {
+            return false;
+        }
+        *used = used.saturating_add(bytes);
+        true
+    }
+
+    fn rollback_accepted_sequence(&self, terminal_id: &str, attempted: u64, previous: u64) {
+        let mut accepted = self
+            .accepted_sequences
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if accepted.get(terminal_id).copied() != Some(attempted) {
+            return;
+        }
+        if previous == 0 {
+            accepted.remove(terminal_id);
+        } else {
+            accepted.insert(terminal_id.to_owned(), previous);
         }
     }
 

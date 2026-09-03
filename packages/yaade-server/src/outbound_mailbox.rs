@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use bytes::Bytes;
 
@@ -8,19 +8,15 @@ pub struct MailboxLimits {
     pub reliable_max_bytes: usize,
     pub legacy_max_frames: usize,
     pub legacy_max_bytes: usize,
-    pub semantic_max_terminals: usize,
-    pub semantic_max_bytes: usize,
 }
 
 impl Default for MailboxLimits {
     fn default() -> Self {
         Self {
             reliable_max_frames: 256,
-            reliable_max_bytes: 2 * 1024 * 1024,
+            reliable_max_bytes: 10 * 1024 * 1024,
             legacy_max_frames: 8_192,
             legacy_max_bytes: 32 * 1024 * 1024,
-            semantic_max_terminals: 64,
-            semantic_max_bytes: 16 * 1024 * 1024 + 6,
         }
     }
 }
@@ -29,7 +25,6 @@ impl Default for MailboxLimits {
 pub enum Overflow {
     Reliable,
     Legacy,
-    Semantic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,8 +91,7 @@ struct QueuedFrame {
     order: u64,
 }
 
-/// Bounded per-client queue. Reliable and legacy frames remain FIFO while
-/// semantic render state is replaceable by terminal.
+/// Bounded per-client queue with reliable control and ordered raw-data lanes.
 pub struct OutboundMailbox {
     limits: MailboxLimits,
     priority: VecDeque<QueuedFrame>,
@@ -105,10 +99,7 @@ pub struct OutboundMailbox {
     reliable_bytes: usize,
     legacy: VecDeque<QueuedFrame>,
     legacy_bytes: usize,
-    semantic: HashMap<String, QueuedFrame>,
-    semantic_bytes: usize,
     next_order: u64,
-    resync: HashSet<String>,
 }
 
 impl OutboundMailbox {
@@ -121,10 +112,7 @@ impl OutboundMailbox {
             reliable_bytes: 0,
             legacy: VecDeque::new(),
             legacy_bytes: 0,
-            semantic: HashMap::new(),
-            semantic_bytes: 0,
             next_order: 0,
-            resync: HashSet::new(),
         }
     }
 
@@ -174,40 +162,6 @@ impl OutboundMailbox {
         accepted(false, false)
     }
 
-    pub fn enqueue_semantic(
-        &mut self,
-        terminal_id: &str,
-        mut frame: OutboundFrame,
-    ) -> EnqueueResult {
-        let bytes = frame.bytes();
-        if terminal_id.is_empty() || bytes > self.limits.semantic_max_bytes {
-            self.resync.insert(terminal_id.to_owned());
-            return rejected(Overflow::Semantic, true);
-        }
-        frame.terminal_id = Some(terminal_id.to_owned());
-        if let Some(previous) = self.semantic.get_mut(terminal_id) {
-            let next_bytes = self.semantic_bytes - previous.frame.bytes() + bytes;
-            if next_bytes > self.limits.semantic_max_bytes {
-                self.resync.insert(terminal_id.to_owned());
-                return rejected(Overflow::Semantic, true);
-            }
-            self.semantic_bytes = next_bytes;
-            previous.frame = frame;
-            self.resync.insert(terminal_id.to_owned());
-            return accepted(true, true);
-        }
-        if self.semantic.len() >= self.limits.semantic_max_terminals
-            || self.semantic_bytes.saturating_add(bytes) > self.limits.semantic_max_bytes
-        {
-            self.resync.insert(terminal_id.to_owned());
-            return rejected(Overflow::Semantic, true);
-        }
-        let queued = self.queued(frame);
-        self.semantic.insert(terminal_id.to_owned(), queued);
-        self.semantic_bytes += bytes;
-        accepted(false, false)
-    }
-
     pub fn pop_next(&mut self) -> Option<OutboundFrame> {
         if let Some(queued) = self.priority.pop_front() {
             self.reliable_bytes = self.reliable_bytes.saturating_sub(queued.frame.bytes());
@@ -216,7 +170,6 @@ impl OutboundMailbox {
         enum Source {
             Reliable,
             Legacy,
-            Semantic(String),
         }
         let mut selected = self
             .reliable
@@ -229,14 +182,6 @@ impl OutboundMailbox {
         {
             selected = Some((frame.order, Source::Legacy));
         }
-        for (id, frame) in &self.semantic {
-            if selected
-                .as_ref()
-                .is_none_or(|(order, _)| frame.order < *order)
-            {
-                selected = Some((frame.order, Source::Semantic(id.clone())));
-            }
-        }
         match selected?.1 {
             Source::Reliable => {
                 let frame = self.reliable.pop_front()?.frame;
@@ -248,22 +193,17 @@ impl OutboundMailbox {
                 self.legacy_bytes -= frame.bytes();
                 Some(frame)
             }
-            Source::Semantic(id) => {
-                let frame = self.semantic.remove(&id)?.frame;
-                self.semantic_bytes -= frame.bytes();
-                Some(frame)
-            }
         }
     }
 
     #[must_use]
     pub fn pending_frames(&self) -> usize {
-        self.priority.len() + self.reliable.len() + self.legacy.len() + self.semantic.len()
+        self.priority.len() + self.reliable.len() + self.legacy.len()
     }
 
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        self.reliable_bytes + self.legacy_bytes + self.semantic_bytes
+        self.reliable_bytes + self.legacy_bytes
     }
 
     pub fn discard_terminal_through(&mut self, terminal_id: &str, sequence: u64) {
@@ -280,12 +220,6 @@ impl OutboundMailbox {
             !remove
         });
         self.legacy_bytes = self.legacy_bytes.saturating_sub(removed_bytes);
-    }
-
-    pub fn consume_resync_required(&mut self) -> Vec<String> {
-        let mut ids = self.resync.drain().collect::<Vec<_>>();
-        ids.sort();
-        ids
     }
 
     fn queued(&mut self, frame: OutboundFrame) -> QueuedFrame {
@@ -323,8 +257,6 @@ mod tests {
             reliable_max_bytes: 10,
             legacy_max_frames: 2,
             legacy_max_bytes: 10,
-            semantic_max_terminals: 2,
-            semantic_max_bytes: 10,
         }
     }
 
@@ -368,7 +300,6 @@ mod tests {
         for value in ["one", "two", "three"] {
             assert_eq!(mailbox.pop_next().expect("frame").data, value.as_bytes());
         }
-        assert!(mailbox.consume_resync_required().is_empty());
     }
 
     #[test]
@@ -402,32 +333,6 @@ mod tests {
         let overflow = mailbox.enqueue_legacy("a", OutboundFrame::text(b"bad".to_vec()));
         assert_eq!(overflow.overflow, Some(Overflow::Legacy));
         assert_eq!(mailbox.pending_frames(), 2);
-    }
-
-    #[test]
-    fn semantic_frames_replace_stale_state_and_mark_resync() {
-        let mut mailbox = OutboundMailbox::new(limits());
-        assert!(
-            mailbox
-                .enqueue_semantic("a", OutboundFrame::text(b"snap".to_vec()))
-                .accepted
-        );
-        let replacement = mailbox.enqueue_semantic("a", OutboundFrame::text(b"newer".to_vec()));
-        assert!(replacement.accepted && replacement.replaced && replacement.requires_resync);
-        assert_eq!(
-            mailbox.pop_next().expect("snapshot").data.as_ref(),
-            b"newer"
-        );
-        assert_eq!(mailbox.consume_resync_required(), vec!["a"]);
-    }
-
-    #[test]
-    fn oversized_semantic_frame_is_rejected_without_using_memory() {
-        let mut mailbox = OutboundMailbox::new(limits());
-        let result = mailbox.enqueue_semantic("a", OutboundFrame::text(vec![0; 11]));
-        assert_eq!(result.overflow, Some(Overflow::Semantic));
-        assert!(result.requires_resync);
-        assert_eq!(mailbox.pending_bytes(), 0);
     }
 
     #[test]

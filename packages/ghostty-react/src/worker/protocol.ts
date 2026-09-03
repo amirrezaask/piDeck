@@ -121,8 +121,10 @@ const COMMAND_TYPES = new Set([
 export function validateTerminalWorkerCommand(value: unknown): value is TerminalWorkerCommand {
   if (!isRecord(value) || !validEnvelope(value) || !COMMAND_TYPES.has(String(value.type))) return false;
   switch (value.type) {
-    case "writeBytes": case "resetAndWriteBytes": case "restoreSnapshot":
+    case "writeBytes": case "restoreSnapshot":
       return value.data instanceof Uint8Array && value.data.byteLength > 0 && value.data.buffer.byteLength > 0;
+    case "resetAndWriteBytes":
+      return value.data instanceof Uint8Array;
     case "writeReplayBytes":
       return Array.isArray(value.chunks) && value.chunks.length > 0 &&
         value.chunks.every(chunk => chunk instanceof Uint8Array && chunk.byteLength > 0 && chunk.buffer.byteLength > 0);

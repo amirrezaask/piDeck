@@ -3,6 +3,8 @@ import { test } from "vite-plus/test";
 import {
   decodeTerminalDataFrame,
   encodeTerminalDataFrame,
+  encodeTerminalInputFrame,
+  encodeTerminalResizeFrame,
   encodeTerminalWsCommand,
   tryDecodeTerminalWsCommand,
   tryDecodeTerminalWsResult,
@@ -48,6 +50,65 @@ test("round-trips v2 frames with sequences above 2^32", () => {
     id: "term-u64",
     payload: new Uint8Array([1, 2, 3]),
   });
+});
+
+test("encodes binary INPUT with stream epoch and byte position", () => {
+  const payload = new Uint8Array([0, 0xff, 0x1b]);
+  const encoded = encodeTerminalInputFrame(17, 9, 3, payload);
+  const view = new DataView(encoded.buffer);
+  assert.deepEqual(Array.from(encoded.subarray(0, 4)), [0x50, 0x44, 4, 7]);
+  assert.equal(view.getBigUint64(8), 17n);
+  assert.equal(view.getBigUint64(16), 9n);
+  assert.equal(view.getBigUint64(24), 3n);
+  assert.equal(view.getUint32(32), payload.byteLength);
+  assert.deepEqual(encoded.subarray(36), payload);
+});
+
+test("encodes binary RESIZE with bounded dimensions and control position", () => {
+  const encoded = encodeTerminalResizeFrame(17, 9, 4, 132, 48);
+  const view = new DataView(encoded.buffer);
+  assert.deepEqual(Array.from(encoded.subarray(0, 4)), [0x50, 0x44, 4, 8]);
+  assert.equal(view.getBigUint64(8), 17n);
+  assert.equal(view.getBigUint64(16), 9n);
+  assert.equal(view.getBigUint64(24), 4n);
+  assert.equal(view.getUint16(36), 132);
+  assert.equal(view.getUint16(38), 48);
+  assert.throws(() => encodeTerminalResizeFrame(17, 9, 5, 0, 48));
+});
+
+test("decodes a snapshot payload larger than its stream cut", () => {
+  const encoded = new Uint8Array(36 + 128);
+  const view = new DataView(encoded.buffer);
+  encoded.set([0x50, 0x44, 4, 4]);
+  view.setUint16(6, 36);
+  view.setBigUint64(8, 17n);
+  view.setBigUint64(16, 9n);
+  view.setBigUint64(24, 3n);
+  view.setUint32(32, 128);
+  assert.equal(decodeTerminalDataFrame(encoded)?.frameType, "snapshot");
+});
+
+test("decodes protocol-v4 PTY_DATA without copying its opaque payload", () => {
+  const payload = new Uint8Array([0xff, 0xe2, 0x82]);
+  const encoded = new Uint8Array(36 + payload.byteLength);
+  const view = new DataView(encoded.buffer);
+  encoded.set([0x50, 0x44, 4, 6]);
+  view.setUint16(6, 36);
+  view.setBigUint64(8, 17n);
+  view.setBigUint64(16, 9n);
+  view.setBigUint64(24, 103n);
+  view.setUint32(32, payload.byteLength);
+  encoded.set(payload, 36);
+  const decoded = decodeTerminalDataFrame(encoded);
+  assert.deepEqual(decoded, {
+    eventSequence: 0,
+    terminalSequence: 103,
+    streamId: 17,
+    streamEpoch: 9,
+    frameType: "pty-data",
+    payload: encoded.subarray(36),
+  });
+  assert.equal(decoded?.payload.buffer, encoded.buffer);
 });
 
 test("encodes and decodes terminal WS control commands", () => {

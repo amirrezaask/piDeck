@@ -132,6 +132,8 @@ const TerminalAttachResult = Schema.NullOr(
     id: Schema.String,
     title: Schema.NullOr(Schema.String),
     terminalEpoch: Schema.optional(Schema.String),
+    streamId: Schema.optional(Schema.Number),
+    streamEpoch: Schema.optional(Schema.Number),
     ownerId: Schema.optional(Schema.String),
     ownerEpoch: Schema.optional(Schema.String),
     protocolVersion: Schema.optional(Schema.Number),
@@ -191,6 +193,8 @@ export type HostTerminalAttachResult = {
   id: string
   title?: string
   terminalEpoch?: string
+  streamId?: number
+  streamEpoch?: number
   ownerId?: string
   ownerEpoch?: string
   protocolVersion?: number

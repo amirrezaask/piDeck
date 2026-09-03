@@ -11,6 +11,14 @@ import { getHostRoute, HOST_ROUTE_CHANNELS, type HostRouteName } from "./routes.
 /** Host → client: binary `terminal:data` frame type bytes. */
 export const TERMINAL_DATA_FRAME_TYPE_V1 = 0x01 as const;
 export const TERMINAL_DATA_FRAME_TYPE = 0x02 as const;
+export const TERMINAL_PROTOCOL_VERSION = 4 as const;
+export const TERMINAL_PROTOCOL_HEADER_BYTES = 36 as const;
+const TERMINAL_PROTOCOL_MAGIC_0 = 0x50;
+const TERMINAL_PROTOCOL_MAGIC_1 = 0x44;
+const TERMINAL_PROTOCOL_SNAPSHOT = 4;
+const TERMINAL_PROTOCOL_PTY_DATA = 6;
+const TERMINAL_PROTOCOL_INPUT = 7;
+const TERMINAL_PROTOCOL_RESIZE = 8;
 
 type Utf8Encoder = { encode(input: string): Uint8Array };
 type Utf8Decoder = { decode(input: Uint8Array): string };
@@ -66,6 +74,52 @@ function toU64(value: number): bigint {
   return BigInt(Math.trunc(value));
 }
 
+export function encodeTerminalInputFrame(
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+  payload: Uint8Array,
+): Uint8Array<ArrayBuffer> {
+  if (payload.byteLength === 0) throw new Error("terminal input cannot be empty");
+  const output = new Uint8Array(new ArrayBuffer(TERMINAL_PROTOCOL_HEADER_BYTES + payload.byteLength));
+  const view = new DataView(output.buffer);
+  output[0] = TERMINAL_PROTOCOL_MAGIC_0;
+  output[1] = TERMINAL_PROTOCOL_MAGIC_1;
+  output[2] = TERMINAL_PROTOCOL_VERSION;
+  output[3] = TERMINAL_PROTOCOL_INPUT;
+  view.setUint16(4, 0);
+  view.setUint16(6, TERMINAL_PROTOCOL_HEADER_BYTES);
+  view.setBigUint64(8, toU64(streamId));
+  view.setBigUint64(16, toU64(streamEpoch));
+  view.setBigUint64(24, toU64(sequence));
+  view.setUint32(32, payload.byteLength);
+  output.set(payload, TERMINAL_PROTOCOL_HEADER_BYTES);
+  return output;
+}
+
+export function encodeTerminalResizeFrame(
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+  cols: number,
+  rows: number,
+): Uint8Array<ArrayBuffer> {
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1 || cols > 0xffff || rows > 0xffff) {
+    throw new Error("invalid terminal resize dimensions");
+  }
+  const output = new Uint8Array(new ArrayBuffer(TERMINAL_PROTOCOL_HEADER_BYTES + 4));
+  const view = new DataView(output.buffer);
+  output.set([TERMINAL_PROTOCOL_MAGIC_0, TERMINAL_PROTOCOL_MAGIC_1, TERMINAL_PROTOCOL_VERSION, TERMINAL_PROTOCOL_RESIZE]);
+  view.setUint16(6, TERMINAL_PROTOCOL_HEADER_BYTES);
+  view.setBigUint64(8, toU64(streamId));
+  view.setBigUint64(16, toU64(streamEpoch));
+  view.setBigUint64(24, toU64(sequence));
+  view.setUint32(32, 4);
+  view.setUint16(36, cols);
+  view.setUint16(38, rows);
+  return output;
+}
+
 function fromU64(value: bigint): number {
   if (value > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
   return Number(value);
@@ -74,7 +128,10 @@ function fromU64(value: bigint): number {
 export type DecodedTerminalDataFrame = {
   eventSequence: number;
   terminalSequence: number;
-  id: string;
+  id?: string;
+  streamId?: number;
+  streamEpoch?: number;
+  frameType?: "snapshot" | "ready" | "pty-data" | "resync-begin";
   payload: Uint8Array;
 };
 
@@ -87,6 +144,38 @@ export function decodeTerminalDataFrame(
       : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (buf.length < 11) return null;
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (
+    buf.length >= TERMINAL_PROTOCOL_HEADER_BYTES &&
+    buf[0] === TERMINAL_PROTOCOL_MAGIC_0 &&
+    buf[1] === TERMINAL_PROTOCOL_MAGIC_1
+  ) {
+    const frameType = buf[3] === TERMINAL_PROTOCOL_SNAPSHOT
+      ? "snapshot" as const
+      : buf[3] === 5
+        ? "ready" as const
+        : buf[3] === TERMINAL_PROTOCOL_PTY_DATA
+          ? "pty-data" as const
+          : buf[3] === 13
+            ? "resync-begin" as const
+            : null;
+    if (buf[2] !== TERMINAL_PROTOCOL_VERSION || frameType === null) return null;
+    if (view.getUint16(4) !== 0 || view.getUint16(6) !== TERMINAL_PROTOCOL_HEADER_BYTES) return null;
+    const payloadLength = view.getUint32(32);
+    if ((frameType === "snapshot" || frameType === "pty-data") && payloadLength === 0) return null;
+    if (buf.length !== TERMINAL_PROTOCOL_HEADER_BYTES + payloadLength) return null;
+    const streamId = fromU64(view.getBigUint64(8));
+    const streamEpoch = fromU64(view.getBigUint64(16));
+    const terminalSequence = fromU64(view.getBigUint64(24));
+    if (frameType === "pty-data" && terminalSequence < payloadLength) return null;
+    return {
+      eventSequence: 0,
+      terminalSequence,
+      streamId,
+      streamEpoch,
+      frameType,
+      payload: buf.subarray(TERMINAL_PROTOCOL_HEADER_BYTES),
+    };
+  }
   if (buf[0] === TERMINAL_DATA_FRAME_TYPE) {
     if (buf.length < 19) return null;
     const eventSequence = fromU64(view.getBigUint64(1));

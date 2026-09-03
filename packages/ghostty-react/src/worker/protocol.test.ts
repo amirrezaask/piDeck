@@ -87,6 +87,11 @@ test("validates every worker command family and rejects malformed envelopes", ()
     { ...envelope, type: "dispose" },
   ]
   for (const command of commands) assert.equal(validateTerminalWorkerCommand(command), true)
+  assert.equal(validateTerminalWorkerCommand({
+    ...envelope,
+    type: "resetAndWriteBytes",
+    data: new Uint8Array(),
+  }), true)
   assert.equal(validateTerminalWorkerCommand({ ...envelope, version: 99, type: "dispose" }), false)
   assert.equal(validateTerminalWorkerCommand({ ...envelope, sequence: -1, type: "dispose" }), false)
   assert.equal(validateTerminalWorkerCommand({ ...envelope, type: "writeBytes", data: "x" }), false)

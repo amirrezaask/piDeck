@@ -9,15 +9,11 @@ import {
   GHOSTTY_SNAPSHOT_FORMAT_VERSION,
   MAX_TERMINAL_CHECKPOINT_BYTES,
   MuxEvent,
-  TerminalPatchMessage,
-  TerminalResyncRequiredMessage,
   TERMINAL_CHECKPOINT_MAGIC,
   TERMINAL_CHECKPOINT_VERSION,
-  TerminalSnapshotMessage,
   type TerminalCheckpoint,
 } from "@yaade/rpc";
 import type { YaadeHostTransport } from "./transport.js";
-import { TerminalV3Store } from "./terminal-v3-store.js";
 
 // Host owns the authoritative terminal replay. This buffer only bridges an
 // in-flight attach/resync; off-screen terminals are replayed from the host.
@@ -141,6 +137,53 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
     string,
     NonNullable<TerminalAttachOptions["onCheckpoint"]>
   >();
+  const terminalBinarySnapshots = new Map<
+    string,
+    { sequence: number; bytes: Uint8Array }
+  >();
+  const terminalReadyPositions = new Map<string, number>();
+  const terminalSyncWaiters = new Map<string, Set<() => void>>();
+  const wakeTerminalSync = (id: string) => {
+    for (const wake of terminalSyncWaiters.get(id) ?? []) wake();
+  };
+  const awaitTerminalSnapshot = async (
+    id: string,
+    sequence: number,
+  ): Promise<Uint8Array> => {
+    const available = () => {
+      const snapshot = terminalBinarySnapshots.get(id);
+      const ready = terminalReadyPositions.get(id);
+      return snapshot?.sequence === sequence && ready === sequence
+        ? snapshot.bytes
+        : null;
+    };
+    const current = available();
+    if (current) {
+      terminalBinarySnapshots.delete(id);
+      terminalReadyPositions.delete(id);
+      return current;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const waiters = terminalSyncWaiters.get(id) ?? new Set<() => void>();
+      const wake = () => {
+        if (!available()) return;
+        clearTimeout(timeout);
+        waiters.delete(wake);
+        resolve();
+      };
+      const timeout = setTimeout(() => {
+        waiters.delete(wake);
+        reject(new Error("terminal snapshot READY barrier timed out"));
+      }, 10_000);
+      waiters.add(wake);
+      terminalSyncWaiters.set(id, waiters);
+    });
+    const snapshot = available();
+    if (!snapshot) throw new Error("terminal snapshot missing at READY barrier");
+    terminalBinarySnapshots.delete(id);
+    terminalReadyPositions.delete(id);
+    return snapshot;
+  };
   let realtimeConnected = false;
   let reconnectGeneration = 0;
   let hadRealtimeDisconnect = false;
@@ -334,7 +377,9 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
         256 * 1024,
       );
       if (!page || page.chunks.length === 0 || page.nextSequence <= cursor) break;
-      const pageHasGap = page.firstSequence > cursor + 1;
+      const firstChunkBytes = page.chunks[0]?.byteLength ?? 0;
+      const firstByte = Math.max(1, page.firstSequence - firstChunkBytes + 1);
+      const pageHasGap = firstByte > cursor + 1;
       const replay: TerminalReplayChunk = {
         data: concatTerminalBytes(page.chunks),
         replayNeedsQueryResponses:
@@ -577,6 +622,26 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
     );
   });
 
+  transport.on("terminal:snapshot-bytes", (...args: unknown[]) => {
+    const id = args[0];
+    const bytes = args[1];
+    const sequence = args[2];
+    if (
+      typeof id !== "string" ||
+      !(bytes instanceof Uint8Array) ||
+      typeof sequence !== "number"
+    ) return;
+    terminalBinarySnapshots.set(id, { sequence, bytes });
+    wakeTerminalSync(id);
+  });
+  transport.on("terminal:ready", (...args: unknown[]) => {
+    const id = args[0];
+    const sequence = args[1];
+    if (typeof id !== "string" || typeof sequence !== "number") return;
+    terminalReadyPositions.set(id, sequence);
+    wakeTerminalSync(id);
+  });
+
   transport.on("terminal:data", (...args: unknown[]) => {
     const id = args[0] as string;
     const data = args[1] as Uint8Array;
@@ -655,58 +720,6 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
     const signal = args[2] as number | undefined;
     for (const cb of terminalExitListeners) cb(id, exitCode, signal);
   });
-  const semanticStores = new Map<string, TerminalV3Store>();
-  const semanticResyncs = new Map<string, Promise<void>>();
-  const semanticStoreFor = (terminalId: string): TerminalV3Store => {
-    const existing = semanticStores.get(terminalId)
-    if (existing) return existing
-    const created = new TerminalV3Store()
-    semanticStores.set(terminalId, created)
-    return created
-  }
-  const requestSemanticResync = (terminalId: string): void => {
-    if (semanticResyncs.has(terminalId)) return
-    let request: Promise<void>
-    request = attachTerminal(terminalId, 0, "semantic")
-      // Modern hosts publish the recovery snapshot as a replaceable binary
-      // frame after the small reliable attach result. Keeping the full cell
-      // grid out of control traffic prevents large terminals from overflowing
-      // the reliable socket mailbox.
-      .then(() => undefined)
-      .catch(() => undefined)
-      .finally(() => {
-        if (semanticResyncs.get(terminalId) === request) {
-          semanticResyncs.delete(terminalId)
-        }
-      })
-    semanticResyncs.set(terminalId, request)
-  }
-  transport.on("terminal.snapshot", (...args: unknown[]) => {
-    try {
-      const message = Schema.decodeUnknownSync(TerminalSnapshotMessage)(args[0])
-      const result = semanticStoreFor(message.terminalId).applySnapshot(message)
-      if (result === "resync-required") requestSemanticResync(message.terminalId)
-    } catch {
-      /* A malformed semantic frame must not break the legacy PTY stream. */
-    }
-  });
-  transport.on("terminal.patch", (...args: unknown[]) => {
-    try {
-      const message = Schema.decodeUnknownSync(TerminalPatchMessage)(args[0])
-      const result = semanticStoreFor(message.terminalId).applyPatch(message)
-      if (result === "resync-required") requestSemanticResync(message.terminalId)
-    } catch {
-      /* A malformed semantic frame must not break the legacy PTY stream. */
-    }
-  });
-  transport.on("terminal.resync-required", (...args: unknown[]) => {
-    try {
-      const message = Schema.decodeUnknownSync(TerminalResyncRequiredMessage)(args[0])
-      requestSemanticResync(message.terminalId)
-    } catch {
-      /* Ignore malformed resync notices; the next attach reconciles state. */
-    }
-  });
   transport.on("mux:event", (...args: unknown[]) => {
     try {
       const event = Schema.decodeUnknownSync(MuxEvent)(args[0]);
@@ -783,8 +796,18 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
           terminalDataBufferSizes.delete(id);
         }
         try {
-          const result = await attachTerminal(id, afterSequence);
+          let result = await attachTerminal(id, afterSequence);
           if (!result) return result;
+          if (result.checkpoint?.snapshotBytes.byteLength === 0) {
+            const snapshotBytes = await awaitTerminalSnapshot(
+              id,
+              result.checkpoint.sequence,
+            );
+            result = {
+              ...result,
+              checkpoint: { ...result.checkpoint, snapshotBytes },
+            };
+          }
 
           const restoredSequence = await restoreCheckpoint(
             id,
@@ -974,14 +997,9 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
           );
         };
       },
-      onSemanticSnapshot: (id, callback) => {
-        const store = semanticStoreFor(id)
-        const current = store.snapshot
-        if (current) callback(current)
-        return store.onChange((snapshot, result) => {
-          if (result === "applied" && snapshot) callback(snapshot)
-        })
-      },
+      // Semantic screen diffs are compatibility-only and are not connected to
+      // the capable-client data plane.
+      onSemanticSnapshot: () => () => undefined,
       onExit: (cb) => {
         terminalExitListeners.add(cb);
         return () => terminalExitListeners.delete(cb);
@@ -1001,9 +1019,9 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
         terminalResyncRetryTimers.delete(id);
         terminalResyncAttempts.delete(id);
         terminalReplayStreaming.delete(id);
-        semanticStores.get(id)?.reset();
-        semanticStores.delete(id);
-        semanticResyncs.delete(id);
+        terminalBinarySnapshots.delete(id);
+        terminalReadyPositions.delete(id);
+        terminalSyncWaiters.delete(id);
         return transport.invoke("terminal:dispose", id);
       },
       acquireLease: (id, mode) =>

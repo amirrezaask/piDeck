@@ -114,6 +114,18 @@ export class GhosttyViewportModel {
     return this.backgroundsValue[row * this.colsValue + column] ?? this.backgroundPacked;
   }
 
+  reset(): void {
+    this.frameId = 0;
+    this.generation = 0;
+    this.cursorXValue = -1;
+    this.cursorYValue = -1;
+    this.cursorVisibleValue = false;
+    this.cursorBlinkingValue = false;
+    this.cursorStyleValue = 0;
+    this.dirtyRowsValue = EMPTY_DIRTY_ROWS;
+    this.allocate(0, 0);
+  }
+
   apply(update: GhosttyRenderUpdate): boolean {
     if (!validateGhosttyRenderUpdate(update)) return false;
     if (update.generation < this.generation) return false;

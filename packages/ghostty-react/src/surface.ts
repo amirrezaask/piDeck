@@ -1066,6 +1066,11 @@ export class GhosttyTerminalSurface {
   /** Atomically replace parser and terminal state from a validated snapshot. */
   async restoreSnapshot(snapshot: Uint8Array): Promise<void> {
     if (this.disposed) throw new Error("Terminal surface is disposed")
+    for (const update of this.core.drainRenderUpdates()) this.core.releaseRenderUpdate(update)
+    this.viewportModel.reset()
+    this.snapshot = null
+    this.forceFullRender = true
+    this.terminalStateDirty = true
     await this.core.restoreSnapshot(snapshot)
     this.snapshotRestoreCount += 1
     this.mount.dataset.ghosttyTerminalSnapshotRestoreCount = String(this.snapshotRestoreCount)

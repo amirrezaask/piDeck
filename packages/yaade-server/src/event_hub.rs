@@ -135,6 +135,8 @@ impl EventHub {
     pub fn emit_terminal(
         &self,
         terminal_id: impl Into<Arc<str>>,
+        stream_id: u64,
+        stream_epoch: u64,
         sequence: u64,
         data: bytes::Bytes,
     ) -> Arc<TerminalFrame> {
@@ -143,10 +145,30 @@ impl EventHub {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.sequence = state.sequence.saturating_add(1);
+        let terminal_id = terminal_id.into();
+        let wire_data = terminal_protocol::Codec::default()
+            .encode(
+                terminal_protocol::Frame::new(
+                    terminal_protocol::FrameType::PtyData,
+                    0,
+                    stream_id,
+                    terminal_protocol::StreamPosition {
+                        epoch: stream_epoch,
+                        sequence,
+                    },
+                    data.clone(),
+                )
+                .expect("bounded PTY data frame"),
+            )
+            .expect("bounded PTY data encoding")
+            .coalesce();
         let frame = Arc::new(TerminalFrame {
             event_sequence: state.sequence,
-            terminal_id: terminal_id.into(),
+            terminal_id,
+            stream_id,
+            stream_epoch,
             chunk: TerminalChunk { sequence, data },
+            wire_data,
         });
         // Allocate and dispatch under the same sequence lock used by metadata.
         // Subscriber enqueue is nonblocking, so socket IO cannot enter this path.
@@ -307,7 +329,7 @@ mod tests {
     #[test]
     fn terminal_bytes_are_live_only_and_globally_ordered() {
         let hub = EventHub::with_limits(identity(), 4, 4096);
-        let frame = hub.emit_terminal("term-1", 1, bytes::Bytes::from_static(b"paint\xff"));
+        let frame = hub.emit_terminal("term-1", 11, 7, 6, bytes::Bytes::from_static(b"paint\xff"));
         hub.emit("mux:event", vec![serde_json::json!("retained")]);
 
         let replay = hub.replay_window(0);
@@ -334,7 +356,13 @@ mod tests {
         let unrelated: Arc<dyn TerminalSubscriber> = Arc::new(Subscriber::default());
         hub.attach_terminal("term-1", "connection-1", &attached);
         hub.attach_terminal("term-2", "connection-2", &unrelated);
-        hub.emit_terminal("term-1", 1, bytes::Bytes::from_static(b"only attached"));
+        hub.emit_terminal(
+            "term-1",
+            11,
+            7,
+            13,
+            bytes::Bytes::from_static(b"only attached"),
+        );
 
         assert_eq!(hub.terminal_subscriber_count("term-1"), 1);
         assert_eq!(attached_impl.0.lock().expect("frames").len(), 1);

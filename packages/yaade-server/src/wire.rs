@@ -7,9 +7,9 @@ use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u8 = 2;
 pub const TERMINAL_DATA_FRAME_TYPE: u8 = 0x02;
-pub const MAX_WS_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const MAX_WS_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_TERMINAL_REPLAY_BYTES: usize = 2 * 1024 * 1024;
-pub const MAX_TERMINALS: usize = 64;
+pub const MAX_TERMINALS: usize = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -235,7 +235,29 @@ pub struct TerminalChunk {
 pub struct TerminalFrame {
     pub event_sequence: u64,
     pub terminal_id: Arc<str>,
+    pub stream_id: u64,
+    pub stream_epoch: u64,
     pub chunk: TerminalChunk,
+    /// One transport payload shared by every attached client.
+    pub wire_data: Bytes,
+}
+
+/// Encode the production data plane using the transport-independent protocol.
+pub fn encode_terminal_protocol_data_frame(
+    frame: &TerminalFrame,
+) -> Result<Bytes, terminal_protocol::ProtocolError> {
+    terminal_protocol::Codec::default()
+        .encode(terminal_protocol::Frame::new(
+            terminal_protocol::FrameType::PtyData,
+            0,
+            frame.stream_id,
+            terminal_protocol::StreamPosition {
+                epoch: frame.stream_epoch,
+                sequence: frame.chunk.sequence,
+            },
+            frame.chunk.data.clone(),
+        )?)
+        .map(terminal_protocol::EncodedFrame::coalesce)
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -348,7 +370,7 @@ mod tests {
 
         assert_eq!(capabilities.protocol_versions, vec![1, 2]);
         assert_eq!(capabilities.preferred_protocol_version, 2);
-        assert_eq!(capabilities.limits.max_terminals, 64);
+        assert_eq!(capabilities.limits.max_terminals, 1_000);
         assert_eq!(capabilities.limits.max_replay_bytes, 2 * 1024 * 1024);
         assert!(capabilities.features.writer_leases);
         assert!(!capabilities.features.persisted_terminal_history);
