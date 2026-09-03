@@ -19,6 +19,9 @@ const TERMINAL_PROTOCOL_SNAPSHOT = 4;
 const TERMINAL_PROTOCOL_PTY_DATA = 6;
 const TERMINAL_PROTOCOL_INPUT = 7;
 const TERMINAL_PROTOCOL_RESIZE = 8;
+const TERMINAL_PROTOCOL_SCROLLBACK_BEGIN = 9;
+const TERMINAL_PROTOCOL_SCROLLBACK_CHUNK = 10;
+const TERMINAL_PROTOCOL_SCROLLBACK_END = 11;
 
 type Utf8Encoder = { encode(input: string): Uint8Array };
 type Utf8Decoder = { decode(input: Uint8Array): string };
@@ -97,6 +100,32 @@ export function encodeTerminalInputFrame(
   return output;
 }
 
+export function encodeTerminalScrollbackRequest(
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+  cursor: number,
+  maxBytes: number,
+  reverse: boolean,
+): Uint8Array<ArrayBuffer> {
+  if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Error("invalid scrollback cursor");
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 8 * 1024 * 1024) {
+    throw new Error("invalid scrollback byte limit");
+  }
+  const output = new Uint8Array(new ArrayBuffer(TERMINAL_PROTOCOL_HEADER_BYTES + 13));
+  const view = new DataView(output.buffer);
+  output.set([TERMINAL_PROTOCOL_MAGIC_0, TERMINAL_PROTOCOL_MAGIC_1, TERMINAL_PROTOCOL_VERSION, TERMINAL_PROTOCOL_SCROLLBACK_BEGIN]);
+  view.setUint16(6, TERMINAL_PROTOCOL_HEADER_BYTES);
+  view.setBigUint64(8, toU64(streamId));
+  view.setBigUint64(16, toU64(streamEpoch));
+  view.setBigUint64(24, toU64(sequence));
+  view.setUint32(32, 13);
+  view.setBigUint64(36, toU64(cursor));
+  view.setUint32(44, maxBytes);
+  output[48] = reverse ? 1 : 0;
+  return output;
+}
+
 export function encodeTerminalResizeFrame(
   streamId: number,
   streamEpoch: number,
@@ -131,7 +160,14 @@ export type DecodedTerminalDataFrame = {
   id?: string;
   streamId?: number;
   streamEpoch?: number;
-  frameType?: "snapshot" | "ready" | "pty-data" | "resync-begin";
+  frameType?:
+    | "snapshot"
+    | "ready"
+    | "pty-data"
+    | "scrollback-begin"
+    | "scrollback-chunk"
+    | "scrollback-end"
+    | "resync-begin";
   payload: Uint8Array;
 };
 
@@ -155,13 +191,22 @@ export function decodeTerminalDataFrame(
         ? "ready" as const
         : buf[3] === TERMINAL_PROTOCOL_PTY_DATA
           ? "pty-data" as const
-          : buf[3] === 13
-            ? "resync-begin" as const
-            : null;
+          : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_BEGIN
+            ? "scrollback-begin" as const
+            : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_CHUNK
+              ? "scrollback-chunk" as const
+              : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_END
+                ? "scrollback-end" as const
+                : buf[3] === 13
+                  ? "resync-begin" as const
+                  : null;
     if (buf[2] !== TERMINAL_PROTOCOL_VERSION || frameType === null) return null;
     if (view.getUint16(4) !== 0 || view.getUint16(6) !== TERMINAL_PROTOCOL_HEADER_BYTES) return null;
     const payloadLength = view.getUint32(32);
-    if ((frameType === "snapshot" || frameType === "pty-data") && payloadLength === 0) return null;
+    if (
+      (frameType === "snapshot" || frameType === "pty-data" || frameType === "scrollback-chunk") &&
+      payloadLength === 0
+    ) return null;
     if (buf.length !== TERMINAL_PROTOCOL_HEADER_BYTES + payloadLength) return null;
     const streamId = fromU64(view.getBigUint64(8));
     const streamEpoch = fromU64(view.getBigUint64(16));

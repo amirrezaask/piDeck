@@ -1,10 +1,31 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use serde::Serialize;
 use tokio::sync::Notify;
+
+static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static DESYNCHRONIZED_CLIENT_STREAMS: AtomicU64 = AtomicU64::new(0);
+static RESYNCHRONIZATIONS: AtomicU64 = AtomicU64::new(0);
+static SLOW_CLIENT_RESYNCHRONIZATIONS: AtomicU64 = AtomicU64::new(0);
+static CLIENT_QUEUE_BYTES: AtomicU64 = AtomicU64::new(0);
+static CLIENT_QUEUE_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalTransportDiagnostics {
+    pub terminal_connections: u64,
+    pub terminal_clients_desynced: u64,
+    pub terminal_resync_total: u64,
+    pub terminal_slow_client_resyncs: u64,
+    pub terminal_client_queue_bytes: u64,
+    pub terminal_client_queue_peak_bytes: u64,
+}
 
 use crate::{
     event_hub::TerminalSubscriber,
@@ -56,6 +77,11 @@ impl TerminalFlow {
             }
         }
     }
+
+    fn desynchronize(&mut self) {
+        self.sent.clear();
+        self.unacknowledged_bytes = 0;
+    }
 }
 
 struct ConnectionOutboundState {
@@ -65,6 +91,7 @@ struct ConnectionOutboundState {
     attaching: HashSet<String>,
     close: Option<(u16, &'static str)>,
     stopped: bool,
+    reported_queue_bytes: usize,
 }
 
 /// Deep per-connection outbound module. Producers only perform bounded enqueue;
@@ -79,7 +106,7 @@ pub struct ConnectionOutbound {
 impl ConnectionOutbound {
     #[must_use]
     pub fn new(protocol: u8, flow_limit: usize) -> Arc<Self> {
-        Arc::new(Self {
+        let outbound = Arc::new(Self {
             protocol,
             flow_limit,
             state: Mutex::new(ConnectionOutboundState {
@@ -89,9 +116,24 @@ impl ConnectionOutbound {
                 attaching: HashSet::new(),
                 close: None,
                 stopped: false,
+                reported_queue_bytes: 0,
             }),
             notify: Notify::new(),
-        })
+        });
+        CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        outbound
+    }
+
+    #[must_use]
+    pub fn global_diagnostics() -> TerminalTransportDiagnostics {
+        TerminalTransportDiagnostics {
+            terminal_connections: CONNECTIONS.load(Ordering::Relaxed),
+            terminal_clients_desynced: DESYNCHRONIZED_CLIENT_STREAMS.load(Ordering::Relaxed),
+            terminal_resync_total: RESYNCHRONIZATIONS.load(Ordering::Relaxed),
+            terminal_slow_client_resyncs: SLOW_CLIENT_RESYNCHRONIZATIONS.load(Ordering::Relaxed),
+            terminal_client_queue_bytes: CLIENT_QUEUE_BYTES.load(Ordering::Relaxed),
+            terminal_client_queue_peak_bytes: CLIENT_QUEUE_PEAK_BYTES.load(Ordering::Relaxed),
+        }
     }
 
     pub fn enqueue_reliable<T: Serialize>(&self, value: &T) -> bool {
@@ -104,6 +146,28 @@ impl ConnectionOutbound {
 
     pub fn enqueue_text(&self, text: &str) -> bool {
         self.enqueue_reliable_frame(OutboundFrame::text(text.as_bytes().to_vec()))
+    }
+
+    pub fn enqueue_binary_reliable(&self, data: bytes::Bytes) -> bool {
+        self.enqueue_reliable_frame(OutboundFrame::binary(data))
+    }
+
+    pub fn enqueue_history(&self, frames: Vec<bytes::Bytes>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.stopped || state.close.is_some() {
+            return false;
+        }
+        let frames = frames.into_iter().map(OutboundFrame::binary).collect();
+        if !state.mailbox.enqueue_history_batch(frames).accepted {
+            return false;
+        }
+        publish_client_queue_bytes(&mut state);
+        drop(state);
+        self.notify.notify_one();
+        true
     }
 
     fn enqueue_reliable_frame(&self, frame: OutboundFrame) -> bool {
@@ -120,6 +184,7 @@ impl ConnectionOutbound {
             self.notify.notify_one();
             return false;
         }
+        publish_client_queue_bytes(&mut state);
         drop(state);
         self.notify.notify_one();
         true
@@ -133,7 +198,7 @@ impl ConnectionOutbound {
         state
             .flow
             .insert(terminal_id.to_owned(), TerminalFlow::new(acknowledged));
-        state.replay_required.remove(terminal_id);
+        resolve_desynchronization(&mut state, terminal_id);
         state.attaching.insert(terminal_id.to_owned());
     }
 
@@ -149,6 +214,7 @@ impl ConnectionOutbound {
             flow.acknowledge(snapshot_sequence);
         }
         state.attaching.remove(terminal_id);
+        publish_client_queue_bytes(&mut state);
         drop(state);
         self.notify.notify_one();
     }
@@ -244,9 +310,10 @@ impl ConnectionOutbound {
             }
         } else {
             state.flow.remove(terminal_id);
-            state.replay_required.remove(terminal_id);
+            resolve_desynchronization(&mut state, terminal_id);
         }
         state.attaching.remove(terminal_id);
+        publish_client_queue_bytes(&mut state);
         drop(state);
         self.notify.notify_one();
         true
@@ -258,7 +325,7 @@ impl ConnectionOutbound {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.flow.remove(terminal_id);
-        state.replay_required.remove(terminal_id);
+        resolve_desynchronization(&mut state, terminal_id);
         state.attaching.remove(terminal_id);
         drop(state);
         self.notify.notify_one();
@@ -307,6 +374,7 @@ impl ConnectionOutbound {
                 if state.attaching.is_empty()
                     && let Some(frame) = state.mailbox.pop_next()
                 {
+                    publish_client_queue_bytes(&mut state);
                     return Some(NextOutbound::Frame(frame));
                 }
                 if let Some((code, reason)) = state.close.take() {
@@ -370,7 +438,9 @@ impl TerminalSubscriber for ConnectionOutbound {
             );
         let acknowledged = flow.acknowledged;
         if !reserved {
-            state.replay_required.insert(terminal_id.to_owned());
+            flow.desynchronize();
+            state.mailbox.discard_terminal(terminal_id);
+            mark_desynchronized(&mut state, terminal_id, true);
             let Ok(data) = encode_resync_begin(&frame, acknowledged) else {
                 state.close = Some((1011, "resync frame serialization failed"));
                 drop(state);
@@ -384,6 +454,7 @@ impl TerminalSubscriber for ConnectionOutbound {
             {
                 state.close = Some((1013, "replay fence mailbox overflow"));
             }
+            publish_client_queue_bytes(&mut state);
             drop(state);
             self.notify.notify_one();
             return;
@@ -409,7 +480,11 @@ impl TerminalSubscriber for ConnectionOutbound {
             )
             .accepted
         {
-            state.replay_required.insert(terminal_id.to_owned());
+            if let Some(flow) = state.flow.get_mut(terminal_id) {
+                flow.desynchronize();
+            }
+            state.mailbox.discard_terminal(terminal_id);
+            mark_desynchronized(&mut state, terminal_id, true);
             if let Ok(data) = encode_resync_begin(&frame, acknowledged) {
                 if !state
                     .mailbox
@@ -422,8 +497,62 @@ impl TerminalSubscriber for ConnectionOutbound {
                 state.close = Some((1011, "replay fence serialization failed"));
             }
         }
+        publish_client_queue_bytes(&mut state);
         drop(state);
         self.notify.notify_one();
+    }
+}
+
+impl Drop for ConnectionOutbound {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        CLIENT_QUEUE_BYTES.fetch_sub(state.reported_queue_bytes as u64, Ordering::Relaxed);
+        DESYNCHRONIZED_CLIENT_STREAMS
+            .fetch_sub(state.replay_required.len() as u64, Ordering::Relaxed);
+        CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn publish_client_queue_bytes(state: &mut ConnectionOutboundState) {
+    let current = state.mailbox.pending_bytes();
+    match current.cmp(&state.reported_queue_bytes) {
+        std::cmp::Ordering::Greater => {
+            CLIENT_QUEUE_BYTES.fetch_add(
+                current.saturating_sub(state.reported_queue_bytes) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        std::cmp::Ordering::Less => {
+            CLIENT_QUEUE_BYTES.fetch_sub(
+                state.reported_queue_bytes.saturating_sub(current) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+    state.reported_queue_bytes = current;
+    CLIENT_QUEUE_PEAK_BYTES.fetch_max(
+        CLIENT_QUEUE_BYTES.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+}
+
+fn mark_desynchronized(state: &mut ConnectionOutboundState, terminal_id: &str, slow_client: bool) {
+    if state.replay_required.insert(terminal_id.to_owned()) {
+        DESYNCHRONIZED_CLIENT_STREAMS.fetch_add(1, Ordering::Relaxed);
+        RESYNCHRONIZATIONS.fetch_add(1, Ordering::Relaxed);
+        if slow_client {
+            SLOW_CLIENT_RESYNCHRONIZATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn resolve_desynchronization(state: &mut ConnectionOutboundState, terminal_id: &str) {
+    if state.replay_required.remove(terminal_id) {
+        DESYNCHRONIZED_CLIENT_STREAMS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -549,13 +678,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overflow_enqueues_one_replay_fence() {
-        let outbound = ConnectionOutbound::new(2, 1);
+    async fn overflow_drops_obsolete_deltas_and_enqueues_one_replay_fence() {
+        let outbound = ConnectionOutbound::new(2, 3);
         outbound.attach("term", 7);
         outbound.complete_attach("term", 7);
-        for sequence in 8..=10 {
-            outbound.enqueue_terminal(terminal_frame(sequence, sequence, b"xx"));
-        }
+        outbound.enqueue_terminal(terminal_frame(8, 8, b"x"));
+        outbound.enqueue_terminal(terminal_frame(10, 10, b"xx"));
+        outbound.enqueue_terminal(terminal_frame(12, 12, b"xx"));
         let Some(NextOutbound::Frame(frame)) = outbound.next().await else {
             panic!("expected replay fence")
         };

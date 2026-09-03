@@ -32,6 +32,19 @@ export interface YaadeHostTransport {
   ): Promise<HostRouteResult<Name>> | null;
   /** @deprecated Legacy realtime overload. */
   invokeRealtime?(channel: string, ...args: unknown[]): Promise<unknown> | null;
+  /** Low-priority binary scrollback page over the terminal data plane. */
+  readTerminalHistory?(
+    terminalId: string,
+    cursor: number,
+    maxBytes: number,
+    reverse?: boolean,
+  ): Promise<{
+    chunks: Uint8Array[];
+    firstSequence: number;
+    lastSequence: number;
+    nextSequence: number;
+    complete: boolean;
+  }> | null;
   /** Fire-and-forget terminal send for callers that do not need delivery status. */
   sendRealtime?(channel: string, ...args: unknown[]): boolean;
   on(channel: string, listener: (...args: unknown[]) => void): () => void;

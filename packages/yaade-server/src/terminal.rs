@@ -1,7 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     env,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::{
@@ -9,12 +10,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use base64::Engine as _;
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select_biased};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use ghostty_vt::{
     ColorScheme, CompressionMode, DeviceAttributes, EffectOptions, Mode, Rgb,
     Terminal as GhosttyTerminal, TerminalOptions as GhosttyTerminalOptions, TerminalSize,
@@ -30,7 +31,6 @@ use uuid::Uuid;
 use crate::{
     event_hub::EventHub,
     model::ProcessIdentity,
-    pty_poller::{PtyOutput, PtyPoller},
     terminal_control::{
         RuntimeTerminalLease, TerminalControlError, TerminalControlRegistry, TerminalLeaseRequest,
     },
@@ -48,6 +48,12 @@ const EXITED_REPLAY_BYTES: usize = 256 * 1024;
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const OWNER_COMMAND_BATCH_MESSAGES: usize = 64;
 const OWNER_WRITE_BATCH_BYTES: usize = 256 * 1024;
+const REACTOR_COMMAND_CAPACITY: usize = 4_096;
+const REACTOR_READ_BUFFER_BYTES: usize = 64 * 1024;
+const REACTOR_READY_EVENTS_PER_TURN: usize = 64;
+const MAX_PENDING_INPUT_BYTES_PER_TERMINAL: usize = 2 * 1024 * 1024;
+const REACTOR_WRITE_BUDGET_PER_TURN: usize = 64 * 1024;
+const REACTOR_MAX_SHARDS: usize = 8;
 const CLEANUP_QUEUE_CAPACITY: usize = 256;
 const CHECKPOINT_BYTES: usize = 512 * 1024;
 // Snapshot payloads use their own bounded binary frame and never base64-expand.
@@ -59,8 +65,9 @@ const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 const EXITED_DISPOSE_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 const WARM_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 const PARK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
-const THERMAL_TICK: std::time::Duration = std::time::Duration::from_millis(250);
-const PARKED_THERMAL_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+const THERMAL_TICK: Duration = Duration::from_millis(250);
+const PARKED_THERMAL_TICK: Duration = Duration::from_secs(5);
+const EXIT_POLL_TICK: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -173,9 +180,15 @@ struct TerminalMetrics {
     pty_bytes_written_total: AtomicU64,
     snapshots_total: AtomicU64,
     snapshot_bytes_total: AtomicU64,
+    snapshot_duration_ns_total: AtomicU64,
+    snapshot_duration_ns_max: AtomicU64,
     compression_runs_total: AtomicU64,
+    compression_duration_ns_total: AtomicU64,
+    compression_duration_ns_max: AtomicU64,
     hot_to_parked_total: AtomicU64,
     parked_to_hot_total: AtomicU64,
+    parked_wake_duration_ns_total: AtomicU64,
+    parked_wake_duration_ns_max: AtomicU64,
 }
 
 /// Content-free terminal runtime metrics and current resource classes.
@@ -186,13 +199,21 @@ pub struct TerminalRuntimeDiagnostics {
     pub terminal_sessions_active: usize,
     pub terminal_sessions_parked: usize,
     pub terminal_clients_attached: usize,
+    pub terminal_reactor_shards: usize,
+    pub terminal_owner_threads: usize,
     pub pty_bytes_read_total: u64,
     pub pty_bytes_written_total: u64,
     pub terminal_snapshots_total: u64,
     pub terminal_snapshot_bytes: u64,
+    pub terminal_snapshot_duration_ns_total: u64,
+    pub terminal_snapshot_duration_ns_max: u64,
     pub terminal_compression_runs_total: u64,
+    pub terminal_compression_duration_ns_total: u64,
+    pub terminal_compression_duration_ns_max: u64,
     pub terminal_hot_to_parked_total: u64,
     pub terminal_parked_to_hot_total: u64,
+    pub terminal_wake_duration_ns_total: u64,
+    pub terminal_wake_duration_ns_max: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -405,9 +426,6 @@ enum TerminalCommand {
     ListLeases {
         reply: Reply<Vec<RuntimeTerminalLease>>,
     },
-    ReleaseConnection {
-        connection_id: String,
-    },
 }
 
 impl TerminalCommand {
@@ -427,8 +445,33 @@ impl TerminalCommand {
                 | Self::ReleaseLease { .. }
                 | Self::Takeover { .. }
                 | Self::Transfer { .. }
-                | Self::ReleaseConnection { .. }
         )
+    }
+}
+
+#[derive(Clone)]
+struct ReactorHandle {
+    urgent: Sender<ReactorCommand>,
+    normal: Sender<ReactorCommand>,
+    wake: Arc<polling::Poller>,
+}
+
+impl ReactorHandle {
+    fn send(&self, command: ReactorCommand, urgent: bool) -> Result<(), TerminalError> {
+        let sender = if urgent { &self.urgent } else { &self.normal };
+        sender.try_send(command).map_err(|error| match error {
+            TrySendError::Full(_) => {
+                TerminalError::Runtime("terminal reactor mailbox is full".to_owned())
+            }
+            TrySendError::Disconnected(_) => {
+                TerminalError::Runtime("terminal reactor stopped".to_owned())
+            }
+        })?;
+        // The bounded poll timeout is a fallback if a platform wake fails. The
+        // command is already owned by the reactor and must not be reported as
+        // rejected after enqueue.
+        let _ = self.wake.notify();
+        Ok(())
     }
 }
 
@@ -440,8 +483,96 @@ struct TerminalEntry {
     spawn_cwd: PathBuf,
     os_pid: Option<u32>,
     process_identity: Option<ProcessIdentity>,
-    urgent_commands: Sender<TerminalCommand>,
-    normal_commands: Sender<TerminalCommand>,
+    reactor: ReactorHandle,
+}
+
+struct CreateRuntime {
+    entry: Arc<TerminalEntry>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    #[cfg(unix)]
+    reader: Box<dyn Read + Send>,
+    #[cfg(unix)]
+    raw_fd: std::os::fd::RawFd,
+    state: EntryState,
+    initialized: Sender<Result<(), TerminalError>>,
+}
+
+enum ReactorCommand {
+    Create(Box<CreateRuntime>),
+    Session {
+        terminal_id: String,
+        command: Box<TerminalCommand>,
+    },
+    ReleaseConnection {
+        connection_id: String,
+    },
+    Diagnostics {
+        reply: Sender<ReactorDiagnostics>,
+    },
+    #[cfg(not(unix))]
+    Output {
+        terminal_id: String,
+        output: ReactorOutput,
+    },
+    Shutdown,
+}
+
+#[cfg(not(unix))]
+enum ReactorOutput {
+    Bytes(Bytes),
+    Eof,
+    ReadFailed(std::io::ErrorKind),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReactorDiagnostics {
+    sessions: usize,
+    parked: usize,
+    attached_clients: usize,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct BorrowedPty(std::os::fd::RawFd);
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for BorrowedPty {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for BorrowedPty {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: the reactor deletes this registration before dropping the
+        // runtime-owned PTY master and reader handles.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.0) }
+    }
+}
+
+struct TerminalRuntime {
+    entry: Arc<TerminalEntry>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    #[cfg(unix)]
+    reader: Box<dyn Read + Send>,
+    #[cfg(unix)]
+    source: BorrowedPty,
+    state: EntryState,
+    terminal: GhosttyTerminal,
+    control: TerminalControlRegistry,
+    write_scratch: Vec<u8>,
+    pending_input: VecDeque<(Bytes, usize)>,
+    pending_input_bytes: usize,
+    poll_key: usize,
+    output_open: bool,
+    #[cfg(unix)]
+    registration_active: bool,
+    exit_observed: bool,
 }
 
 pub struct TerminalHost {
@@ -451,7 +582,8 @@ pub struct TerminalHost {
     cleanup_tx: tokio::sync::mpsc::Sender<(String, String)>,
     history: TerminalHistoryArchive,
     checkpoints: bool,
-    pty_poller: Arc<PtyPoller>,
+    reactors: Vec<ReactorHandle>,
+    reactor_workers: Mutex<Vec<thread::JoinHandle<()>>>,
     metrics: TerminalMetrics,
 }
 
@@ -461,8 +593,24 @@ impl TerminalHost {
         history_root: &Path,
         _checkpoints: bool,
     ) -> Result<Arc<Self>, TerminalError> {
-        let (cleanup_tx, mut cleanup_rx) = tokio::sync::mpsc::channel(CLEANUP_QUEUE_CAPACITY);
-        let pty_poller = PtyPoller::new().map_err(TerminalError::Runtime)?;
+        let (cleanup_tx, cleanup_rx) = tokio::sync::mpsc::channel(CLEANUP_QUEUE_CAPACITY);
+        let shard_count = terminal_reactor_shard_count();
+        let mut reactor_receivers = Vec::with_capacity(shard_count);
+        let mut reactors = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let wake = Arc::new(
+                polling::Poller::new()
+                    .map_err(|error| TerminalError::Runtime(error.to_string()))?,
+            );
+            let (urgent, urgent_rx) = bounded(REACTOR_COMMAND_CAPACITY);
+            let (normal, normal_rx) = bounded(REACTOR_COMMAND_CAPACITY);
+            reactors.push(ReactorHandle {
+                urgent,
+                normal,
+                wake: Arc::clone(&wake),
+            });
+            reactor_receivers.push((wake, urgent_rx, normal_rx));
+        }
         let host = Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             events,
@@ -470,23 +618,40 @@ impl TerminalHost {
             cleanup_tx,
             history: TerminalHistoryArchive::open(history_root)?,
             checkpoints: true,
-            pty_poller,
+            reactors,
+            reactor_workers: Mutex::new(Vec::with_capacity(shard_count)),
             metrics: TerminalMetrics::default(),
         });
+
         let weak = Arc::downgrade(&host);
-        tokio::spawn(async move {
-            while let Some((id, terminal_epoch)) = cleanup_rx.recv().await {
-                let weak = weak.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(EXITED_DISPOSE_TTL).await;
-                    let Some(host) = weak.upgrade() else { return };
-                    let current_epoch = host.inspect(&id).map(|entry| entry.terminal_epoch);
-                    if current_epoch.as_deref() == Some(&terminal_epoch) {
-                        let _ = host.dispose(&id);
+        let mut workers: Vec<thread::JoinHandle<()>> = Vec::with_capacity(shard_count);
+        for (index, (poller, urgent, normal)) in reactor_receivers.into_iter().enumerate() {
+            let owner = weak.clone();
+            let worker = match thread::Builder::new()
+                .name(format!("yaade-terminal-reactor-{index}"))
+                .stack_size(512 * 1024)
+                .spawn(move || run_terminal_reactor(owner, poller, urgent, normal))
+            {
+                Ok(worker) => worker,
+                Err(error) => {
+                    for reactor in &host.reactors {
+                        let _ = reactor.urgent.send(ReactorCommand::Shutdown);
+                        let _ = reactor.wake.notify();
                     }
-                });
-            }
-        });
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(TerminalError::Runtime(error.to_string()));
+                }
+            };
+            workers.push(worker);
+        }
+        *host
+            .reactor_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = workers;
+
+        tokio::spawn(run_terminal_cleanup(weak, cleanup_rx));
         Ok(host)
     }
 
@@ -600,9 +765,8 @@ impl TerminalHost {
             .is_none()
             .then(|| Path::new(&command).file_name()?.to_str().map(str::to_owned))
             .flatten();
-        let (urgent_command_tx, urgent_command_rx) = bounded(64);
-        let (normal_command_tx, normal_command_rx) = bounded(64);
-        let (output_tx, output_rx) = bounded(64);
+        let reactor_index = terminal_stream_id(&id) as usize % self.reactors.len();
+        let reactor = self.reactors[reactor_index].clone();
         let entry = Arc::new(TerminalEntry {
             id: id.clone(),
             title: title.clone(),
@@ -611,8 +775,7 @@ impl TerminalHost {
             spawn_cwd: cwd,
             os_pid,
             process_identity: process_identity.clone(),
-            urgent_commands: urgent_command_tx,
-            normal_commands: normal_command_tx,
+            reactor: reactor.clone(),
         });
         let state = EntryState {
             status: TerminalProcessStatus::Running,
@@ -638,40 +801,29 @@ impl TerminalHost {
             attached_clients: HashSet::new(),
             compression_activity: 0,
         };
-        let weak = Arc::downgrade(self);
-        let owner_entry = Arc::clone(&entry);
         let (init_tx, init_rx) = bounded(1);
-        thread::Builder::new()
-            .name(format!("yaade-terminal-owner-{id}"))
-            .stack_size(512 * 1024)
-            .spawn(move || {
-                terminal_owner_loop(
-                    weak,
-                    owner_entry,
-                    pair.master,
-                    writer,
-                    child,
-                    state,
-                    urgent_command_rx,
-                    normal_command_rx,
-                    output_rx,
-                    init_tx,
-                );
-            })
-            .map_err(|error| TerminalError::Runtime(error.to_string()))?;
+        reactor.send(
+            ReactorCommand::Create(Box::new(CreateRuntime {
+                entry: Arc::clone(&entry),
+                master: pair.master,
+                writer,
+                child,
+                #[cfg(unix)]
+                reader,
+                #[cfg(unix)]
+                raw_fd,
+                state,
+                initialized: init_tx,
+            })),
+            false,
+        )?;
         init_rx
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(Duration::from_secs(30))
             .map_err(|_| {
-                TerminalError::Runtime("terminal owner initialization timed out".to_owned())
+                TerminalError::Runtime("terminal reactor initialization timed out".to_owned())
             })??;
-        #[cfg(unix)]
-        let registration = self.pty_poller.register(raw_fd, reader, output_tx);
         #[cfg(not(unix))]
-        let registration = self.pty_poller.register(0, reader, output_tx);
-        if let Err(error) = registration {
-            let _ = self.request(&entry, |reply| TerminalCommand::Dispose { reply });
-            return Err(TerminalError::Runtime(error));
-        }
+        spawn_fallback_pty_reader(id.clone(), reader, reactor.clone())?;
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -703,22 +855,17 @@ impl TerminalHost {
     ) -> Result<T, TerminalError> {
         let (reply, result) = bounded(1);
         let command = command(reply);
-        let commands = if command.is_urgent() {
-            &entry.urgent_commands
-        } else {
-            &entry.normal_commands
-        };
-        commands.try_send(command).map_err(|error| match error {
-            crossbeam_channel::TrySendError::Full(_) => {
-                TerminalError::Runtime("terminal control mailbox is full".to_owned())
-            }
-            crossbeam_channel::TrySendError::Disconnected(_) => {
-                TerminalError::Runtime("terminal owner stopped".to_owned())
-            }
-        })?;
+        let urgent = command.is_urgent();
+        entry.reactor.send(
+            ReactorCommand::Session {
+                terminal_id: entry.id.clone(),
+                command: Box::new(command),
+            },
+            urgent,
+        )?;
         result
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .map_err(|_| TerminalError::Runtime("terminal owner reply timed out".to_owned()))?
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| TerminalError::Runtime("terminal reactor reply timed out".to_owned()))?
     }
 
     #[must_use]
@@ -899,36 +1046,65 @@ impl TerminalHost {
 
     #[must_use]
     pub fn runtime_diagnostics(&self) -> TerminalRuntimeDiagnostics {
-        let entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut diagnostics = TerminalRuntimeDiagnostics {
+        let mut reactor_diagnostics = ReactorDiagnostics::default();
+        for reactor in &self.reactors {
+            let (reply, received) = bounded(1);
+            if reactor
+                .send(ReactorCommand::Diagnostics { reply }, false)
+                .is_ok()
+                && let Ok(shard) = received.recv_timeout(Duration::from_secs(1))
+            {
+                reactor_diagnostics.sessions += shard.sessions;
+                reactor_diagnostics.parked += shard.parked;
+                reactor_diagnostics.attached_clients += shard.attached_clients;
+            }
+        }
+        TerminalRuntimeDiagnostics {
             terminal_sessions_total: self.metrics.sessions_total.load(Ordering::Relaxed),
-            terminal_sessions_active: entries.len(),
+            terminal_sessions_active: reactor_diagnostics.sessions,
+            terminal_sessions_parked: reactor_diagnostics.parked,
+            terminal_clients_attached: reactor_diagnostics.attached_clients,
+            terminal_reactor_shards: self.reactors.len(),
+            terminal_owner_threads: self
+                .reactor_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
             pty_bytes_read_total: self.metrics.pty_bytes_read_total.load(Ordering::Relaxed),
             pty_bytes_written_total: self.metrics.pty_bytes_written_total.load(Ordering::Relaxed),
             terminal_snapshots_total: self.metrics.snapshots_total.load(Ordering::Relaxed),
             terminal_snapshot_bytes: self.metrics.snapshot_bytes_total.load(Ordering::Relaxed),
+            terminal_snapshot_duration_ns_total: self
+                .metrics
+                .snapshot_duration_ns_total
+                .load(Ordering::Relaxed),
+            terminal_snapshot_duration_ns_max: self
+                .metrics
+                .snapshot_duration_ns_max
+                .load(Ordering::Relaxed),
             terminal_compression_runs_total: self
                 .metrics
                 .compression_runs_total
                 .load(Ordering::Relaxed),
+            terminal_compression_duration_ns_total: self
+                .metrics
+                .compression_duration_ns_total
+                .load(Ordering::Relaxed),
+            terminal_compression_duration_ns_max: self
+                .metrics
+                .compression_duration_ns_max
+                .load(Ordering::Relaxed),
             terminal_hot_to_parked_total: self.metrics.hot_to_parked_total.load(Ordering::Relaxed),
             terminal_parked_to_hot_total: self.metrics.parked_to_hot_total.load(Ordering::Relaxed),
-            ..TerminalRuntimeDiagnostics::default()
-        };
-        for entry in entries {
-            if let Ok(inspect) = self.request(&entry, |reply| TerminalCommand::Inspect { reply }) {
-                diagnostics.terminal_clients_attached += inspect.attached_clients;
-                diagnostics.terminal_sessions_parked +=
-                    usize::from(inspect.thermal_state == ThermalState::Parked);
-            }
+            terminal_wake_duration_ns_total: self
+                .metrics
+                .parked_wake_duration_ns_total
+                .load(Ordering::Relaxed),
+            terminal_wake_duration_ns_max: self
+                .metrics
+                .parked_wake_duration_ns_max
+                .load(Ordering::Relaxed),
         }
-        diagnostics
     }
 
     pub fn terminate_stale_process(
@@ -1147,19 +1323,13 @@ impl TerminalHost {
     }
 
     pub fn release_connection(&self, connection_id: &str) {
-        let entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for entry in entries {
-            let _ = entry
-                .urgent_commands
-                .try_send(TerminalCommand::ReleaseConnection {
+        for reactor in &self.reactors {
+            let _ = reactor.send(
+                ReactorCommand::ReleaseConnection {
                     connection_id: connection_id.to_owned(),
-                });
+                },
+                true,
+            );
         }
     }
 
@@ -1177,6 +1347,25 @@ impl TerminalHost {
             fence: supplied,
             reply,
         })
+    }
+}
+
+impl Drop for TerminalHost {
+    fn drop(&mut self) {
+        for reactor in &self.reactors {
+            // Shutdown is reliable and bounded; unlike session work it must not
+            // be rejected merely because a shard mailbox is momentarily full.
+            let _ = reactor.urgent.send(ReactorCommand::Shutdown);
+            let _ = reactor.wake.notify();
+        }
+        for worker in self
+            .reactor_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -1232,194 +1421,655 @@ fn create_ghostty_terminal(state: &EntryState) -> Result<GhosttyTerminal, Termin
     Ok(terminal)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn terminal_owner_loop(
+fn terminal_reactor_shard_count() -> usize {
+    env::var("YAADE_TERMINAL_REACTOR_SHARDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .min(REACTOR_MAX_SHARDS)
+        })
+        .clamp(1, REACTOR_MAX_SHARDS)
+}
+
+async fn run_terminal_cleanup(
     host: Weak<TerminalHost>,
-    entry: Arc<TerminalEntry>,
-    master: Box<dyn MasterPty + Send>,
-    mut writer: Box<dyn Write + Send>,
-    mut child: Box<dyn Child + Send + Sync>,
-    mut state: EntryState,
-    urgent_commands: Receiver<TerminalCommand>,
-    normal_commands: Receiver<TerminalCommand>,
-    output: Receiver<PtyOutput>,
-    initialized: Sender<Result<(), TerminalError>>,
+    mut cleanup: tokio::sync::mpsc::Receiver<(String, String)>,
 ) {
-    let mut terminal = match create_ghostty_terminal(&state) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = initialized.send(Err(error));
-            return;
-        }
-    };
-    state.compression_activity = terminal.compression_activity().unwrap_or(0);
-    let mut control = TerminalControlRegistry::new();
-    if let Err(error) = control.register_terminal(&entry.id, &entry.terminal_epoch) {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = initialized.send(Err(error.into()));
-        return;
-    }
-    if initialized.send(Ok(())).is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return;
-    }
-    macro_rules! handle {
-        ($command:expr) => {
-            if !handle_terminal_command(
-                &host,
-                &entry,
-                &*master,
-                &mut writer,
-                &mut child,
-                &mut state,
-                &mut terminal,
-                &mut control,
-                $command,
-            ) {
-                return;
-            }
-        };
-    }
-    macro_rules! handle_batch {
-        ($commands:expr, $scratch:expr) => {
-            if !handle_terminal_command_batch(
-                &host,
-                &entry,
-                &*master,
-                &mut writer,
-                &mut child,
-                &mut state,
-                &mut terminal,
-                &mut control,
-                $commands,
-                $scratch,
-            ) {
-                return;
-            }
-        };
-    }
-    let mut write_scratch = Vec::new();
-    let mut output_open = true;
-    let mut exit_observed = false;
+    let mut pending = BinaryHeap::<Reverse<(tokio::time::Instant, String, String)>>::new();
     loop {
-        // Bound each class per turn: input/disposal stays responsive without
-        // allowing a hot producer to starve lifecycle work or PTY output.
-        let mut urgent_batch = Vec::new();
-        for _ in 0..OWNER_COMMAND_BATCH_MESSAGES {
-            match urgent_commands.try_recv() {
-                Ok(command) => urgent_batch.push(command),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
-            }
-        }
-        if !urgent_batch.is_empty() {
-            handle_batch!(urgent_batch, &mut write_scratch);
-        }
-        let mut output_bytes = 0_usize;
-        while output_open && output_bytes < 1024 * 1024 {
-            match output.try_recv() {
-                Ok(PtyOutput::Bytes(data)) => {
-                    output_bytes = output_bytes.saturating_add(data.len());
-                    if !process_terminal_output(
-                        &host,
-                        &entry,
-                        &mut writer,
-                        &mut state,
-                        &mut terminal,
-                        data,
-                    ) {
-                        let _ = child.kill();
-                        output_open = false;
-                        break;
-                    }
-                }
-                Ok(PtyOutput::ReadFailed(kind)) => {
-                    eprintln!("[terminal-poller] {} failed: {kind:?}", entry.id);
-                    output_open = false;
-                    break;
-                }
-                Ok(PtyOutput::Eof) | Err(TryRecvError::Disconnected) => {
-                    output_open = false;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-            }
-        }
-        for _ in 0..4 {
-            match normal_commands.try_recv() {
-                Ok(command) => handle!(command),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
-            }
-        }
-        maintain_terminal_thermal_state(&host, &mut state, &mut terminal);
-        if !output_open && !exit_observed {
-            observe_terminal_exit(&host, &entry, &mut child, &mut state, &mut terminal);
-            exit_observed = true;
-        }
-        if !output_open {
-            select_biased! {
-                recv(urgent_commands) -> command => {
-                    let first = match command { Ok(value) => value, Err(_) => return };
-                    handle_batch!(collect_command_batch(first, &urgent_commands), &mut write_scratch);
+        if let Some(Reverse((deadline, _, _))) = pending.peek() {
+            tokio::select! {
+                next = cleanup.recv() => match next {
+                    Some((id, epoch)) => pending.push(Reverse((tokio::time::Instant::now() + EXITED_DISPOSE_TTL, id, epoch))),
+                    None => break,
                 },
-                recv(normal_commands) -> command => handle!(match command { Ok(value) => value, Err(_) => return }),
-            }
-            continue;
-        }
-        let thermal_tick = if state.thermal_state == ThermalState::Parked {
-            PARKED_THERMAL_TICK
-        } else {
-            THERMAL_TICK
-        };
-        select_biased! {
-            recv(urgent_commands) -> command => {
-                let first = match command { Ok(value) => value, Err(_) => return };
-                handle_batch!(collect_command_batch(first, &urgent_commands), &mut write_scratch);
-            },
-            recv(output) -> message => match message {
-                Ok(PtyOutput::Bytes(data)) => {
-                    if !process_terminal_output(
-                        &host,
-                        &entry,
-                        &mut writer,
-                        &mut state,
-                        &mut terminal,
-                        data,
-                    ) {
-                        let _ = child.kill();
-                        output_open = false;
+                () = tokio::time::sleep_until(*deadline) => {
+                    let now = tokio::time::Instant::now();
+                    while pending.peek().is_some_and(|Reverse((deadline, _, _))| *deadline <= now) {
+                        let Some(Reverse((_, id, epoch))) = pending.pop() else { break };
+                        let Some(host) = host.upgrade() else { return };
+                        let current_epoch = host.inspect(&id).map(|entry| entry.terminal_epoch);
+                        if current_epoch.as_deref() == Some(&epoch) {
+                            let _ = host.dispose(&id);
+                        }
                     }
                 }
-                Ok(PtyOutput::ReadFailed(kind)) => {
-                    eprintln!("[terminal-poller] {} failed: {kind:?}", entry.id);
-                    output_open = false;
-                }
-                Ok(PtyOutput::Eof) | Err(_) => output_open = false,
-            },
-            recv(normal_commands) -> command => handle!(match command { Ok(value) => value, Err(_) => return }),
-            default(thermal_tick) => {},
+            }
+        } else {
+            let Some((id, epoch)) = cleanup.recv().await else {
+                break;
+            };
+            pending.push(Reverse((
+                tokio::time::Instant::now() + EXITED_DISPOSE_TTL,
+                id,
+                epoch,
+            )));
         }
     }
 }
 
-fn collect_command_batch(
-    first: TerminalCommand,
-    commands: &Receiver<TerminalCommand>,
-) -> Vec<TerminalCommand> {
-    let mut batch = Vec::with_capacity(OWNER_COMMAND_BATCH_MESSAGES);
-    batch.push(first);
-    for _ in 1..OWNER_COMMAND_BATCH_MESSAGES {
-        match commands.try_recv() {
-            Ok(command) => batch.push(command),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+fn run_terminal_reactor(
+    host: Weak<TerminalHost>,
+    poller: Arc<polling::Poller>,
+    urgent: Receiver<ReactorCommand>,
+    normal: Receiver<ReactorCommand>,
+) {
+    #[cfg(unix)]
+    use polling::Events;
+
+    let mut runtimes = HashMap::<u64, TerminalRuntime>::new();
+    let mut runtime_by_id = HashMap::<String, u64>::new();
+    let mut maintenance = BinaryHeap::<Reverse<(Instant, u64)>>::new();
+    let mut next_runtime_key = 1_u64;
+    #[cfg(unix)]
+    let mut events = Events::new();
+    #[cfg(unix)]
+    let mut read_buffer = vec![0_u8; REACTOR_READ_BUFFER_BYTES];
+    let mut running = true;
+
+    while running {
+        running = process_reactor_commands(
+            &host,
+            &poller,
+            &urgent,
+            OWNER_COMMAND_BATCH_MESSAGES * 4,
+            &mut runtimes,
+            &mut runtime_by_id,
+            &mut maintenance,
+            &mut next_runtime_key,
+        );
+        if !running {
+            break;
+        }
+
+        #[cfg(unix)]
+        {
+            events.clear();
+            let now = Instant::now();
+            let timeout = maintenance
+                .peek()
+                .map(|Reverse((deadline, _))| deadline.saturating_duration_since(now))
+                .unwrap_or(THERMAL_TICK)
+                .min(THERMAL_TICK);
+            if poller.wait(&mut events, Some(timeout)).is_ok() {
+                for event in events.iter().take(REACTOR_READY_EVENTS_PER_TURN) {
+                    let key = event.key as u64;
+                    let Some(runtime) = runtimes.get_mut(&key) else {
+                        continue;
+                    };
+                    if !runtime.output_open {
+                        continue;
+                    }
+                    if event.writable {
+                        flush_runtime_input(runtime);
+                    }
+                    if event.readable {
+                        drain_runtime_output(&host, runtime, &mut read_buffer);
+                    }
+                    if runtime.output_open
+                        && let Err(error) = set_runtime_interest(&poller, runtime)
+                    {
+                        eprintln!(
+                            "[terminal-reactor] {} poll update failed: {error}",
+                            runtime.entry.id
+                        );
+                        let _ = runtime.child.kill();
+                        runtime.output_open = false;
+                    }
+                    if !runtime.output_open {
+                        unregister_runtime(&poller, runtime);
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        thread::sleep(THERMAL_TICK.min(Duration::from_millis(25)));
+
+        running = process_reactor_commands(
+            &host,
+            &poller,
+            &normal,
+            OWNER_COMMAND_BATCH_MESSAGES,
+            &mut runtimes,
+            &mut runtime_by_id,
+            &mut maintenance,
+            &mut next_runtime_key,
+        );
+        if !running {
+            break;
+        }
+        maintain_due_runtimes(&host, &mut runtimes, &mut maintenance);
+    }
+
+    for (_, mut runtime) in runtimes.drain() {
+        #[cfg(unix)]
+        unregister_runtime(&poller, &mut runtime);
+        runtime
+            .control
+            .unregister_terminal(&runtime.entry.id, Some(&runtime.entry.terminal_epoch));
+        let _ = runtime.child.kill();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_reactor_commands(
+    host: &Weak<TerminalHost>,
+    poller: &Arc<polling::Poller>,
+    receiver: &Receiver<ReactorCommand>,
+    limit: usize,
+    runtimes: &mut HashMap<u64, TerminalRuntime>,
+    runtime_by_id: &mut HashMap<String, u64>,
+    maintenance: &mut BinaryHeap<Reverse<(Instant, u64)>>,
+    next_runtime_key: &mut u64,
+) -> bool {
+    let mut commands = VecDeque::with_capacity(limit.min(OWNER_COMMAND_BATCH_MESSAGES));
+    for _ in 0..limit {
+        match receiver.try_recv() {
+            Ok(command) => commands.push_back(command),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => return false,
         }
     }
-    batch
+    while let Some(command) = commands.pop_front() {
+        match command {
+            ReactorCommand::Create(create) => initialize_runtime(
+                poller,
+                *create,
+                runtimes,
+                runtime_by_id,
+                maintenance,
+                next_runtime_key,
+            ),
+            ReactorCommand::Session {
+                terminal_id,
+                command,
+            } => {
+                let mut batch = vec![*command];
+                while batch.len() < OWNER_COMMAND_BATCH_MESSAGES {
+                    let same_terminal = matches!(
+                        commands.front(),
+                        Some(ReactorCommand::Session { terminal_id: next, .. }) if next == &terminal_id
+                    );
+                    if !same_terminal {
+                        break;
+                    }
+                    let Some(ReactorCommand::Session { command, .. }) = commands.pop_front() else {
+                        unreachable!()
+                    };
+                    batch.push(*command);
+                }
+                let Some(key) = runtime_by_id.get(&terminal_id).copied() else {
+                    for command in batch {
+                        reject_terminal_command(command, &terminal_id);
+                    }
+                    continue;
+                };
+                let mut keep = {
+                    let runtime = runtimes.get_mut(&key).expect("terminal runtime index");
+                    handle_terminal_command_batch(
+                        host,
+                        &runtime.entry,
+                        &*runtime.master,
+                        &mut runtime.child,
+                        &mut runtime.state,
+                        &mut runtime.terminal,
+                        &mut runtime.control,
+                        batch,
+                        &mut runtime.write_scratch,
+                        &mut runtime.pending_input,
+                        &mut runtime.pending_input_bytes,
+                    )
+                };
+                #[cfg(unix)]
+                if keep {
+                    let runtime = runtimes.get_mut(&key).expect("terminal runtime index");
+                    if runtime.registration_active
+                        && runtime.output_open
+                        && let Err(error) = set_runtime_interest(poller, runtime)
+                    {
+                        eprintln!(
+                            "[terminal-reactor] {} poll update failed: {error}",
+                            runtime.entry.id
+                        );
+                        let _ = runtime.child.kill();
+                        runtime.output_open = false;
+                        keep = false;
+                    }
+                }
+                #[cfg(not(unix))]
+                if keep {
+                    let runtime = runtimes.get_mut(&key).expect("terminal runtime index");
+                    flush_runtime_input_fallback(runtime);
+                }
+                if !keep {
+                    remove_runtime(poller, key, runtimes, runtime_by_id);
+                }
+            }
+            ReactorCommand::ReleaseConnection { connection_id } => {
+                for runtime in runtimes.values_mut() {
+                    runtime.control.release_connection(&connection_id);
+                    runtime.state.replay_ready_clients.remove(&connection_id);
+                    runtime.state.attached_clients.remove(&connection_id);
+                    runtime.state.last_activity_at = Instant::now();
+                }
+            }
+            ReactorCommand::Diagnostics { reply } => {
+                let _ = reply.send(ReactorDiagnostics {
+                    sessions: runtimes.len(),
+                    parked: runtimes
+                        .values()
+                        .filter(|runtime| runtime.state.thermal_state == ThermalState::Parked)
+                        .count(),
+                    attached_clients: runtimes
+                        .values()
+                        .map(|runtime| runtime.state.attached_clients.len())
+                        .sum(),
+                });
+            }
+            #[cfg(not(unix))]
+            ReactorCommand::Output {
+                terminal_id,
+                output,
+            } => {
+                if let Some(key) = runtime_by_id.get(&terminal_id).copied()
+                    && let Some(runtime) = runtimes.get_mut(&key)
+                {
+                    process_fallback_output(host, runtime, output);
+                }
+            }
+            ReactorCommand::Shutdown => return false,
+        }
+    }
+    true
+}
+
+fn initialize_runtime(
+    poller: &Arc<polling::Poller>,
+    mut create: CreateRuntime,
+    runtimes: &mut HashMap<u64, TerminalRuntime>,
+    runtime_by_id: &mut HashMap<String, u64>,
+    maintenance: &mut BinaryHeap<Reverse<(Instant, u64)>>,
+    next_runtime_key: &mut u64,
+) {
+    let terminal = match create_ghostty_terminal(&create.state) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = create.child.kill();
+            let _ = create.initialized.send(Err(error));
+            return;
+        }
+    };
+    create.state.compression_activity = terminal.compression_activity().unwrap_or(0);
+    let mut control = TerminalControlRegistry::new();
+    if let Err(error) = control.register_terminal(&create.entry.id, &create.entry.terminal_epoch) {
+        let _ = create.child.kill();
+        let _ = create.initialized.send(Err(error.into()));
+        return;
+    }
+    let key = *next_runtime_key;
+    *next_runtime_key = next_runtime_key.saturating_add(1);
+    #[cfg(unix)]
+    let source = BorrowedPty(create.raw_fd);
+    #[cfg(unix)]
+    {
+        use polling::{Event, PollMode};
+        // `portable-pty` clones share the master file description. Nonblocking
+        // mode therefore covers both reactor reads and serialized input writes.
+        // SAFETY: `raw_fd` is owned by `create.master` for this entire scope.
+        let flags = unsafe { libc::fcntl(create.raw_fd, libc::F_GETFL) };
+        let nonblocking = flags >= 0
+            // SAFETY: the descriptor is valid and flags preserve existing mode bits.
+            && unsafe { libc::fcntl(create.raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0;
+        if !nonblocking {
+            control.unregister_terminal(&create.entry.id, Some(&create.entry.terminal_epoch));
+            let _ = create.child.kill();
+            let _ = create.initialized.send(Err(TerminalError::Runtime(
+                std::io::Error::last_os_error().to_string(),
+            )));
+            return;
+        }
+        // SAFETY: the runtime retains the PTY handles and registration source;
+        // `unregister_runtime` deletes the key before those handles are dropped.
+        if let Err(error) =
+            unsafe { poller.add_with_mode(&source, Event::readable(key as usize), PollMode::Level) }
+        {
+            control.unregister_terminal(&create.entry.id, Some(&create.entry.terminal_epoch));
+            let _ = create.child.kill();
+            let _ = create
+                .initialized
+                .send(Err(TerminalError::Runtime(error.to_string())));
+            return;
+        }
+    }
+    let terminal_id = create.entry.id.clone();
+    runtimes.insert(
+        key,
+        TerminalRuntime {
+            entry: create.entry,
+            master: create.master,
+            writer: create.writer,
+            child: create.child,
+            #[cfg(unix)]
+            reader: create.reader,
+            #[cfg(unix)]
+            source,
+            state: create.state,
+            terminal,
+            control,
+            write_scratch: Vec::with_capacity(OWNER_WRITE_BATCH_BYTES),
+            pending_input: VecDeque::new(),
+            pending_input_bytes: 0,
+            poll_key: key as usize,
+            output_open: true,
+            #[cfg(unix)]
+            registration_active: true,
+            exit_observed: false,
+        },
+    );
+    runtime_by_id.insert(terminal_id, key);
+    maintenance.push(Reverse((Instant::now() + THERMAL_TICK, key)));
+    if create.initialized.send(Ok(())).is_err() {
+        remove_runtime(poller, key, runtimes, runtime_by_id);
+    }
+}
+
+fn remove_runtime(
+    poller: &Arc<polling::Poller>,
+    key: u64,
+    runtimes: &mut HashMap<u64, TerminalRuntime>,
+    runtime_by_id: &mut HashMap<String, u64>,
+) {
+    let Some(mut runtime) = runtimes.remove(&key) else {
+        return;
+    };
+    #[cfg(unix)]
+    unregister_runtime(poller, &mut runtime);
+    runtime_by_id.remove(&runtime.entry.id);
+}
+
+#[cfg(unix)]
+fn unregister_runtime(poller: &polling::Poller, runtime: &mut TerminalRuntime) {
+    if runtime.registration_active {
+        let _ = poller.delete(runtime.source);
+        runtime.registration_active = false;
+    }
+    runtime.output_open = false;
+}
+
+#[cfg(unix)]
+fn set_runtime_interest(
+    poller: &polling::Poller,
+    runtime: &TerminalRuntime,
+) -> std::io::Result<()> {
+    use polling::{Event, PollMode};
+    let interest = if runtime.pending_input.is_empty() {
+        Event::readable(runtime.poll_key)
+    } else {
+        Event::all(runtime.poll_key)
+    };
+    poller.modify_with_mode(runtime.source, interest, PollMode::Level)
+}
+
+#[cfg(unix)]
+fn flush_runtime_input(runtime: &mut TerminalRuntime) {
+    let mut budget = REACTOR_WRITE_BUDGET_PER_TURN;
+    while budget > 0 {
+        let Some((data, offset)) = runtime.pending_input.front_mut() else {
+            break;
+        };
+        let remaining = data.len().saturating_sub(*offset);
+        let requested = remaining.min(budget);
+        match runtime.writer.write(&data[*offset..*offset + requested]) {
+            Ok(0) => {
+                runtime.output_open = false;
+                runtime.pending_input.clear();
+                runtime.pending_input_bytes = 0;
+                let _ = runtime.child.kill();
+                break;
+            }
+            Ok(written) => {
+                *offset += written;
+                budget -= written;
+                runtime.pending_input_bytes = runtime.pending_input_bytes.saturating_sub(written);
+                if *offset == data.len() {
+                    runtime.pending_input.pop_front();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => {
+                eprintln!("[terminal-input] {}: {error}", runtime.entry.id);
+                runtime.output_open = false;
+                runtime.pending_input.clear();
+                runtime.pending_input_bytes = 0;
+                let _ = runtime.child.kill();
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn flush_runtime_input_fallback(runtime: &mut TerminalRuntime) {
+    while let Some((data, offset)) = runtime.pending_input.pop_front() {
+        if let Err(error) = runtime.writer.write_all(&data[offset..]) {
+            eprintln!("[terminal-input] {}: {error}", runtime.entry.id);
+            runtime.output_open = false;
+            let _ = runtime.child.kill();
+            break;
+        }
+        runtime.pending_input_bytes = runtime
+            .pending_input_bytes
+            .saturating_sub(data.len().saturating_sub(offset));
+    }
+}
+
+#[cfg(unix)]
+fn drain_runtime_output(
+    host: &Weak<TerminalHost>,
+    runtime: &mut TerminalRuntime,
+    buffer: &mut [u8],
+) {
+    // `portable-pty` does not guarantee O_NONBLOCK on every cloned reader.
+    // Read once per level-triggered readiness event; a second speculative read
+    // could block the entire shard after consuming the available bytes.
+    match runtime.reader.read(buffer) {
+        Ok(0) => runtime.output_open = false,
+        Ok(count) => {
+            let data = Bytes::copy_from_slice(&buffer[..count]);
+            if !process_terminal_output(
+                host,
+                &runtime.entry,
+                &mut runtime.state,
+                &mut runtime.terminal,
+                &mut runtime.pending_input,
+                &mut runtime.pending_input_bytes,
+                data,
+            ) {
+                let _ = runtime.child.kill();
+                runtime.output_open = false;
+            }
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) => {}
+        Err(error) => {
+            eprintln!(
+                "[terminal-reactor] {} failed: {:?}",
+                runtime.entry.id,
+                error.kind()
+            );
+            runtime.output_open = false;
+        }
+    }
+}
+
+fn maintain_due_runtimes(
+    host: &Weak<TerminalHost>,
+    runtimes: &mut HashMap<u64, TerminalRuntime>,
+    maintenance: &mut BinaryHeap<Reverse<(Instant, u64)>>,
+) {
+    let now = Instant::now();
+    while maintenance
+        .peek()
+        .is_some_and(|Reverse((deadline, _))| *deadline <= now)
+    {
+        let Some(Reverse((_, key))) = maintenance.pop() else {
+            break;
+        };
+        let Some(runtime) = runtimes.get_mut(&key) else {
+            continue;
+        };
+        if !runtime.output_open && !runtime.exit_observed {
+            runtime.exit_observed = try_observe_terminal_exit(
+                host,
+                &runtime.entry,
+                &mut runtime.child,
+                &mut runtime.state,
+                &mut runtime.terminal,
+            );
+        }
+        maintain_terminal_thermal_state(host, &mut runtime.state, &mut runtime.terminal);
+        let tick = if !runtime.output_open && !runtime.exit_observed {
+            EXIT_POLL_TICK
+        } else if runtime.state.thermal_state == ThermalState::Parked {
+            PARKED_THERMAL_TICK
+        } else {
+            THERMAL_TICK
+        };
+        maintenance.push(Reverse((Instant::now() + tick, key)));
+    }
+}
+
+fn reject_terminal_command(command: TerminalCommand, terminal_id: &str) {
+    let error = || TerminalError::NotFound(terminal_id.to_owned());
+    match command {
+        TerminalCommand::Inspect { reply } => {
+            let _ = reply.send(Err(error()));
+        }
+        TerminalCommand::Write { reply, .. }
+        | TerminalCommand::SetTheme { reply, .. }
+        | TerminalCommand::Resize { reply, .. }
+        | TerminalCommand::MarkReplayReady { reply, .. }
+        | TerminalCommand::Detach { reply, .. }
+        | TerminalCommand::Dispose { reply }
+        | TerminalCommand::ReleaseLease { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        TerminalCommand::Authorize { reply, .. }
+        | TerminalCommand::AuthorizeAndWrite { reply, .. }
+        | TerminalCommand::AuthorizeAndResize { reply, .. }
+        | TerminalCommand::AuthorizeAndDispose { reply, .. }
+        | TerminalCommand::AcquireLease { reply, .. }
+        | TerminalCommand::RenewLease { reply, .. }
+        | TerminalCommand::Takeover { reply, .. }
+        | TerminalCommand::Transfer { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        TerminalCommand::Attach { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        TerminalCommand::GetLiveCwd { reply } => {
+            let _ = reply.send(Err(error()));
+        }
+        TerminalCommand::ListLeases { reply } => {
+            let _ = reply.send(Err(error()));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn spawn_fallback_pty_reader(
+    terminal_id: String,
+    mut reader: Box<dyn Read + Send>,
+    reactor: ReactorHandle,
+) -> Result<(), TerminalError> {
+    thread::Builder::new()
+        .name(format!("yaade-pty-reader-{terminal_id}"))
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let mut buffer = vec![0_u8; REACTOR_READ_BUFFER_BYTES];
+            loop {
+                let output = match reader.read(&mut buffer) {
+                    Ok(0) => ReactorOutput::Eof,
+                    Ok(count) => ReactorOutput::Bytes(Bytes::copy_from_slice(&buffer[..count])),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => ReactorOutput::ReadFailed(error.kind()),
+                };
+                let terminal = matches!(output, ReactorOutput::Eof | ReactorOutput::ReadFailed(_));
+                if reactor
+                    .normal
+                    .send(ReactorCommand::Output {
+                        terminal_id: terminal_id.clone(),
+                        output,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = reactor.wake.notify();
+                if terminal {
+                    break;
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| TerminalError::Runtime(error.to_string()))
+}
+
+#[cfg(not(unix))]
+fn process_fallback_output(
+    host: &Weak<TerminalHost>,
+    runtime: &mut TerminalRuntime,
+    output: ReactorOutput,
+) {
+    match output {
+        ReactorOutput::Bytes(data) => {
+            if !process_terminal_output(
+                host,
+                &runtime.entry,
+                &mut runtime.state,
+                &mut runtime.terminal,
+                &mut runtime.pending_input,
+                &mut runtime.pending_input_bytes,
+                data,
+            ) {
+                let _ = runtime.child.kill();
+                runtime.output_open = false;
+            }
+        }
+        ReactorOutput::Eof => runtime.output_open = false,
+        ReactorOutput::ReadFailed(kind) => {
+            eprintln!("[terminal-reactor] {} failed: {kind:?}", runtime.entry.id);
+            runtime.output_open = false;
+        }
+    }
 }
 
 enum BatchedWriteReply {
@@ -1459,13 +2109,14 @@ fn handle_terminal_command_batch(
     host: &Weak<TerminalHost>,
     entry: &TerminalEntry,
     master: &dyn MasterPty,
-    writer: &mut Box<dyn Write + Send>,
     child: &mut Box<dyn Child + Send + Sync>,
     state: &mut EntryState,
     terminal: &mut GhosttyTerminal,
     control: &mut TerminalControlRegistry,
     commands: Vec<TerminalCommand>,
     write_scratch: &mut Vec<u8>,
+    pending_input: &mut VecDeque<(Bytes, usize)>,
+    pending_input_bytes: &mut usize,
 ) -> bool {
     let mut commands = VecDeque::from(commands);
     while let Some(command) = commands.pop_front() {
@@ -1519,18 +2170,23 @@ fn handle_terminal_command_batch(
             let write_error = if write_scratch.is_empty() {
                 None
             } else {
+                enqueue_pending_input(
+                    pending_input,
+                    pending_input_bytes,
+                    Bytes::copy_from_slice(write_scratch),
+                    false,
+                )
+                .err()
+                .map(|error| error.to_string())
+            };
+            if write_error.is_none() && !write_scratch.is_empty() {
                 mark_terminal_hot(state);
                 if let Some(host) = host.upgrade() {
                     host.metrics
                         .pty_bytes_written_total
                         .fetch_add(write_scratch.len() as u64, Ordering::Relaxed);
                 }
-                writer
-                    .write_all(write_scratch)
-                    .and_then(|()| writer.flush())
-                    .err()
-                    .map(|error| error.to_string())
-            };
+            }
             for reply in replies {
                 match reply {
                     BatchedWriteReply::Direct(reply) => {
@@ -1593,7 +2249,18 @@ fn handle_terminal_command_batch(
             }
             let resize_error = latest
                 .and_then(|(cols, rows)| {
-                    resize_terminal(host, master, entry, writer, state, terminal, cols, rows).err()
+                    resize_terminal(
+                        host,
+                        master,
+                        entry,
+                        state,
+                        terminal,
+                        pending_input,
+                        pending_input_bytes,
+                        cols,
+                        rows,
+                    )
+                    .err()
                 })
                 .map(|error| error.to_string());
             for reply in replies {
@@ -1616,7 +2283,15 @@ fn handle_terminal_command_batch(
         }
 
         if !handle_terminal_command(
-            host, entry, master, writer, child, state, terminal, control, command,
+            host,
+            entry,
+            child,
+            state,
+            terminal,
+            control,
+            pending_input,
+            pending_input_bytes,
+            command,
         ) {
             return false;
         }
@@ -1662,20 +2337,36 @@ fn authorize_terminal(
         .map_err(Into::into)
 }
 
-fn write_terminal(writer: &mut Box<dyn Write + Send>, data: &Bytes) -> Result<(), TerminalError> {
-    writer
-        .write_all(data)
-        .and_then(|()| writer.flush())
-        .map_err(|error| TerminalError::Runtime(error.to_string()))
+fn enqueue_pending_input(
+    pending: &mut VecDeque<(Bytes, usize)>,
+    pending_bytes: &mut usize,
+    data: Bytes,
+    authority_response: bool,
+) -> Result<(), TerminalError> {
+    if pending_bytes.saturating_add(data.len()) > MAX_PENDING_INPUT_BYTES_PER_TERMINAL {
+        return Err(TerminalError::Runtime(
+            "terminal input queue is full".to_owned(),
+        ));
+    }
+    *pending_bytes = pending_bytes.saturating_add(data.len());
+    if authority_response {
+        let insertion = usize::from(pending.front().is_some_and(|(_, offset)| *offset > 0));
+        pending.insert(insertion, (data, 0));
+    } else {
+        pending.push_back((data, 0));
+    }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resize_terminal(
     host: &Weak<TerminalHost>,
     master: &dyn MasterPty,
     entry: &TerminalEntry,
-    writer: &mut Box<dyn Write + Send>,
     state: &mut EntryState,
     terminal: &mut GhosttyTerminal,
+    pending_input: &mut VecDeque<(Bytes, usize)>,
+    pending_input_bytes: &mut usize,
     cols: u16,
     rows: u16,
 ) -> Result<(), TerminalError> {
@@ -1696,13 +2387,13 @@ fn resize_terminal(
         .map(<[u8]>::to_vec)
         .collect::<Vec<_>>();
     for response in responses {
-        writer
-            .write_all(&response)
-            .map_err(|error| TerminalError::Runtime(error.to_string()))?;
+        enqueue_pending_input(
+            pending_input,
+            pending_input_bytes,
+            Bytes::from(response),
+            false,
+        )?;
     }
-    writer
-        .flush()
-        .map_err(|error| TerminalError::Runtime(error.to_string()))?;
     state.cols = cols;
     state.rows = rows;
     if state.checkpoints {
@@ -1715,12 +2406,12 @@ fn resize_terminal(
 fn handle_terminal_command(
     host: &Weak<TerminalHost>,
     entry: &TerminalEntry,
-    master: &dyn MasterPty,
-    writer: &mut Box<dyn Write + Send>,
     child: &mut Box<dyn Child + Send + Sync>,
     state: &mut EntryState,
     terminal: &mut GhosttyTerminal,
     control: &mut TerminalControlRegistry,
+    pending_input: &mut VecDeque<(Bytes, usize)>,
+    pending_input_bytes: &mut usize,
     command: TerminalCommand,
 ) -> bool {
     match command {
@@ -1741,9 +2432,8 @@ fn handle_terminal_command(
                 attached_clients: state.attached_clients.len(),
             }));
         }
-        TerminalCommand::Write { data, reply } => {
-            mark_terminal_hot(state);
-            let _ = reply.send(write_terminal(writer, &data));
+        TerminalCommand::Write { .. } => {
+            unreachable!("write commands are handled by the serialized batch path")
         }
         TerminalCommand::Authorize {
             principal_id,
@@ -1759,19 +2449,8 @@ fn handle_terminal_command(
                 fence,
             ));
         }
-        TerminalCommand::AuthorizeAndWrite {
-            principal_id,
-            connection_id,
-            fence,
-            data,
-            reply,
-        } => {
-            let result = require_ready(state, &connection_id)
-                .and_then(|()| {
-                    authorize_terminal(control, entry, &principal_id, &connection_id, fence)
-                })
-                .and_then(|lease| write_terminal(writer, &data).map(|()| lease));
-            let _ = reply.send(result);
+        TerminalCommand::AuthorizeAndWrite { .. } => {
+            unreachable!("authorized writes are handled by the serialized batch path")
         }
         TerminalCommand::SetTheme { theme, reply } => {
             let result = if state.terminal_theme == theme {
@@ -1790,9 +2469,15 @@ fn handle_terminal_command(
                             .mode(Mode::COLOR_SCHEME_UPDATES)
                             .map_err(ghostty_error)?
                         {
-                            write_terminal_theme_preference(&mut **writer, theme)
-                                .and_then(|()| writer.flush())
+                            let mut response = Vec::new();
+                            write_terminal_theme_preference(&mut response, theme)
                                 .map_err(|error| TerminalError::Runtime(error.to_string()))?;
+                            enqueue_pending_input(
+                                pending_input,
+                                pending_input_bytes,
+                                Bytes::from(response),
+                                false,
+                            )?;
                         }
                         state.terminal_theme = theme;
                         Ok(())
@@ -1800,26 +2485,8 @@ fn handle_terminal_command(
             };
             let _ = reply.send(result);
         }
-        TerminalCommand::Resize { cols, rows, reply } => {
-            mark_terminal_hot(state);
-            let _ = reply.send(resize_terminal(
-                host, master, entry, writer, state, terminal, cols, rows,
-            ));
-        }
-        TerminalCommand::AuthorizeAndResize {
-            principal_id,
-            connection_id,
-            fence,
-            cols,
-            rows,
-            reply,
-        } => {
-            let result = authorize_terminal(control, entry, &principal_id, &connection_id, fence)
-                .and_then(|lease| {
-                    resize_terminal(host, master, entry, writer, state, terminal, cols, rows)
-                        .map(|()| lease)
-                });
-            let _ = reply.send(result);
+        TerminalCommand::Resize { .. } | TerminalCommand::AuthorizeAndResize { .. } => {
+            unreachable!("resize commands are handled by the coalescing batch path")
         }
         TerminalCommand::Attach {
             client_id,
@@ -1985,12 +2652,6 @@ fn handle_terminal_command(
         TerminalCommand::ListLeases { reply } => {
             let _ = reply.send(control.list(&entry.id).map_err(Into::into));
         }
-        TerminalCommand::ReleaseConnection { connection_id } => {
-            control.release_connection(&connection_id);
-            state.replay_ready_clients.remove(&connection_id);
-            state.attached_clients.remove(&connection_id);
-            state.last_activity_at = Instant::now();
-        }
         TerminalCommand::AuthorizeAndDispose {
             principal_id,
             connection_id,
@@ -2079,24 +2740,14 @@ fn maintain_terminal_thermal_state(
         ThermalState::Hot => {}
         ThermalState::Warm => {
             if activity != state.compression_activity || state.thermal_state == ThermalState::Hot {
-                let _ = terminal.compress(CompressionMode::Incremental);
-                if let Some(host) = host.upgrade() {
-                    host.metrics
-                        .compression_runs_total
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                compress_terminal(host, terminal, CompressionMode::Incremental);
             }
         }
         ThermalState::Parked => {
             if state.thermal_state != ThermalState::Parked || activity != state.compression_activity
             {
-                let _ = terminal.compress(CompressionMode::Full);
+                compress_terminal(host, terminal, CompressionMode::Full);
                 state.replay.shrink_to_fit();
-                if let Some(host) = host.upgrade() {
-                    host.metrics
-                        .compression_runs_total
-                        .fetch_add(1, Ordering::Relaxed);
-                }
             }
         }
     }
@@ -2115,27 +2766,96 @@ fn maintain_terminal_thermal_state(
     state.thermal_state = target;
 }
 
+fn compress_terminal(
+    host: &Weak<TerminalHost>,
+    terminal: &mut GhosttyTerminal,
+    mode: CompressionMode,
+) {
+    let started = Instant::now();
+    let _ = terminal.compress(mode);
+    let elapsed = duration_nanos(started.elapsed());
+    if let Some(host) = host.upgrade() {
+        host.metrics
+            .compression_runs_total
+            .fetch_add(1, Ordering::Relaxed);
+        host.metrics
+            .compression_duration_ns_total
+            .fetch_add(elapsed, Ordering::Relaxed);
+        host.metrics
+            .compression_duration_ns_max
+            .fetch_max(elapsed, Ordering::Relaxed);
+    }
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn process_terminal_output(
     host: &Weak<TerminalHost>,
     entry: &TerminalEntry,
-    writer: &mut Box<dyn Write + Send>,
     state: &mut EntryState,
     terminal: &mut GhosttyTerminal,
+    pending_input: &mut VecDeque<(Bytes, usize)>,
+    pending_input_bytes: &mut usize,
     data: Bytes,
 ) -> bool {
     if state.disposed {
         return true;
     }
-    if let Some(host) = host.upgrade() {
+    let wake_started = (state.thermal_state == ThermalState::Parked).then(Instant::now);
+    let upgraded_host = host.upgrade();
+    if let Some(host) = &upgraded_host {
         host.metrics
             .pty_bytes_read_total
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        if state.thermal_state == ThermalState::Parked {
+        if wake_started.is_some() {
             host.metrics
                 .parked_to_hot_total
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    mark_terminal_hot(state);
+    state.sequence = state.sequence.saturating_add(data.len() as u64);
+    let sequence = state.sequence;
+    state.replay.push_back(ReplayChunk {
+        sequence,
+        data: data.clone(),
+    });
+    state.replay_bytes = state.replay_bytes.saturating_add(data.len());
+    while state.replay_bytes > MAX_REPLAY_BYTES && state.replay.len() > 1 {
+        if let Some(dropped) = state.replay.pop_front() {
+            state.replay_bytes = state.replay_bytes.saturating_sub(dropped.data.len());
+            state.replay_truncated = true;
+        }
+    }
+
+    // Fanout is the first consumer after sequencing. Ghostty is an authority
+    // sidecar over the same immutable bytes, never a rendering transform in
+    // front of capable clients. Subscriber enqueue is bounded and nonblocking.
+    if let Some(host) = &upgraded_host {
+        host.events.emit_terminal(
+            Arc::<str>::from(entry.id.as_str()),
+            terminal_stream_id(&entry.id),
+            terminal_stream_epoch(&entry.terminal_epoch),
+            sequence,
+            data.clone(),
+        );
+        if let Err(error) = host.history.try_append(&entry.id, sequence, data.clone()) {
+            eprintln!("[terminal-history] {error}");
+        }
+        if let Some(started) = wake_started {
+            let elapsed = duration_nanos(started.elapsed());
+            host.metrics
+                .parked_wake_duration_ns_total
+                .fetch_add(elapsed, Ordering::Relaxed);
+            host.metrics
+                .parked_wake_duration_ns_max
+                .fetch_max(elapsed, Ordering::Relaxed);
+        }
+    }
+
     let (responses, title, working_directory, bells) = match terminal.write(&data) {
         Ok(effects) => (
             effects
@@ -2154,16 +2874,16 @@ fn process_terminal_output(
             return false;
         }
     };
-    let mut response_failed = false;
     for response in responses {
-        if let Err(error) = writer.write_all(&response) {
+        if let Err(error) = enqueue_pending_input(
+            pending_input,
+            pending_input_bytes,
+            Bytes::from(response),
+            true,
+        ) {
             eprintln!("[terminal-pty-response] {}: {error}", entry.id);
-            response_failed = true;
-            break;
+            return false;
         }
-    }
-    if !response_failed && let Err(error) = writer.flush() {
-        eprintln!("[terminal-pty-response] {}: {error}", entry.id);
     }
     if let Some(title) = title {
         state.title = Some(String::from_utf8_lossy(&title).into_owned());
@@ -2172,20 +2892,6 @@ fn process_terminal_output(
         state.live_cwd = decode_terminal_working_directory(&value);
     }
 
-    mark_terminal_hot(state);
-    state.sequence = state.sequence.saturating_add(data.len() as u64);
-    let sequence = state.sequence;
-    state.replay.push_back(ReplayChunk {
-        sequence,
-        data: data.clone(),
-    });
-    state.replay_bytes = state.replay_bytes.saturating_add(data.len());
-    while state.replay_bytes > MAX_REPLAY_BYTES && state.replay.len() > 1 {
-        if let Some(dropped) = state.replay.pop_front() {
-            state.replay_bytes = state.replay_bytes.saturating_sub(dropped.data.len());
-            state.replay_truncated = true;
-        }
-    }
     if state.checkpoints {
         state.bytes_since_checkpoint = state.bytes_since_checkpoint.saturating_add(data.len());
         if state.bytes_since_checkpoint >= CHECKPOINT_BYTES
@@ -2194,38 +2900,29 @@ fn process_terminal_output(
             store_checkpoint(host, &entry.id, &entry.terminal_epoch, state, terminal);
         }
     }
-    let Some(host) = host.upgrade() else {
-        return true;
-    };
-    // Publish the same immutable allocation before touching the lower-priority
-    // history lane. History saturation cannot delay this chunk or any client.
-    host.events.emit_terminal(
-        Arc::<str>::from(entry.id.as_str()),
-        terminal_stream_id(&entry.id),
-        terminal_stream_epoch(&entry.terminal_epoch),
-        sequence,
-        data.clone(),
-    );
-    if let Err(error) = host.history.try_append(&entry.id, sequence, data) {
-        eprintln!("[terminal-history] {error}");
-    }
-    for _ in 0..bells {
-        host.events.emit("terminal:bell", vec![json!(entry.id)]);
+    if let Some(host) = upgraded_host {
+        for _ in 0..bells {
+            host.events.emit("terminal:bell", vec![json!(entry.id)]);
+        }
     }
     true
 }
 
-fn observe_terminal_exit(
+fn try_observe_terminal_exit(
     host: &Weak<TerminalHost>,
     entry: &TerminalEntry,
     child: &mut Box<dyn Child + Send + Sync>,
     state: &mut EntryState,
     terminal: &mut GhosttyTerminal,
-) {
+) -> bool {
     if state.disposed {
-        return;
+        return true;
     }
-    let exit = child.wait();
+    let exit = match child.try_wait() {
+        Ok(Some(status)) => Ok(status),
+        Ok(None) => return false,
+        Err(error) => Err(error),
+    };
     let (exit_code, signal) = exit.map_or((1, None), |status| {
         (
             i32::try_from(status.exit_code()).unwrap_or(1),
@@ -2244,7 +2941,9 @@ fn observe_terminal_exit(
             state.replay_truncated = true;
         }
     }
-    let Some(host) = host.upgrade() else { return };
+    let Some(host) = host.upgrade() else {
+        return true;
+    };
     let mut args = vec![json!(entry.id), json!(exit_code)];
     if let Some(signal) = signal {
         args.push(json!(signal));
@@ -2256,6 +2955,7 @@ fn observe_terminal_exit(
     let _ = host
         .cleanup_tx
         .blocking_send((entry.id.clone(), entry.terminal_epoch.clone()));
+    true
 }
 
 fn store_checkpoint(
@@ -2265,6 +2965,7 @@ fn store_checkpoint(
     state: &mut EntryState,
     terminal: &GhosttyTerminal,
 ) -> bool {
+    let started = Instant::now();
     let checkpoint = match encode_checkpoint(
         terminal_epoch,
         state.sequence,
@@ -2286,18 +2987,24 @@ fn store_checkpoint(
         }
     };
     if let Some(host) = host.upgrade()
-        && let Ok(encoded) = serde_json::to_vec(&checkpoint)
         && let Err(error) = host
             .history
-            .persist_checkpoint(terminal_id, Bytes::from(encoded))
+            .try_persist_checkpoint(terminal_id, checkpoint.snapshot_bytes.0.clone())
     {
         eprintln!("[terminal-checkpoint] {error}");
     }
     if let Some(host) = host.upgrade() {
+        let elapsed = duration_nanos(started.elapsed());
         host.metrics.snapshots_total.fetch_add(1, Ordering::Relaxed);
         host.metrics
             .snapshot_bytes_total
             .fetch_add(checkpoint.payload_bytes as u64, Ordering::Relaxed);
+        host.metrics
+            .snapshot_duration_ns_total
+            .fetch_add(elapsed, Ordering::Relaxed);
+        host.metrics
+            .snapshot_duration_ns_max
+            .fetch_max(elapsed, Ordering::Relaxed);
     }
     state.checkpoint = Some(checkpoint);
     state.bytes_since_checkpoint = 0;
@@ -2651,6 +3358,259 @@ fn default_shell_args(shell: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn test_identity() -> crate::wire::ServerIdentity {
+        crate::wire::ServerIdentity {
+            server_id: "test-server".to_owned(),
+            server_epoch: "test-epoch".to_owned(),
+            protocol_version: 2,
+            runtime_version: "test".to_owned(),
+            started_at: crate::model::now_iso(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fixed_reactor_shards_fan_in_many_ptys_and_fence_descriptor_reuse() {
+        let root = tempfile::tempdir().expect("history root");
+        let host = TerminalHost::new(Arc::new(EventHub::new(test_identity())), root.path(), true)
+            .expect("terminal host");
+        let shard_count = host.runtime_diagnostics().terminal_reactor_shards;
+        assert!((1..=REACTOR_MAX_SHARDS).contains(&shard_count));
+        assert_eq!(
+            host.runtime_diagnostics().terminal_owner_threads,
+            shard_count
+        );
+
+        let mut ids = Vec::new();
+        for index in 0..32_u8 {
+            let created = host
+                .create(
+                    Path::new("/tmp"),
+                    Some(TerminalLaunch {
+                        command: Some("/bin/cat".to_owned()),
+                        args: Vec::new(),
+                        ..TerminalLaunch::default()
+                    }),
+                )
+                .expect("create PTY");
+            host.write(&created.id, &[b'a' + index % 26, b'\n'])
+                .expect("write PTY");
+            ids.push(created.id);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && ids.iter().any(|id| {
+                host.inspect(id)
+                    .is_none_or(|state| state.output_position == 0)
+            })
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ids.iter().all(|id| {
+            host.inspect(id)
+                .is_some_and(|state| state.output_position > 0)
+        }));
+        let diagnostics = host.runtime_diagnostics();
+        assert_eq!(diagnostics.terminal_sessions_active, ids.len());
+        assert_eq!(diagnostics.terminal_owner_threads, shard_count);
+        for id in ids {
+            host.dispose(&id).expect("dispose PTY");
+        }
+
+        // New registrations reuse OS descriptor numbers under pressure, while
+        // monotonically unique poll keys prevent stale readiness delivery.
+        for generation in 0..64_u8 {
+            let created = host
+                .create(
+                    Path::new("/tmp"),
+                    Some(TerminalLaunch {
+                        command: Some("/usr/bin/printf".to_owned()),
+                        args: vec![format!("generation-{generation}")],
+                        ..TerminalLaunch::default()
+                    }),
+                )
+                .expect("create reuse PTY");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline
+                && host
+                    .inspect(&created.id)
+                    .is_none_or(|state| state.output_position == 0)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                host.inspect(&created.id)
+                    .is_some_and(|state| state.output_position > 0),
+                "generation {generation} produced no output"
+            );
+            host.dispose(&created.id).expect("dispose reuse PTY");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_pty_input_is_bounded_without_stalling_its_reactor_shard() {
+        let root = tempfile::tempdir().expect("history root");
+        let host = TerminalHost::new(Arc::new(EventHub::new(test_identity())), root.path(), false)
+            .expect("terminal host");
+        let blocked = host
+            .create(
+                Path::new("/tmp"),
+                Some(TerminalLaunch {
+                    command: Some("/bin/sleep".to_owned()),
+                    args: vec!["10".to_owned()],
+                    ..TerminalLaunch::default()
+                }),
+            )
+            .expect("blocked PTY");
+        let blocked_shard = terminal_stream_id(&blocked.id) as usize % host.reactors.len();
+        let responsive = loop {
+            let candidate = host
+                .create(
+                    Path::new("/tmp"),
+                    Some(TerminalLaunch {
+                        command: Some("/bin/cat".to_owned()),
+                        args: Vec::new(),
+                        ..TerminalLaunch::default()
+                    }),
+                )
+                .expect("responsive PTY");
+            if terminal_stream_id(&candidate.id) as usize % host.reactors.len() == blocked_shard {
+                break candidate;
+            }
+            host.dispose(&candidate.id)
+                .expect("dispose other shard PTY");
+        };
+
+        let chunk = vec![b'x'; 512 * 1024];
+        let mut saturated = false;
+        for _ in 0..8 {
+            if host.write(&blocked.id, &chunk).is_err() {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(
+            saturated,
+            "blocked PTY input did not reach its explicit bound"
+        );
+        host.write(&responsive.id, b"ok\n")
+            .expect("responsive shard peer write");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && host
+                .inspect(&responsive.id)
+                .is_none_or(|state| state.output_position == 0)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            host.inspect(&responsive.id)
+                .is_some_and(|state| state.output_position > 0),
+            "blocked input stalled another PTY on the same shard"
+        );
+        host.dispose(&blocked.id).expect("dispose blocked PTY");
+        host.dispose(&responsive.id)
+            .expect("dispose responsive PTY");
+    }
+
+    /// Reproducible scale probe; intentionally ignored in the fast suite.
+    /// Run with:
+    /// `cargo test --release --lib benchmark_one_thousand_parkable_sessions -- --ignored --nocapture`
+    #[cfg(unix)]
+    #[ignore = "opens 1,000 PTYs and reports host-specific resource measurements"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn benchmark_one_thousand_parkable_sessions() {
+        const SESSION_COUNT: usize = 1_000;
+        let root = tempfile::tempdir().expect("history root");
+        let baseline_rss_kib = process_rss_kib();
+        let host = TerminalHost::new(Arc::new(EventHub::new(test_identity())), root.path(), false)
+            .expect("terminal host");
+        let create_started = Instant::now();
+        let mut ids = Vec::with_capacity(SESSION_COUNT);
+        for _ in 0..SESSION_COUNT {
+            match host.create(
+                Path::new("/tmp"),
+                Some(TerminalLaunch {
+                    command: Some("/bin/cat".to_owned()),
+                    args: Vec::new(),
+                    ..TerminalLaunch::default()
+                }),
+            ) {
+                Ok(created) => ids.push(created.id),
+                Err(error) => {
+                    eprintln!(
+                        "terminal_scale admission stopped at {} of {SESSION_COUNT}: {error}",
+                        ids.len()
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(ids.len() >= 256, "scale fixture admitted too few PTYs");
+        let admitted = ids.len();
+        let create_ms = create_started.elapsed().as_millis();
+        let active_rss_kib = process_rss_kib();
+        tokio::time::sleep(WARM_AFTER + THERMAL_TICK).await;
+        let warm_rss_kib = process_rss_kib();
+        tokio::time::sleep(PARK_AFTER - WARM_AFTER + THERMAL_TICK).await;
+        let parked_rss_kib = process_rss_kib();
+        let parked_diagnostics = host.runtime_diagnostics();
+        assert_eq!(parked_diagnostics.terminal_sessions_parked, admitted);
+        let mut started = HashMap::with_capacity(admitted);
+        for id in &ids {
+            started.insert(id.as_str(), Instant::now());
+            host.write(id, b"x\n").expect("write scale PTY");
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut observed = HashMap::with_capacity(admitted);
+        while observed.len() < admitted && Instant::now() < deadline {
+            for id in &ids {
+                if !observed.contains_key(id.as_str())
+                    && host
+                        .inspect(id)
+                        .is_some_and(|state| state.output_position >= 2)
+                {
+                    observed.insert(
+                        id.as_str(),
+                        started[id.as_str()].elapsed().as_micros() as u64,
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(observed.len(), admitted, "not every PTY echoed input");
+        let mut latency_us = observed.into_values().collect::<Vec<_>>();
+        latency_us.sort_unstable();
+        let percentile = |numerator: usize| latency_us[numerator * (latency_us.len() - 1) / 100];
+        let diagnostics = host.runtime_diagnostics();
+        assert_eq!(diagnostics.terminal_sessions_active, admitted);
+        assert_eq!(
+            diagnostics.terminal_owner_threads,
+            diagnostics.terminal_reactor_shards
+        );
+        let p50_us = percentile(50);
+        let p95_us = percentile(95);
+        let p99_us = percentile(99);
+        drop(started);
+        drop(ids);
+        let shutdown_started = Instant::now();
+        drop(host);
+        let shutdown_ms = shutdown_started.elapsed().as_millis();
+        eprintln!(
+            "terminal_scale requested={SESSION_COUNT} admitted={admitted} create_ms={create_ms} rss_base_kib={baseline_rss_kib} rss_active_kib={active_rss_kib} rss_warm_kib={warm_rss_kib} rss_parked_kib={parked_rss_kib} rss_delta_kib={} shards={} p50_wake_us={p50_us} p95_wake_us={p95_us} p99_wake_us={p99_us} shutdown_ms={shutdown_ms}",
+            active_rss_kib.saturating_sub(baseline_rss_kib),
+            diagnostics.terminal_reactor_shards,
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_rss_kib() -> u64 {
+        command_output("ps", &["-o", "rss=", "-p", &std::process::id().to_string()])
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     #[cfg(unix)]
     #[test]
     fn stale_process_identity_does_not_match_a_live_reused_pid() {
@@ -2762,6 +3722,76 @@ mod tests {
             restored.state().expect("restored state"),
             terminal.state().expect("state")
         );
+    }
+
+    #[test]
+    fn snapshot_continuation_matrix_covers_partial_utf8_and_control_strings() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"utf8:\xe2", b"\x94\x80 done"),
+            (b"\x1b[31", b"mred\x1b[0m"),
+            (b"\x1b]2;partial", b" title\x07"),
+            (b"\x1bP$q", b"m\x1b\\"),
+            (b"\x1b_Gf=100;", b"payload\x1b\\"),
+            (b"\x1b[?1049h\x1b7alternate", b"\x1b8\x1b[?1049lprimary"),
+        ];
+        for &(prefix, suffix) in cases {
+            let options = || GhosttyTerminalOptions {
+                cols: 80,
+                rows: 24,
+                scrollback: 128,
+                effects: EffectOptions::default(),
+            };
+            let mut authority = GhosttyTerminal::new(options()).expect("authority");
+            authority.write(prefix).expect("prefix");
+            let snapshot = authority.snapshot(MAX_CHECKPOINT_BYTES).expect("snapshot");
+            let mut replica = GhosttyTerminal::from_snapshot(&snapshot, EffectOptions::default())
+                .expect("replica");
+            let authority_effects = authority.write(suffix).expect("authority continuation");
+            let replica_effects = replica.write(suffix).expect("replica continuation");
+            assert_eq!(
+                authority_effects.pty_responses().collect::<Vec<_>>(),
+                replica_effects.pty_responses().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                authority.state().expect("authority state"),
+                replica.state().expect("replica state")
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_snapshot_resize_continuation_matches_uninterrupted_authority() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut bytes = vec![0_u8; 4_096];
+        for byte in &mut bytes {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *byte = seed as u8;
+        }
+        for cut in [1, 2, 3, 7, 31, 127, 511, 1023, 2047, 4095] {
+            let options = GhosttyTerminalOptions {
+                cols: 80,
+                rows: 24,
+                scrollback: 256,
+                effects: EffectOptions::default(),
+            };
+            let mut authority = GhosttyTerminal::new(options).expect("authority");
+            authority.write(&bytes[..cut]).expect("random prefix");
+            let snapshot = authority.snapshot(MAX_CHECKPOINT_BYTES).expect("snapshot");
+            let mut replica = GhosttyTerminal::from_snapshot(&snapshot, EffectOptions::default())
+                .expect("replica");
+            authority.resize(97, 31, 1, 1).expect("authority resize");
+            replica.resize(97, 31, 1, 1).expect("replica resize");
+            for continuation in bytes[cut..].chunks(113) {
+                authority.write(continuation).expect("authority bytes");
+                replica.write(continuation).expect("replica bytes");
+            }
+            assert_eq!(
+                authority.state().expect("authority state"),
+                replica.state().expect("replica state")
+            );
+        }
     }
 
     #[test]

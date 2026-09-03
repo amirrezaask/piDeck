@@ -3,7 +3,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -30,8 +34,8 @@ const BLOCK_HEADER_BYTES: usize = 16;
 const RECORD_HEADER_BYTES: usize = 12;
 const ACTIVE_RECORD_HEADER_BYTES: usize = 16;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
-const MAX_CHECKPOINT_BYTES: usize = 1024 * 1024;
-const CHECKPOINT_FILE: &str = "checkpoint.json";
+const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+const CHECKPOINT_FILE: &str = "checkpoint.bin";
 const MAX_BLOCK_RECORDS: usize = 1_000_000;
 const INGEST_MAX_MESSAGES: usize = 1024;
 const INGEST_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -108,6 +112,10 @@ pub struct TerminalHistoryCapacityDiagnostics {
     pub used_bytes: u64,
     pub allocated_bytes: u64,
     pub durable_pending_bytes: u64,
+    pub ingest_queue_bytes: u64,
+    pub history_bytes_accepted_total: u64,
+    pub history_ingest_rejections_total: u64,
+    pub history_checkpoint_rejections_total: u64,
     pub idle_trims: u64,
     pub idle_bytes_reclaimed: u64,
     pub idle_regrows: u64,
@@ -237,6 +245,9 @@ struct HistoryShared {
     background_errors: Mutex<Vec<String>>,
     accepted_sequences: Mutex<HashMap<String, u64>>,
     budget: IngestBudget,
+    bytes_accepted_total: AtomicU64,
+    ingest_rejections_total: AtomicU64,
+    checkpoint_rejections_total: AtomicU64,
 }
 
 /// Durable block-compressed PTY history. Live appends enter a count- and
@@ -282,6 +293,9 @@ impl TerminalHistoryArchive {
                 bytes: Mutex::new(0),
                 available: Condvar::new(),
             },
+            bytes_accepted_total: AtomicU64::new(0),
+            ingest_rejections_total: AtomicU64::new(0),
+            checkpoint_rejections_total: AtomicU64::new(0),
         });
         if cleanup {
             shared.cleanup_expired()?;
@@ -390,6 +404,9 @@ impl TerminalHistoryArchive {
         };
         if !self.shared.try_reserve_ingest_bytes(data.len()) {
             self.shared
+                .ingest_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.shared
                 .rollback_accepted_sequence(terminal_id, sequence, previous);
             return Err(HistoryError::Corrupt(
                 "history ingest byte budget is full".to_owned(),
@@ -403,8 +420,16 @@ impl TerminalHistoryArchive {
                 sequence,
                 data,
             })) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.shared
+                    .bytes_accepted_total
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                Ok(())
+            }
             Err(_) => {
+                self.shared
+                    .ingest_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
                 self.shared.release_ingest_bytes(bytes);
                 self.shared
                     .rollback_accepted_sequence(terminal_id, sequence, previous);
@@ -436,6 +461,50 @@ impl TerminalHistoryArchive {
             self.shared.release_ingest_bytes(bytes);
             return Err(HistoryError::Corrupt("history owner stopped".to_owned()));
         }
+        Ok(())
+    }
+
+    /// Non-blocking checkpoint submission for a terminal owner/reactor. The
+    /// snapshot stays opaque binary and a saturated persistence lane preserves
+    /// the prior committed checkpoint instead of delaying PTY processing.
+    pub fn try_persist_checkpoint(
+        &self,
+        terminal_id: &str,
+        data: Bytes,
+    ) -> Result<(), HistoryError> {
+        if data.is_empty() || data.len() > MAX_CHECKPOINT_BYTES {
+            return Err(HistoryError::Corrupt(format!(
+                "checkpoint must contain 1..={MAX_CHECKPOINT_BYTES} bytes"
+            )));
+        }
+        if !self.shared.try_reserve_ingest_bytes(data.len()) {
+            self.shared
+                .checkpoint_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(HistoryError::Corrupt(
+                "history ingest byte budget is full".to_owned(),
+            ));
+        }
+        let bytes = data.len();
+        if self
+            .ingest_tx
+            .try_send(IngestCommand::Checkpoint(CheckpointCommand {
+                terminal_id: terminal_id.to_owned(),
+                data,
+            }))
+            .is_err()
+        {
+            self.shared
+                .checkpoint_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.shared.release_ingest_bytes(bytes);
+            return Err(HistoryError::Corrupt(
+                "history ingest mailbox is full".to_owned(),
+            ));
+        }
+        self.shared
+            .bytes_accepted_total
+            .fetch_add(bytes as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -763,6 +832,17 @@ impl HistoryShared {
             owner: "history-owner",
             memory_class: "transient-staging",
             states: states.len(),
+            ingest_queue_bytes: *self
+                .budget
+                .bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                as u64,
+            history_bytes_accepted_total: self.bytes_accepted_total.load(Ordering::Relaxed),
+            history_ingest_rejections_total: self.ingest_rejections_total.load(Ordering::Relaxed),
+            history_checkpoint_rejections_total: self
+                .checkpoint_rejections_total
+                .load(Ordering::Relaxed),
             ..TerminalHistoryCapacityDiagnostics::default()
         };
         for state in states {

@@ -2002,6 +2002,7 @@ dependencies = [
  "include_dir",
  "indexmap",
  "jiff",
+ "libc",
  "mime_guess",
  "percent-encoding",
  "polling",

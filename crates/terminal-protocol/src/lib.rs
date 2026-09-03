@@ -123,15 +123,7 @@ impl Frame {
         position: StreamPosition,
         payload: Bytes,
     ) -> Result<Self, ProtocolError> {
-        if flags != 0 {
-            return Err(ProtocolError::UnknownFlags(flags));
-        }
-        if matches!(kind, FrameType::PtyData | FrameType::Input) && payload.is_empty() {
-            return Err(ProtocolError::EmptyData);
-        }
-        if kind == FrameType::PtyData && position.sequence < payload.len() as u64 {
-            return Err(ProtocolError::InvalidPosition);
-        }
+        validate_frame(kind, flags, position, &payload)?;
         Ok(Self {
             kind,
             flags,
@@ -194,13 +186,7 @@ impl Codec {
                 max: self.max_payload,
             });
         }
-        Frame::new(
-            frame.kind,
-            frame.flags,
-            frame.stream_id,
-            frame.position,
-            frame.payload.clone(),
-        )?;
+        validate_frame(frame.kind, frame.flags, frame.position, &frame.payload)?;
         let mut header = BytesMut::with_capacity(HEADER_LEN);
         header.extend_from_slice(&MAGIC);
         header.put_u8(VERSION);
@@ -268,6 +254,35 @@ impl Codec {
     }
 }
 
+fn validate_frame(
+    kind: FrameType,
+    flags: u16,
+    position: StreamPosition,
+    payload: &Bytes,
+) -> Result<(), ProtocolError> {
+    if flags != 0 {
+        return Err(ProtocolError::UnknownFlags(flags));
+    }
+    if matches!(
+        kind,
+        FrameType::Snapshot | FrameType::PtyData | FrameType::Input
+    ) && payload.is_empty()
+    {
+        return Err(ProtocolError::EmptyData);
+    }
+    if kind == FrameType::PtyData && position.sequence < payload.len() as u64 {
+        return Err(ProtocolError::InvalidPosition);
+    }
+    if kind == FrameType::Resize && payload.len() != 4 {
+        return Err(ProtocolError::InvalidPayloadLength {
+            kind,
+            expected: 4,
+            actual: payload.len(),
+        });
+    }
+    Ok(())
+}
+
 impl Default for Codec {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_PAYLOAD)
@@ -303,9 +318,19 @@ pub enum ProtocolError {
     /// Header and payload arithmetic overflowed.
     #[error("terminal frame length overflow")]
     LengthOverflow,
-    /// Raw data messages may not be empty.
+    /// Raw data and snapshot messages may not be empty.
     #[error("terminal data frame payload is empty")]
     EmptyData,
+    /// A fixed-shape frame has an invalid payload length.
+    #[error("terminal {kind:?} payload length {actual} does not equal {expected}")]
+    InvalidPayloadLength {
+        /// Frame category.
+        kind: FrameType,
+        /// Required bytes.
+        expected: usize,
+        /// Received bytes.
+        actual: usize,
+    },
     /// PTY byte offset cannot cover the payload.
     #[error("terminal stream position does not cover payload")]
     InvalidPosition,
@@ -378,6 +403,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(frame.byte_range(), Some(100..=104));
+    }
+
+    #[test]
+    fn validates_snapshot_and_resize_payload_shapes() {
+        assert!(matches!(
+            Frame::new(
+                FrameType::Snapshot,
+                0,
+                1,
+                StreamPosition {
+                    epoch: 1,
+                    sequence: 0
+                },
+                Bytes::new(),
+            ),
+            Err(ProtocolError::EmptyData)
+        ));
+        assert!(matches!(
+            Frame::new(
+                FrameType::Resize,
+                0,
+                1,
+                StreamPosition {
+                    epoch: 1,
+                    sequence: 1
+                },
+                Bytes::from_static(b"bad"),
+            ),
+            Err(ProtocolError::InvalidPayloadLength { .. })
+        ));
     }
 
     #[test]

@@ -21,7 +21,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, delete, get, post},
 };
-use base64::Engine as _;
 use futures_util::{
     SinkExt as _, StreamExt as _,
     stream::{SplitSink, SplitStream},
@@ -356,6 +355,7 @@ async fn diagnostics(State(state): State<AppState>, headers: HeaderMap, uri: Uri
             },
             "memory": {
                 "terminalRuntime": state.runtime.terminal.runtime_diagnostics(),
+                "terminalTransport": ConnectionOutbound::global_diagnostics(),
                 "terminalHistory": state.runtime.terminal.history_capacity_diagnostics(),
             },
             "devices": state.runtime.devices.list().unwrap_or_default().into_iter().map(|device| json!({
@@ -721,11 +721,36 @@ async fn handle_socket(
                             outbound.detach(id);
                             runtime.events.detach_terminal(id, &principal.connection_id);
                         }
-                        let result = runtime.dispatch(&principal, &command.op, &command.args);
+                        let mut attach_snapshot_payload = None;
+                        let result = if protocol == 2 && command.op == "terminal:attach" {
+                            runtime
+                                .attach_terminal_binary(&principal, &command.args)
+                                .and_then(|mut attach| {
+                                    attach_snapshot_payload = attach.checkpoint.as_mut().map(
+                                        |checkpoint| {
+                                            std::mem::take(&mut checkpoint.snapshot_bytes.0)
+                                        },
+                                    );
+                                    let mut value = serde_json::to_value(attach)?;
+                                    if let Some(object) = value.as_object_mut() {
+                                        object.insert(
+                                            "ownerId".to_owned(),
+                                            json!(runtime.identity.server_id),
+                                        );
+                                        object.insert(
+                                            "ownerEpoch".to_owned(),
+                                            json!(runtime.identity.server_epoch),
+                                        );
+                                    }
+                                    Ok(value)
+                                })
+                        } else {
+                            runtime.dispatch(&principal, &command.op, &command.args)
+                        };
                         queued_commands = queued_commands.saturating_sub(1);
                         let mut attach_snapshot = None;
                         let mut attach_stream = None;
-                        let mut response = match result {
+                        let response = match result {
                             Ok(value) => {
                                 if command.op == "terminal:attach" {
                                     let last_sequence = value
@@ -756,6 +781,7 @@ async fn handle_socket(
                                 {
                                     attached.remove(id);
                                     raw.remove(id);
+                                    outbound.detach(id);
                                     runtime.events.detach_terminal(id, &principal.connection_id);
                                 }
                                 json!({
@@ -765,23 +791,6 @@ async fn handle_socket(
                                     "error": { "code": error.wire_code(), "message": error.to_string() },
                                 })
                             }
-                        };
-                        let attach_snapshot_payload = if protocol == 2 && command.op == "terminal:attach" {
-                            response
-                                .get_mut("value")
-                                .and_then(Value::as_object_mut)
-                                .and_then(|value| value.get_mut("checkpoint"))
-                                .and_then(Value::as_object_mut)
-                                .and_then(|checkpoint| checkpoint.get_mut("snapshotBytes"))
-                                .and_then(|encoded| {
-                                    let decoded = base64::engine::general_purpose::STANDARD
-                                        .decode(encoded.as_str()?)
-                                        .ok()?;
-                                    *encoded = Value::String(String::new());
-                                    Some(Bytes::from(decoded))
-                                })
-                        } else {
-                            None
                         };
                         let accepted = if command.op == "terminal:attach" {
                             command.args.first().and_then(Value::as_str).is_some_and(|id| {
@@ -832,6 +841,142 @@ async fn handle_socket(
                                     None,
                                     frame.payload,
                                 )
+                            }
+                            terminal_protocol::FrameType::ScrollbackBegin
+                                if frame.payload.len() == 13 =>
+                            {
+                                let expected = control_position.saturating_add(1);
+                                if frame.position.sequence != expected {
+                                    outbound.close(1002, "terminal control sequence gap");
+                                    break;
+                                }
+                                let cursor = u64::from_be_bytes(
+                                    frame.payload[..8].try_into().expect("validated slice"),
+                                );
+                                let max_bytes = u32::from_be_bytes(
+                                    frame.payload[8..12].try_into().expect("validated slice"),
+                                ) as usize;
+                                let reverse = match frame.payload[12] {
+                                    0 => false,
+                                    1 => true,
+                                    _ => {
+                                        outbound.close(1002, "invalid scrollback direction");
+                                        break;
+                                    }
+                                };
+                                if !(1..=256 * 1024).contains(&max_bytes) {
+                                    outbound.close(1002, "invalid scrollback byte limit");
+                                    break;
+                                }
+                                *control_position = expected;
+                                let terminal = Arc::clone(&runtime.terminal);
+                                let outbound = Arc::clone(&outbound);
+                                let terminal_id = terminal_id.clone();
+                                let stream_id = frame.stream_id;
+                                let stream_epoch = frame.position.epoch;
+                                tokio::spawn(async move {
+                                    let page = tokio::task::spawn_blocking(move || {
+                                        terminal.read_replay_page(
+                                            &terminal_id,
+                                            cursor,
+                                            Some(max_bytes),
+                                            reverse,
+                                        )
+                                    })
+                                    .await;
+                                    let codec = terminal_protocol::Codec::default();
+                                    let page = match page {
+                                        Ok(Ok(page)) => page,
+                                        _ => {
+                                            if let Ok(error_end) = terminal_protocol::Frame::new(
+                                                terminal_protocol::FrameType::ScrollbackEnd,
+                                                0,
+                                                stream_id,
+                                                terminal_protocol::StreamPosition {
+                                                    epoch: stream_epoch,
+                                                    sequence: cursor,
+                                                },
+                                                bytes::Bytes::from_static(&[2]),
+                                            )
+                                            .and_then(|frame| codec.encode(frame))
+                                            {
+                                                let _ = outbound
+                                                    .enqueue_binary_reliable(error_end.coalesce());
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    let mut frames = Vec::new();
+                                    let begin = terminal_protocol::Frame::new(
+                                        terminal_protocol::FrameType::ScrollbackBegin,
+                                        0,
+                                        stream_id,
+                                        terminal_protocol::StreamPosition {
+                                            epoch: stream_epoch,
+                                            sequence: expected,
+                                        },
+                                        bytes::Bytes::new(),
+                                    )
+                                    .and_then(|frame| codec.encode(frame));
+                                    let Ok(begin) = begin else { return };
+                                    frames.push(begin.coalesce());
+                                    let (next_sequence, complete) = if let Some(page) = page {
+                                        let mut sequence = page.first_sequence;
+                                        for (index, chunk) in page.chunks.into_iter().enumerate() {
+                                            if index > 0 {
+                                                sequence = sequence
+                                                    .saturating_add(chunk.0.len() as u64);
+                                            }
+                                            let encoded = terminal_protocol::Frame::new(
+                                                terminal_protocol::FrameType::ScrollbackChunk,
+                                                0,
+                                                stream_id,
+                                                terminal_protocol::StreamPosition {
+                                                    epoch: stream_epoch,
+                                                    sequence,
+                                                },
+                                                chunk.0,
+                                            )
+                                            .and_then(|frame| codec.encode(frame));
+                                            let Ok(encoded) = encoded else { return };
+                                            frames.push(encoded.coalesce());
+                                        }
+                                        (page.next_sequence, page.complete)
+                                    } else {
+                                        (cursor, true)
+                                    };
+                                    let end = terminal_protocol::Frame::new(
+                                        terminal_protocol::FrameType::ScrollbackEnd,
+                                        0,
+                                        stream_id,
+                                        terminal_protocol::StreamPosition {
+                                            epoch: stream_epoch,
+                                            sequence: next_sequence,
+                                        },
+                                        bytes::Bytes::from(vec![u8::from(complete)]),
+                                    )
+                                    .and_then(|frame| codec.encode(frame));
+                                    if let Ok(end) = end {
+                                        frames.push(end.coalesce());
+                                        if !outbound.enqueue_history(frames)
+                                            && let Ok(error_end) = terminal_protocol::Frame::new(
+                                                terminal_protocol::FrameType::ScrollbackEnd,
+                                                0,
+                                                stream_id,
+                                                terminal_protocol::StreamPosition {
+                                                    epoch: stream_epoch,
+                                                    sequence: cursor,
+                                                },
+                                                bytes::Bytes::from_static(&[2]),
+                                            )
+                                            .and_then(|frame| codec.encode(frame))
+                                        {
+                                            let _ = outbound
+                                                .enqueue_binary_reliable(error_end.coalesce());
+                                        }
+                                    }
+                                });
+                                continue;
                             }
                             terminal_protocol::FrameType::Resize if frame.payload.len() == 4 => {
                                 let expected = control_position.saturating_add(1);

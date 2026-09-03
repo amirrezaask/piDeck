@@ -25,6 +25,7 @@ hostname = "0.4"
 include_dir = { version = "0.7", optional = true }
 indexmap = "2.12"
 jiff = "0.2"
+libc = "0.2"
 mime_guess = "2.0"
 percent-encoding = "2.3"
 polling = "3.11"

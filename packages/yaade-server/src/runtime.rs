@@ -825,6 +825,44 @@ impl HostRuntime {
         );
     }
 
+    pub fn attach_terminal_binary(
+        &self,
+        principal: &Principal,
+        args: &[Value],
+    ) -> Result<crate::terminal::TerminalAttach, RuntimeError> {
+        self.authorize(principal, "terminal:attach")?;
+        validate_route_args("terminal:attach", args)?;
+        let id = string(args, 0)?;
+        if matches!(
+            args.get(2).and_then(Value::as_str),
+            Some("semantic" | "both")
+        ) {
+            return Err(RuntimeError::Invalid(
+                "semantic terminal mode is not available on this host".to_owned(),
+            ));
+        }
+        if self.terminal.is_live_terminal(id) {
+            let lease = self.terminal.acquire_lease(
+                id,
+                &principal.principal_id,
+                &principal.connection_id,
+                if principal.can_control {
+                    TerminalLeaseMode::Writer
+                } else {
+                    TerminalLeaseMode::Observer
+                },
+            )?;
+            drop(lease);
+        }
+        self.terminal
+            .attach(
+                id,
+                &principal.connection_id,
+                args.get(1).and_then(Value::as_u64).unwrap_or(0),
+            )
+            .map_err(Into::into)
+    }
+
     fn dispatch_terminal(
         &self,
         principal: &Principal,

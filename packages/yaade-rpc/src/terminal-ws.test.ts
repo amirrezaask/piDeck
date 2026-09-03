@@ -5,6 +5,7 @@ import {
   encodeTerminalDataFrame,
   encodeTerminalInputFrame,
   encodeTerminalResizeFrame,
+  encodeTerminalScrollbackRequest,
   encodeTerminalWsCommand,
   tryDecodeTerminalWsCommand,
   tryDecodeTerminalWsResult,
@@ -74,6 +75,20 @@ test("encodes binary RESIZE with bounded dimensions and control position", () =>
   assert.equal(view.getUint16(36), 132);
   assert.equal(view.getUint16(38), 48);
   assert.throws(() => encodeTerminalResizeFrame(17, 9, 5, 0, 48));
+});
+
+test("encodes a bounded binary scrollback request", () => {
+  const encoded = encodeTerminalScrollbackRequest(17, 9, 5, 4096, 262144, true);
+  const view = new DataView(encoded.buffer);
+  assert.deepEqual(Array.from(encoded.subarray(0, 4)), [0x50, 0x44, 4, 9]);
+  assert.equal(view.getBigUint64(8), 17n);
+  assert.equal(view.getBigUint64(16), 9n);
+  assert.equal(view.getBigUint64(24), 5n);
+  assert.equal(view.getUint32(32), 13);
+  assert.equal(view.getBigUint64(36), 4096n);
+  assert.equal(view.getUint32(44), 262144);
+  assert.equal(encoded[48], 1);
+  assert.throws(() => encodeTerminalScrollbackRequest(17, 9, 5, 0, 0, false));
 });
 
 test("decodes a snapshot payload larger than its stream cut", () => {

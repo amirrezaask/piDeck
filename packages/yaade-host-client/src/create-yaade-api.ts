@@ -301,6 +301,36 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
     }
   }
 
+  const readTerminalHistoryPage = async (
+    id: string,
+    cursor: number,
+    maxBytes: number,
+    reverse = false,
+  ) => {
+    const binary = transport.readTerminalHistory?.(
+      id,
+      cursor,
+      maxBytes,
+      reverse,
+    );
+    if (binary) return binary;
+    if (reverse) {
+      return transport.invoke(
+        "terminal:readReplayPage",
+        id,
+        cursor,
+        maxBytes,
+        "backward",
+      );
+    }
+    return transport.invoke(
+      "terminal:readReplayPage",
+      id,
+      cursor,
+      maxBytes,
+    );
+  };
+
   const previewNewestReplay = async (
     id: string,
     result: TerminalAttachResult,
@@ -317,12 +347,11 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
     let replayTruncated = result.replayTruncated === true;
     if (previewChunks.length === 0) {
       try {
-        const page = await transport.invoke(
-          "terminal:readReplayPage",
+        const page = await readTerminalHistoryPage(
           id,
           0,
           256 * 1024,
-          "backward",
+          true,
         );
         if (page?.chunks.length) {
           previewChunks = page.chunks;
@@ -370,8 +399,7 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
       !complete &&
       (generation === undefined || generation === reconnectGeneration)
     ) {
-      const page = await transport.invoke(
-        "terminal:readReplayPage",
+      const page = await readTerminalHistoryPage(
         id,
         cursor,
         256 * 1024,

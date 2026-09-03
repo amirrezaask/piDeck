@@ -5,6 +5,7 @@ import {
   decodeTerminalDataFrame,
   encodeTerminalInputFrame,
   encodeTerminalResizeFrame,
+  encodeTerminalScrollbackRequest,
   encodeTerminalWsAck,
   encodeTerminalWsCommand,
   isTerminalWsHotOp,
@@ -250,6 +251,24 @@ export class WebHostTransport implements YaadeHostTransport {
     { id: string; epoch: number; position: number; inputPosition: number; controlPosition: number }
   >();
   private readonly terminalStreamIds = new Map<string, number>();
+  private readonly pendingHistory = new Map<
+    number,
+    {
+      epoch: number;
+      chunks: Uint8Array[];
+      firstSequence: number;
+      lastSequence: number;
+      resolve: (page: {
+        chunks: Uint8Array[];
+        firstSequence: number;
+        lastSequence: number;
+        nextSequence: number;
+        complete: boolean;
+      }) => void;
+      reject: (error: Error) => void;
+      timeout: ReturnType<typeof setTimeout>;
+    }
+  >();
   private realtimeRequestSequence = 0;
   private loopFiber: Fiber.RuntimeFiber<void, never> | null = null;
   private reconnectRequested = false;
@@ -371,6 +390,59 @@ export class WebHostTransport implements YaadeHostTransport {
     });
   }
 
+  readTerminalHistory(
+    terminalId: string,
+    cursor: number,
+    maxBytes: number,
+    reverse = false,
+  ): Promise<{
+    chunks: Uint8Array[];
+    firstSequence: number;
+    lastSequence: number;
+    nextSequence: number;
+    complete: boolean;
+  }> | null {
+    const socket = this.socket;
+    const streamId = this.terminalStreamIds.get(terminalId);
+    const stream = streamId === undefined ? undefined : this.terminalStreams.get(streamId);
+    if (!socket || socket.readyState !== WebSocket.OPEN || streamId === undefined || !stream) {
+      return null;
+    }
+    if (this.pendingHistory.has(streamId)) return null;
+    stream.controlPosition += 1;
+    const request = encodeTerminalScrollbackRequest(
+      streamId,
+      stream.epoch,
+      stream.controlPosition,
+      cursor,
+      maxBytes,
+      reverse,
+    );
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingHistory.delete(streamId);
+        reject(new Error("terminal scrollback request timed out"));
+      }, 10_000);
+      this.pendingHistory.set(streamId, {
+        epoch: stream.epoch,
+        chunks: [],
+        firstSequence: 0,
+        lastSequence: 0,
+        resolve,
+        reject,
+        timeout,
+      });
+      try {
+        socket.send(request);
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingHistory.delete(streamId);
+        stream.controlPosition -= 1;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
   sendRealtime(channel: string, ...args: unknown[]): boolean {
     if (this.closed || !isTerminalWsHotOp(channel)) return false;
     const socket = this.socket;
@@ -462,6 +534,7 @@ export class WebHostTransport implements YaadeHostTransport {
       new HostDisconnectedError({ message: "host transport closed" }),
     );
     this.rejectRealtime(new Error("host transport closed"));
+    this.rejectHistory(new Error("host transport closed"));
     const fiber = this.loopFiber;
     this.loopFiber = null;
     if (fiber) {
@@ -493,6 +566,7 @@ export class WebHostTransport implements YaadeHostTransport {
         // terminal input safely, so fail them immediately instead of leaving
         // callers parked until the ten-second request timeout.
         self.rejectRealtime(new Error("host websocket disconnected"));
+        self.rejectHistory(new Error("host websocket disconnected"));
         const delay = hostRealtimeReconnectDelay(self.reconnectAttempt++);
         if (self.reconnectRequested) {
           self.reconnectRequested = false;
@@ -803,6 +877,59 @@ export class WebHostTransport implements YaadeHostTransport {
       this.dispatch("protocol:error", "Terminal data arrived before ATTACH_ACK");
       return;
     }
+    if (
+      decoded.frameType === "scrollback-begin" ||
+      decoded.frameType === "scrollback-chunk" ||
+      decoded.frameType === "scrollback-end"
+    ) {
+      if (!stream || decoded.streamEpoch !== stream.epoch) {
+        this.dispatch("protocol:error", "Invalid terminal scrollback epoch");
+        return;
+      }
+      const pending = this.pendingHistory.get(decoded.streamId!);
+      if (!pending || pending.epoch !== stream.epoch) return;
+      if (decoded.frameType === "scrollback-begin") {
+        pending.chunks.length = 0;
+        pending.firstSequence = 0;
+        pending.lastSequence = 0;
+        return;
+      }
+      if (decoded.frameType === "scrollback-chunk") {
+        if (pending.firstSequence === 0) pending.firstSequence = decoded.terminalSequence;
+        if (pending.lastSequence !== 0) {
+          const firstByte = decoded.terminalSequence - decoded.payload.byteLength + 1;
+          if (firstByte !== pending.lastSequence + 1) {
+            clearTimeout(pending.timeout);
+            this.pendingHistory.delete(decoded.streamId!);
+            pending.reject(new Error("terminal scrollback sequence gap"));
+            return;
+          }
+        }
+        pending.lastSequence = decoded.terminalSequence;
+        pending.chunks.push(decoded.payload);
+        return;
+      }
+      if (decoded.payload.byteLength !== 1 || decoded.payload[0]! > 1) {
+        clearTimeout(pending.timeout);
+        this.pendingHistory.delete(decoded.streamId!);
+        pending.reject(new Error(
+          decoded.payload[0] === 2
+            ? "terminal scrollback queue is full"
+            : "invalid terminal scrollback completion",
+        ));
+        return;
+      }
+      clearTimeout(pending.timeout);
+      this.pendingHistory.delete(decoded.streamId!);
+      pending.resolve({
+        chunks: pending.chunks,
+        firstSequence: pending.firstSequence,
+        lastSequence: pending.lastSequence,
+        nextSequence: decoded.terminalSequence,
+        complete: decoded.payload[0] === 1,
+      });
+      return;
+    }
     if (decoded.frameType === "resync-begin") {
       if (!stream || decoded.streamEpoch !== stream.epoch) {
         this.dispatch("protocol:error", "Invalid terminal resynchronization epoch");
@@ -938,6 +1065,14 @@ export class WebHostTransport implements YaadeHostTransport {
     pending.reject(
       new Error(result.error?.message ?? "terminal command failed"),
     );
+  }
+
+  private rejectHistory(error: Error): void {
+    for (const pending of this.pendingHistory.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    this.pendingHistory.clear();
   }
 
   private rejectRealtime(error: Error): void {

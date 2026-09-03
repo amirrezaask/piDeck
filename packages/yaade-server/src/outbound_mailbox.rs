@@ -8,6 +8,8 @@ pub struct MailboxLimits {
     pub reliable_max_bytes: usize,
     pub legacy_max_frames: usize,
     pub legacy_max_bytes: usize,
+    pub history_max_frames: usize,
+    pub history_max_bytes: usize,
 }
 
 impl Default for MailboxLimits {
@@ -17,6 +19,8 @@ impl Default for MailboxLimits {
             reliable_max_bytes: 10 * 1024 * 1024,
             legacy_max_frames: 8_192,
             legacy_max_bytes: 32 * 1024 * 1024,
+            history_max_frames: 1_024,
+            history_max_bytes: 2 * 1024 * 1024,
         }
     }
 }
@@ -25,6 +29,7 @@ impl Default for MailboxLimits {
 pub enum Overflow {
     Reliable,
     Legacy,
+    History,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +104,8 @@ pub struct OutboundMailbox {
     reliable_bytes: usize,
     legacy: VecDeque<QueuedFrame>,
     legacy_bytes: usize,
+    history: VecDeque<QueuedFrame>,
+    history_bytes: usize,
     next_order: u64,
 }
 
@@ -112,6 +119,8 @@ impl OutboundMailbox {
             reliable_bytes: 0,
             legacy: VecDeque::new(),
             legacy_bytes: 0,
+            history: VecDeque::new(),
+            history_bytes: 0,
             next_order: 0,
         }
     }
@@ -162,6 +171,26 @@ impl OutboundMailbox {
         accepted(false, false)
     }
 
+    /// Enqueue one complete scrollback response atomically. History has an
+    /// independent budget and drains only when live/control lanes are empty.
+    pub fn enqueue_history_batch(&mut self, frames: Vec<OutboundFrame>) -> EnqueueResult {
+        let bytes = frames
+            .iter()
+            .fold(0_usize, |total, frame| total.saturating_add(frame.bytes()));
+        if frames.is_empty()
+            || self.history.len().saturating_add(frames.len()) > self.limits.history_max_frames
+            || self.history_bytes.saturating_add(bytes) > self.limits.history_max_bytes
+        {
+            return rejected(Overflow::History, false);
+        }
+        for frame in frames {
+            let queued = self.queued(frame);
+            self.history.push_back(queued);
+        }
+        self.history_bytes = self.history_bytes.saturating_add(bytes);
+        accepted(false, false)
+    }
+
     pub fn pop_next(&mut self) -> Option<OutboundFrame> {
         if let Some(queued) = self.priority.pop_front() {
             self.reliable_bytes = self.reliable_bytes.saturating_sub(queued.frame.bytes());
@@ -182,15 +211,20 @@ impl OutboundMailbox {
         {
             selected = Some((frame.order, Source::Legacy));
         }
-        match selected?.1 {
-            Source::Reliable => {
+        match selected {
+            Some((_, Source::Reliable)) => {
                 let frame = self.reliable.pop_front()?.frame;
                 self.reliable_bytes -= frame.bytes();
                 Some(frame)
             }
-            Source::Legacy => {
+            Some((_, Source::Legacy)) => {
                 let frame = self.legacy.pop_front()?.frame;
                 self.legacy_bytes -= frame.bytes();
+                Some(frame)
+            }
+            None => {
+                let frame = self.history.pop_front()?.frame;
+                self.history_bytes -= frame.bytes();
                 Some(frame)
             }
         }
@@ -198,22 +232,29 @@ impl OutboundMailbox {
 
     #[must_use]
     pub fn pending_frames(&self) -> usize {
-        self.priority.len() + self.reliable.len() + self.legacy.len()
+        self.priority.len() + self.reliable.len() + self.legacy.len() + self.history.len()
     }
 
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        self.reliable_bytes + self.legacy_bytes
+        self.reliable_bytes + self.legacy_bytes + self.history_bytes
     }
 
     pub fn discard_terminal_through(&mut self, terminal_id: &str, sequence: u64) {
+        self.discard_terminal_where(terminal_id, |value| value <= sequence);
+    }
+
+    /// Drop every queued raw delta for a replica that must be rebuilt from a
+    /// new snapshot. Reliable control for other streams remains intact.
+    pub fn discard_terminal(&mut self, terminal_id: &str) {
+        self.discard_terminal_where(terminal_id, |_| true);
+    }
+
+    fn discard_terminal_where(&mut self, terminal_id: &str, predicate: impl Fn(u64) -> bool) {
         let mut removed_bytes = 0;
         self.legacy.retain(|queued| {
             let remove = queued.frame.terminal_id.as_deref() == Some(terminal_id)
-                && queued
-                    .frame
-                    .terminal_sequence
-                    .is_some_and(|value| value <= sequence);
+                && queued.frame.terminal_sequence.is_some_and(&predicate);
             if remove {
                 removed_bytes += queued.frame.bytes();
             }
@@ -257,6 +298,8 @@ mod tests {
             reliable_max_bytes: 10,
             legacy_max_frames: 2,
             legacy_max_bytes: 10,
+            history_max_frames: 2,
+            history_max_bytes: 10,
         }
     }
 
@@ -333,6 +376,45 @@ mod tests {
         let overflow = mailbox.enqueue_legacy("a", OutboundFrame::text(b"bad".to_vec()));
         assert_eq!(overflow.overflow, Some(Overflow::Legacy));
         assert_eq!(mailbox.pending_frames(), 2);
+    }
+
+    #[test]
+    fn desynchronized_terminal_drops_only_its_obsolete_raw_deltas() {
+        let mut mailbox = OutboundMailbox::new(MailboxLimits::default());
+        mailbox.enqueue_legacy("a", OutboundFrame::terminal("a", 1, b"a-1".to_vec()));
+        mailbox.enqueue_legacy("b", OutboundFrame::terminal("b", 1, b"b-1".to_vec()));
+        mailbox.enqueue_legacy("a", OutboundFrame::terminal("a", 2, b"a-2".to_vec()));
+        mailbox.discard_terminal("a");
+        assert_eq!(mailbox.pending_frames(), 1);
+        assert_eq!(
+            mailbox.pop_next().expect("unrelated stream").data.as_ref(),
+            b"b-1"
+        );
+    }
+
+    #[test]
+    fn history_has_an_independent_budget_and_never_precedes_live_data() {
+        let mut mailbox = OutboundMailbox::new(limits());
+        assert!(
+            mailbox
+                .enqueue_history_batch(vec![OutboundFrame::binary(b"history".to_vec())])
+                .accepted
+        );
+        assert!(
+            mailbox
+                .enqueue_legacy("a", OutboundFrame::terminal("a", 1, b"live".to_vec()))
+                .accepted
+        );
+        assert_eq!(mailbox.pop_next().expect("live").data.as_ref(), b"live");
+        assert_eq!(
+            mailbox.pop_next().expect("history").data.as_ref(),
+            b"history"
+        );
+        assert!(
+            !mailbox
+                .enqueue_history_batch(vec![OutboundFrame::binary(vec![0; 11])])
+                .accepted
+        );
     }
 
     #[test]

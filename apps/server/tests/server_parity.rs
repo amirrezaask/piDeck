@@ -566,7 +566,7 @@ async fn persisted_replay_pages_and_checkpoints_recover_trimmed_terminal_output(
         )
         .expect("attach");
     assert_eq!(attach["replayQuality"], "checkpoint");
-    assert_eq!(attach["checkpoint"]["checkpointVersion"], 1);
+    assert_eq!(attach["checkpoint"]["checkpointVersion"], 2);
     assert_eq!(attach["archiveAvailable"], true);
     let page = harness
         .server
@@ -610,8 +610,8 @@ async fn two_websocket_clients_receive_same_live_pty_and_survive_one_disconnect(
         .await
         .expect("create json");
     let terminal_id = create["value"]["id"].as_str().expect("terminal id");
-    // Terminal protocol version 2 means Ghostty semantic ownership. The Rust
-    // host is deliberately raw-only until it has a native Ghostty adapter.
+    // The capable transport owns a native Ghostty authority and replicates
+    // opaque snapshot plus raw bytes; semantic diffs are not on this path.
     assert!(create["value"].get("protocolVersion").is_none());
 
     let mut first = modern_socket(&harness, None).await;
@@ -622,6 +622,7 @@ async fn two_websocket_clients_receive_same_live_pty_and_survive_one_disconnect(
     for _ in 0..2 {
         let _ = json_message(&mut second).await;
     }
+    let mut second_stream = None;
     for (request, socket) in [("one", &mut first), ("two", &mut second)] {
         socket
             .send(Message::Text(
@@ -638,7 +639,56 @@ async fn two_websocket_clients_receive_same_live_pty_and_survive_one_disconnect(
         let result = json_message(socket).await;
         assert_eq!(result["ok"], true);
         assert!(result["value"]["outputChunks"].as_array().is_some());
+        if request == "two" {
+            second_stream = Some((
+                result["value"]["streamId"].as_u64().expect("stream id"),
+                result["value"]["streamEpoch"]
+                    .as_u64()
+                    .expect("stream epoch"),
+            ));
+        }
+        for expected_kind in [4_u8, 5_u8] {
+            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("attach frame timeout")
+                .expect("socket open")
+                .expect("attach frame");
+            let Message::Binary(frame) = frame else {
+                panic!("expected binary attach frame")
+            };
+            assert_eq!(&frame[..3], b"PD\x04");
+            assert_eq!(frame[3], expected_kind);
+        }
     }
+    let (stream_id, stream_epoch) = second_stream.expect("second stream");
+    let mut scrollback = vec![0_u8; 49];
+    scrollback[..4].copy_from_slice(b"PD\x04\x09");
+    scrollback[6..8].copy_from_slice(&36_u16.to_be_bytes());
+    scrollback[8..16].copy_from_slice(&stream_id.to_be_bytes());
+    scrollback[16..24].copy_from_slice(&stream_epoch.to_be_bytes());
+    scrollback[24..32].copy_from_slice(&1_u64.to_be_bytes());
+    scrollback[32..36].copy_from_slice(&13_u32.to_be_bytes());
+    scrollback[36..44].copy_from_slice(&0_u64.to_be_bytes());
+    scrollback[44..48].copy_from_slice(&(64_u32 * 1024).to_be_bytes());
+    second
+        .send(Message::Binary(scrollback.into()))
+        .await
+        .expect("scrollback request");
+    let mut kinds = Vec::new();
+    while kinds.last() != Some(&11) {
+        let frame = tokio::time::timeout(Duration::from_secs(2), second.next())
+            .await
+            .expect("scrollback timeout")
+            .expect("socket open")
+            .expect("scrollback frame");
+        let Message::Binary(frame) = frame else {
+            panic!("expected binary scrollback frame")
+        };
+        kinds.push(frame[3]);
+    }
+    assert_eq!(kinds.first(), Some(&9));
+    assert!(kinds.contains(&10));
+
     first.close(None).await.expect("close first");
     second
         .send(Message::Text("ping".into()))
