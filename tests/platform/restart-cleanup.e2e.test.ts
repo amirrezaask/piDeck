@@ -36,7 +36,10 @@ test("browser exit preserves the PTY while host crash cleanup ends its process g
 
     await harness.restartApi("SIGKILL")
     await waitUntil(() => !processAlive(pid), 10_000, "stale terminal process group cleanup")
-    const secondBrowser = await harness.startBrowser(undefined, `/?s=${terminal.sessionId}&term=${terminal.id}`)
+    const secondBrowser = await harness.startBrowser(
+      undefined,
+      `/terminals?s=${terminal.sessionId}&term=${terminal.id}`,
+    )
     await expect(secondBrowser.page.locator('[data-yaade-terminal-interrupted]')).toBeVisible({
       timeout: 30_000,
     })

@@ -183,7 +183,7 @@ export async function createDurableRuntimeHarness(
 
   const startBrowser = async (
     userDataDir?: string,
-    startPath = "/",
+    startPath = "/terminals",
   ): Promise<BrowserHandle> => {
     if (!apiHandle) {
       try {

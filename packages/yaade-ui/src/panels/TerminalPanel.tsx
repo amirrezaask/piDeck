@@ -50,6 +50,8 @@ export type TerminalPanelProps = {
   readOnly?: boolean
   /** Visible explanation for a history-only terminal surface. */
   readOnlyMessage?: string
+  /** Host-restart state rendered without replacing the resident panel DOM node. */
+  interruptedState?: "history" | "unavailable"
   /** Attach to an existing PTY without ever creating, restarting, or disposing it. */
   attachOnly?: boolean
   /** Hold off creating/attaching a PTY until the surrounding session is ready. */
@@ -303,6 +305,7 @@ export function TerminalPanel({
   sessionGeneration = 0,
   readOnly = false,
   readOnlyMessage = "Archived · read-only",
+  interruptedState,
   attachOnly = false,
   deferPty = false,
   visible = true,
@@ -1058,6 +1061,7 @@ export function TerminalPanel({
       data-yaade-terminal-status={displayStatus}
       data-yaade-terminal-renderer="ghostty"
       data-yaade-terminal-panel-render-count={renderCountRef.current}
+      data-yaade-terminal-interrupted={interruptedState}
       onMouseDown={() => focusTerminalInput(tabId)}
     >
       <div className="yaade-terminal-surface relative min-h-0 flex-1 overflow-hidden">
@@ -1106,7 +1110,7 @@ export function TerminalPanel({
           </span>
         </div>
       ) : null}
-      {terminalError ? (
+      {terminalError && interruptedState !== "unavailable" ? (
         <div
           role="alert"
           className="pointer-events-none absolute inset-x-0 bottom-7 border-t border-destructive/30 bg-background/90 px-3 py-2 text-xs text-destructive"
@@ -1114,7 +1118,32 @@ export function TerminalPanel({
           Ghostty terminal failed to load: {terminalError}
         </div>
       ) : null}
-      {readOnly ? (
+      {interruptedState === "unavailable" ? (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-background px-4 text-center">
+          <div className="flex max-w-md flex-col items-center gap-4" role="status">
+            <div className="space-y-1.5">
+              <p className="text-sm font-medium text-foreground">
+                Terminal ended when the host restarted
+              </p>
+              <p className="text-sm text-muted-foreground">
+                Retained output is unavailable. Restarting opens a new shell; it does not resume
+                the previous process.
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <Button type="button" size="sm" onClick={onRestart}>
+                <RotateCcw />
+                Restart terminal
+              </Button>
+              <Button type="button" size="sm" variant="outline" onClick={onClose}>
+                <X />
+                Close
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {readOnly && interruptedState !== "unavailable" ? (
         <div
           role="status"
           data-yaade-terminal-archived=""
@@ -1123,7 +1152,8 @@ export function TerminalPanel({
           {readOnlyMessage}
         </div>
       ) : null}
-      {displayStatus === "exited" || displayStatus === "failed" ? (
+      {interruptedState !== "unavailable" &&
+      (displayStatus === "exited" || displayStatus === "failed") ? (
         <div
           data-yaade-terminal-exit-bar
           role={displayStatus === "failed" ? "alert" : "status"}

@@ -67,6 +67,7 @@ export function muxSessionUrl(
   sessionId: SessionIdType,
   tabOrMuxTerminalId?: SessionTabId | MuxTerminalIdType,
   muxTerminalId?: MuxTerminalIdType,
+  basePath = "/",
 ): string {
   const params = new URLSearchParams({ s: sessionId })
   const tabId = tabOrMuxTerminalId && isSessionTabId(tabOrMuxTerminalId)
@@ -79,7 +80,7 @@ export function muxSessionUrl(
   )
   if (tabId) params.set("t", tabId)
   if (paneId) params.set("term", paneId)
-  return `/?${params.toString()}`
+  return `${basePath}?${params.toString()}`
 }
 
 export const LAST_MUX_SESSION_ROUTE_KEY = "yaade:last-terminal-multiplexer-route"

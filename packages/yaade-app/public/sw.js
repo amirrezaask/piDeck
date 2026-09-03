@@ -1,4 +1,4 @@
-const CACHE_NAME = "yaade-shell-v1"
+const CACHE_NAME = "pideck-shell-v2"
 const SHELL_KEY = "/__yaade-offline-shell__"
 
 async function trimCache(cache, maxEntries = 128) {
@@ -30,8 +30,10 @@ function cacheable(request) {
   if (url.origin !== self.location.origin) return false
   return !url.pathname.startsWith("/api/") &&
     url.pathname !== "/api" &&
-    url.pathname !== "/terminal/ws" &&
-    url.pathname !== "/terminal/health"
+    !url.pathname.startsWith("/agents/v1/") &&
+    !url.pathname.startsWith("/tasks/api/") &&
+    !url.pathname.startsWith("/terminal/") &&
+    url.pathname !== "/tasks/health"
 }
 
 self.addEventListener("install", event => {

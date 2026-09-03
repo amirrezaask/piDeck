@@ -3,6 +3,16 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.ts",
+      "default": "./index.ts"
+    },
+    "./client": {
+      "types": "./client.tsx",
+      "default": "./client.tsx"
+    }
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "vp build",

@@ -192,7 +192,7 @@ test("two browser clients can both write to the same terminal", async ({ launchA
   });
 
   try {
-    await secondPage.goto(launched.baseUrl, { waitUntil: "domcontentloaded" });
+    await secondPage.goto(`${launched.baseUrl}/terminals`, { waitUntil: "domcontentloaded" });
     await secondPage.waitForFunction(() => window.__yaadeTest != null);
     await secondPage.evaluate(() => window.__yaadeTest!.waitForReady());
     await expect(
@@ -254,7 +254,7 @@ test("two clients keep independent Window navigation", async ({ launchApp, brows
   const secondContext = await browser.newContext();
   const secondPage = await secondContext.newPage();
   try {
-    await secondPage.goto(launched.baseUrl, { waitUntil: "domcontentloaded" });
+    await secondPage.goto(`${launched.baseUrl}/terminals`, { waitUntil: "domcontentloaded" });
     await secondPage.waitForFunction(() => window.__yaadeTest != null);
     await secondPage.evaluate(() => window.__yaadeTest!.waitForReady());
 
@@ -270,6 +270,14 @@ test("two clients keep independent Window navigation", async ({ launchApp, brows
     if (!initial.sessionId || !firstTabId || !secondTabId) {
       throw new Error("two Window ids are required");
     }
+    await expect
+      .poll(() =>
+        secondPage.evaluate(
+          sessionId => window.__yaadeTest?.getState().activeSessionId === sessionId,
+          initial.sessionId,
+        ),
+      )
+      .toBe(true);
     await tabs.nth(0).getByRole("tab").click();
     await expect
       .poll(() => launched.page.evaluate(() => window.__yaadeTest?.getState().activeTabId ?? null))

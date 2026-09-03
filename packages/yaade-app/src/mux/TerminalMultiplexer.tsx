@@ -389,6 +389,7 @@ function markPerformance(name: string): void {
 }
 
 export function TerminalMultiplexer() {
+	const terminalBasePath = location.pathname.startsWith("/terminals") ? "/terminals" : "/";
 	const hostPorts = useHostPorts();
 	const serverConnections = useServerConnections();
 	const desktopClient = isDesktopClient(window.location);
@@ -592,7 +593,7 @@ export function TerminalMultiplexer() {
 			serverConnections.manager.selectMuxTerminal(terminalId);
 			client.store.selectMuxTerminal(terminalId);
 		}
-		const url = muxSessionUrl(session.id, tab?.id, terminalId);
+		const url = muxSessionUrl(session.id, tab?.id, terminalId, terminalBasePath);
 		persistMuxSessionRoute(url, localStorage);
 		if (location.href !== new URL(url, location.origin).href) history.replaceState(null, "", url);
 	}, [
@@ -960,7 +961,9 @@ export function TerminalMultiplexer() {
 				? client.store.getSnapshot().tabsById.get(session.activeTabId)
 				: undefined;
 			writeMuxSessionLocation(
-				session ? muxSessionUrl(session.id, nextTab?.id, nextTab?.activeMuxTerminalId) : "/",
+				session
+				? muxSessionUrl(session.id, nextTab?.id, nextTab?.activeMuxTerminalId, terminalBasePath)
+				: terminalBasePath,
 				"push",
 			);
 		},
@@ -978,7 +981,7 @@ export function TerminalMultiplexer() {
 			serverConnections.manager.selectMuxTerminal(terminal.id);
 			client.store.selectMuxTerminal(terminal.id);
 			const tabId = terminal.tabId ?? client.store.getSnapshot().activeTabId;
-			const nextUrl = muxSessionUrl(terminal.sessionId, tabId, terminal.id);
+			const nextUrl = muxSessionUrl(terminal.sessionId, tabId, terminal.id, terminalBasePath);
 			if (current !== terminal.id || location.href !== new URL(nextUrl, location.origin).href) {
 				writeMuxSessionLocation(nextUrl, "push", { yaadeMobileTerminal: terminal.id });
 			}
@@ -1182,7 +1185,10 @@ export function TerminalMultiplexer() {
 			serverConnections.manager.selectTab(tab.id);
 			client.store.selectTab(tab.id);
 			const nextTerminal = client.store.getSnapshot().activeMuxTerminalId;
-			writeMuxSessionLocation(muxSessionUrl(session.id, tab.id, nextTerminal), "push");
+			writeMuxSessionLocation(
+				muxSessionUrl(session.id, tab.id, nextTerminal, terminalBasePath),
+				"push",
+			);
 		},
 		[client, serverConnections.manager],
 	);
@@ -2014,7 +2020,10 @@ export function TerminalMultiplexer() {
 				}
 			}
 			const tabId = terminal.tabId ?? client.store.getSnapshot().activeTabId;
-			writeMuxSessionLocation(muxSessionUrl(terminal.sessionId, tabId, terminal.id), "replace");
+			writeMuxSessionLocation(
+			muxSessionUrl(terminal.sessionId, tabId, terminal.id, terminalBasePath),
+			"replace",
+		);
 			pendingFocusHistoryRef.current.delete(terminal.id);
 			recordTerminalFocus(terminal);
 		},
@@ -2297,7 +2306,7 @@ export function TerminalMultiplexer() {
 	);
 	const renderTerminal = useCallback(
 		(terminal: MuxTerminal, focused: boolean, visible = true) =>
-			terminalHasResidentSurface(terminal) ? (
+			terminalHasResidentSurface(terminal) || residentTerminalIds.has(terminal.id) ? (
 				isMobile ? (
 					<div className="h-full min-h-0" data-yaade-desktop-terminal-placeholder={terminal.id} />
 				) : (
@@ -2319,6 +2328,7 @@ export function TerminalMultiplexer() {
 			muxOverlayOpen,
 			recordPlacedTerminalFocus,
 			renderTerminalController,
+			residentTerminalIds,
 		],
 	);
 	const renderMobileTerminal = useCallback(
@@ -2337,7 +2347,7 @@ export function TerminalMultiplexer() {
 
 	const showMobileTerminalList = (terminal: MuxTerminal) => {
 		const tabId = terminal.tabId ?? client.store.getSnapshot().activeTabId;
-		const listUrl = muxSessionUrl(terminal.sessionId, tabId);
+		const listUrl = muxSessionUrl(terminal.sessionId, tabId, undefined, terminalBasePath);
 		if (history.state?.yaadeMobileTerminal === terminal.id) {
 			history.back();
 			return;

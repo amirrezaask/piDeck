@@ -15,9 +15,20 @@ export default defineConfig({
     { name: 'desktop-chromium', use: { ...devices['Desktop Chrome'] } },
     { name: 'mobile-chromium', use: { ...devices['Pixel 7'] } },
   ],
-  webServer: {
-    command: 'pnpm --filter @pideck/web build && pnpm --filter @pideck/web preview --host 127.0.0.1 --port 4173',
-    url: 'http://127.0.0.1:4173',
-    reuseExistingServer: !process.env.CI,
-  },
+  webServer: [
+    {
+      command:
+        'rm -rf .tmp/agents-e2e && mkdir -p .tmp/agents-e2e && PI_EXECUTABLE="$PWD/tests/fixtures/fake-pi-rpc.mjs" cargo run --quiet --manifest-path apps/server/Cargo.toml -- serve --port 4774 --data-dir .tmp/agents-e2e --allowed-roots "$PWD"',
+      url: 'http://127.0.0.1:4774/agents/v1/health',
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    {
+      command:
+        'YAADE_PORT=4774 pnpm --filter @pideck/client-web build && YAADE_PORT=4774 pnpm --filter @pideck/client-web preview --host 127.0.0.1 --port 4173',
+      url: 'http://127.0.0.1:4173',
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  ],
 });

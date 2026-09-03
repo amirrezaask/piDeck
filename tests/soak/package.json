@@ -1,3 +1,11 @@
 {
-  "type": "module"
+  "name": "@pideck/soak-tests",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@pideck/agents-client": "workspace:*",
+    "jsdom": "^30.0.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  }
 }

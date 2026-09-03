@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import WebSocket from 'ws';
-import { LruCache } from '../../apps/web/src/lib/lru.ts';
-import { RendererSoakProbe } from '../../apps/web/src/lib/renderer-soak.tsx';
-import { SupervisorClient } from '../../apps/web/src/lib/supervisor-client.ts';
-import { mergeTranscriptEvents } from '../../apps/web/src/lib/transcript.ts';
+import {
+  LruCache,
+  mergeTranscriptEvents,
+  RendererSoakProbe,
+  SupervisorClient,
+} from '@pideck/agents-client/soak';
 import supervisorPackage from '../../packages/supervisor/index.ts';
 
 const { buildSupervisorApp } = supervisorPackage;
@@ -276,9 +278,9 @@ test('100k-event/25-agent SupervisorClient and React renderer soak stays lossles
       streams.push(stream);
     }
 
-    const { JSDOM } = await import('../../apps/web/node_modules/jsdom/lib/api.js');
-    const React = await import('../../apps/web/node_modules/react/index.js');
-    const { createRoot } = await import('../../apps/web/node_modules/react-dom/client.js');
+    const { JSDOM } = await import('jsdom');
+    const React = await import('react');
+    const { createRoot } = await import('react-dom/client');
     rendererDom = new JSDOM('<!doctype html><main id="renderer"></main>', {
       url: 'http://renderer.test/',
     });

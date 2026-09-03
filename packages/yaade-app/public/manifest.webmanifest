@@ -1,9 +1,9 @@
 {
   "id": "/",
-  "name": "YAADE",
-  "short_name": "YAADE",
-  "description": "A browser terminal multiplexer for your machine.",
-  "start_url": "/",
+  "name": "piDeck",
+  "short_name": "piDeck",
+  "description": "Terminal sessions, Pi agents, and tasks in one client.",
+  "start_url": "/agents",
   "scope": "/",
   "display": "standalone",
   "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],

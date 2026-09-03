@@ -7,7 +7,7 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   reporter: 'list',
   use: {
-    baseURL: 'http://127.0.0.1:5175',
+    baseURL: 'http://127.0.0.1:5174',
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },
@@ -19,8 +19,8 @@ export default defineConfig({
       reuseExistingServer: false,
     },
     {
-      command: 'VITE_API_URL=http://127.0.0.1:3101 pnpm --filter @dispatch/client exec vite --port 5175 --host 127.0.0.1',
-      url: 'http://127.0.0.1:5175',
+      command: 'YAADE_PORT=3101 pnpm --filter @pideck/client-web dev --host 127.0.0.1',
+      url: 'http://127.0.0.1:5174/tasks',
       reuseExistingServer: false,
     },
   ],

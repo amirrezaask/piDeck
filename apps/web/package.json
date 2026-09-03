@@ -1,27 +1,33 @@
 {
-  "name": "@yaade/web",
+  "name": "@pideck/client-web",
   "version": "0.0.1",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "node scripts/dev-web.mjs",
-    "test": "vp test --root ../.. apps/web/scripts/register-local-host.test.mjs",
+    "test": "vp test --root ../.. apps/web/src apps/web/scripts/register-local-host.test.mjs",
     "build": "vp build && node scripts/verify-startup-graph.mjs && node scripts/compress-assets.mjs",
+    "preview": "vp preview",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@yaade/app": "workspace:*"
+    "@pideck/agents-client": "workspace:*",
+    "@pideck/tasks-client": "workspace:*",
+    "@yaade/app": "workspace:*",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.3"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.1.8",
-    "@types/node": "^22.15.29",
-    "@types/react": "^19.1.8",
-    "@types/react-dom": "^19.1.6",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.1.0",
-    "oxc-transform-react": "0.145.0",
-    "tailwindcss": "^4.1.8",
+    "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
     "vite": "catalog:",
-    "vite-plus": "catalog:"
+    "vite-plus": "catalog:",
+    "vitest": "^4.1.11"
   }
 }

@@ -17,13 +17,14 @@ The database defaults to `<data-dir>/yaade.sqlite3`. Terminal tables keep their 
 ## Applications
 
 ```text
-apps/server           Rust host: SQLite, PTY, terminal, tasks, and Pi RPC
-apps/web              terminal web client
+apps/server           Rust executable adapter
+apps/web              unified browser client for /terminals, /agents, and /tasks
 apps/desktop          Tauri terminal desktop client
-apps/agents-web       piDeck agent client
-apps/agents-desktop   Electron shell for the agent client
-apps/agents-switcher  piDeck browser extension
-apps/tasks-web        Dispatch task client
+apps/agents-desktop   legacy Electron shell for the agent surface
+apps/agents-switcher  Chrome navigation extension
+packages/yaade-server reusable Rust host runtime
+packages/agents-client agent surface module consumed by the unified client
+packages/tasks-client  task surface module consumed by the unified client
 ```
 
 `packages/ghostty-core` and `packages/ghostty-react` provide the Ghostty VT terminal stack. The repository does not include the GPUI desktop experiment.
@@ -44,7 +45,7 @@ pnpm install
 
 ## Development
 
-Start the Rust server and the three browser clients:
+Start the Rust server and the unified browser client:
 
 ```sh
 pnpm dev
@@ -53,13 +54,11 @@ pnpm dev
 Or run them separately:
 
 ```sh
-pnpm dev:server    # Rust server on http://127.0.0.1:7774
-pnpm dev:terminal  # terminal client on http://127.0.0.1:5174
-pnpm dev:agents    # agent client on http://127.0.0.1:5173
-pnpm dev:tasks     # task client on http://127.0.0.1:5175
+pnpm dev:server  # Rust server on http://127.0.0.1:7774
+pnpm dev:client  # unified client on http://127.0.0.1:5174
 ```
 
-The clients proxy their namespaced routes to the Rust server. Set `YAADE_PORT`, `VITE_SUPERVISOR_URL`, or `VITE_API_URL` when the server uses another origin.
+The client proxies `/terminal`, `/agents`, and `/tasks/api` to the Rust server. Chrome and `apps/agents-switcher` own navigation between `/terminals`, `/agents`, and `/tasks`; the client intentionally has no global navigation shell. Set `YAADE_PORT` when the server uses another port.
 
 The server accepts the Mergence host options:
 
@@ -116,6 +115,6 @@ The Electron shell uses `http://127.0.0.1:7774` by default. Set `PIDECK_SERVER_U
 pnpm build:release
 ```
 
-The release script compiles the Rust host and embeds the terminal web assets. Agent and task clients build with `pnpm build:agents` and `pnpm build:tasks`; package their desktop or web distributions according to the target deployment.
+The release script compiles the Rust host, embeds the unified client assets, and writes the unpacked Chrome extension to `dist/extension`.
 
 Treat the SQLite database and Pi session directory as sensitive data. They may contain terminal output, prompts, model responses, tool input, attachments, and source paths. See [docs/backup-and-recovery.md](docs/backup-and-recovery.md) before copying or restoring a live database.

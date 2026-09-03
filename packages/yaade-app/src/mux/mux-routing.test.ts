@@ -25,6 +25,7 @@ describe("terminal session routing", () => {
     const terminalId = Schema.decodeUnknownSync(MuxTerminalId)("term-a")
     assert.deepEqual(parseMuxSessionRoute(muxSessionUrl(sessionId, tabId, terminalId)), { sessionId, tabId, muxTerminalId: terminalId })
     assert.deepEqual(parseMuxSessionRoute(muxSessionUrl(sessionId, terminalId)), { sessionId, muxTerminalId: terminalId })
+    assert.equal(muxSessionUrl(sessionId, tabId, terminalId, "/terminals").startsWith("/terminals?"), true)
   })
 
   it("resolves host-local deep links against multi-server scoped ids", () => {

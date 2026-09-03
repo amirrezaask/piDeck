@@ -2,11 +2,14 @@
   "extends": "../../tsconfig.web.base.json",
   "compilerOptions": {
     "noEmit": true,
-    "lib": ["ES2022", "DOM"],
-    "types": ["vite/client"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["vite/client", "vitest/globals", "node"],
     "paths": {
-      "@/*": ["../../packages/yaade-ui/src/*"]
+      "@/*": ["../../packages/yaade-ui/src/*"],
+      "@agents/*": ["../../packages/agents-client/src/*"],
+      "@tasks/*": ["../../packages/tasks-client/src/*"],
+      "@nextflow/contracts": ["../../packages/contracts/src/index.ts"]
     }
   },
-  "include": ["vite.config.ts"]
+  "include": ["src", "vite.config.ts"]
 }

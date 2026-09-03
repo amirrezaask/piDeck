@@ -26,7 +26,7 @@ test("host restart preserves the routed terminal, retained output, and explicit 
     if (!terminal || !before?.activeSessionId || !before.activeTabId) {
       throw new Error("active terminal route is unavailable")
     }
-    const route = `/?s=${encodeURIComponent(before.activeSessionId)}&t=${encodeURIComponent(before.activeTabId)}&term=${encodeURIComponent(terminal.id)}`
+    const route = `/terminals?s=${encodeURIComponent(before.activeSessionId)}&t=${encodeURIComponent(before.activeTabId)}&term=${encodeURIComponent(terminal.id)}`
     await page.goto(`${harness.origin}${route}`, { waitUntil: "domcontentloaded" })
     await page.evaluate(() => window.__yaadeTest!.waitForReady())
 

@@ -38,7 +38,7 @@ The host emits the negotiated raw binary terminal stream. It omits the terminal-
 
 ## Verification
 
-Rust unit and integration coverage lives in `apps/server/src` and `apps/server/tests/server_parity.rs`. Linux, macOS, and Windows build/test coverage is enforced by the `runtime-platform` CI matrix. Browser, security, and service lifecycle suites launch the Rust executable directly.
+Rust unit coverage lives in `packages/yaade-server/src`; executable integration coverage lives in `apps/server/tests/server_parity.rs`. Linux, macOS, and Windows build/test coverage is enforced by the `runtime-platform` CI matrix. Browser, security, and service lifecycle suites launch the Rust executable directly.
 
 Useful commands:
 

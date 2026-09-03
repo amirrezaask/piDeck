@@ -10,6 +10,8 @@ packages/<name>/
   tests/         # co-located tests and fixtures
 ```
 
+Rust packages use `Cargo.toml` as the manifest and `src/lib.rs` as the public entry point.
+
 Import only through a package's entry points — its root files. Files in any package subfolder are private, including `lib/` and implementation files under `src/` in older packages. A package may expose several small entry points; explicitly discourage giant barrel files that re-export a whole subtree through one index.
 
 `lint:boundaries` enforces four rules: code outside a package can import only its root entry points; files within a package can import its own internals; tests use package entry points and may share their own test fixtures but may not deep-import package internals; and the dependency graph must not contain cycles.

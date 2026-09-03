@@ -7,7 +7,7 @@
     "start": "cargo run --release --manifest-path Cargo.toml -- serve",
     "build": "cargo build --release --locked --manifest-path Cargo.toml",
     "typecheck": "cargo check --manifest-path Cargo.toml",
-    "test": "cargo test --manifest-path Cargo.toml",
-    "lint": "cargo fmt --manifest-path Cargo.toml -- --check && cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings"
+    "test": "cargo test --locked --manifest-path ../../packages/yaade-server/Cargo.toml && cargo test --locked --manifest-path Cargo.toml",
+    "lint": "cargo fmt --manifest-path ../../packages/yaade-server/Cargo.toml -- --check && cargo clippy --locked --manifest-path ../../packages/yaade-server/Cargo.toml --all-targets -- -D warnings && cargo fmt --manifest-path Cargo.toml -- --check && cargo clippy --locked --manifest-path Cargo.toml --all-targets -- -D warnings"
   }
 }

@@ -1,9 +1,7 @@
 import { lazy, Suspense } from "react"
-import { LoaderCircle, RotateCcw, X } from "lucide-react"
+import { LoaderCircle } from "lucide-react"
 import type { MuxTerminal } from "@yaade/rpc"
 import type { YaadeTheme } from "@yaade/shared"
-import { Button } from "@yaade/ui/primitives"
-
 const TerminalPanel = lazy(() =>
   import("@yaade/ui/terminal").then(module => ({ default: module.TerminalPanel })),
 )
@@ -55,57 +53,14 @@ export function ProcessTerminalView({
           ? "Terminal process is unavailable"
           : "Starting terminal…"
 
-  if (processState === "interrupted" && interruptedHistoryId) {
-    return (
-      <div className="flex h-full min-h-0 flex-1 flex-col" data-yaade-terminal-interrupted="history">
-        <Suspense fallback={<div className="grid flex-1 place-items-center text-sm text-muted-foreground">Opening retained history…</div>}>
-          <TerminalPanel
-            cwdRootUri="file:///"
-            theme={theme}
-            tabId={terminal.id}
-            focused={focused}
-            isActive={visible}
-            existingPtyId={interruptedHistoryId}
-            sessionGeneration={terminal.output.generation}
-            status="exited"
-            readOnly
-            readOnlyMessage="Interrupted by host restart · retained output is read-only"
-            attachOnly
-            visible={visible}
-            onJumpToLive={onJumpToLive}
-            onRestart={onRestart}
-            onClose={onClose}
-          />
-        </Suspense>
-      </div>
-    )
-  }
-
-  if (processState === "interrupted") {
-    return (
-      <div
-        className="flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-4 px-4 text-center"
-        data-yaade-terminal-interrupted="unavailable"
-      >
-        <div className="max-w-md space-y-1.5" role="status">
-          <p className="text-sm font-medium text-foreground">Terminal ended when the host restarted</p>
-          <p className="text-sm text-muted-foreground">
-            Retained output is unavailable. Restarting opens a new shell; it does not resume the previous process.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center justify-center gap-2">
-          <Button type="button" size="sm" onClick={onRestart}>
-            <RotateCcw />
-            Restart terminal
-          </Button>
-          <Button type="button" size="sm" variant="outline" onClick={onClose}>
-            <X />
-            Close
-          </Button>
-        </div>
-      </div>
-    )
-  }
+  const interruptedState =
+    processState === "interrupted"
+      ? interruptedHistoryId
+        ? "history"
+        : "unavailable"
+      : undefined
+  const panelStatus = interruptedState === "history" ? "exited" : status
+  const panelPtyId = interruptedState === "history" ? interruptedHistoryId : terminal.output.ptyId
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
@@ -121,16 +76,25 @@ export function ProcessTerminalView({
           {statusMessage}
         </div>
       ) : (
-        <Suspense fallback={<div className="grid flex-1 place-items-center text-sm text-muted-foreground">Opening terminal…</div>}>
+        <Suspense
+          fallback={
+            <div className="grid flex-1 place-items-center text-sm text-muted-foreground">
+              {interruptedState === "history" ? "Opening retained history…" : "Opening terminal…"}
+            </div>
+          }
+        >
           <TerminalPanel
             cwdRootUri="file:///"
             theme={theme}
             tabId={terminal.id}
             focused={focused}
             isActive={visible}
-            existingPtyId={terminal.output.ptyId}
+            existingPtyId={panelPtyId}
             sessionGeneration={terminal.output.generation}
-            status={status}
+            status={panelStatus}
+            readOnly={interruptedState !== undefined}
+            readOnlyMessage="Interrupted by host restart · retained output is read-only"
+            interruptedState={interruptedState}
             attachOnly
             visible={visible}
             onTitleChange={(_id, title) => onTitleChange?.(title)}

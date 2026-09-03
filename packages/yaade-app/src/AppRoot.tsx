@@ -10,13 +10,17 @@ const GlassMaterialGallery = lazy(() => import("@yaade/ui/gallery"))
 /** The Session shell is now the only browser app surface. */
 export function AppRoot() {
   const [updateReady, setUpdateReady] = useState(isPwaUpdateReady)
-  window.__yaadeTest ??= basicTestBridge()
+  const testBridge = window.__yaadeTest ?? basicTestBridge()
+  window.__yaadeTest = testBridge
 
   useEffect(() => {
+    // StrictMode replays effect setup and cleanup without re-rendering. Restore
+    // the bridge during the second setup so clients never observe it missing.
+    window.__yaadeTest ??= testBridge
     return () => {
-      delete window.__yaadeTest
+      if (window.__yaadeTest === testBridge) delete window.__yaadeTest
     }
-  }, [])
+  }, [testBridge])
 
   useEffect(() => {
     const onUpdate = () => setUpdateReady(true)

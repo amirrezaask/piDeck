@@ -43,7 +43,7 @@ function distIsFresh(): boolean {
   const sources = [
     join(repoRoot, "package.json"),
     join(repoRoot, "pnpm-workspace.yaml"),
-    join(repoRoot, "apps", "yaade"),
+    join(repoRoot, "apps", "web"),
     join(repoRoot, "packages"),
   ]
   const acc = { value: 0 }
@@ -62,5 +62,5 @@ export default function globalSetup(): void {
     console.log("[global-setup] apps/web/dist is newer than sources; skipping SPA build")
     return
   }
-  execFileSync(vpBin, ["run", "--filter", "@yaade/web", "build"], { stdio: "inherit" })
+  execFileSync(vpBin, ["run", "--filter", "@pideck/client-web", "build"], { stdio: "inherit" })
 }

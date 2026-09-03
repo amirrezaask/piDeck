@@ -184,7 +184,7 @@ test('renders persisted and streamed PI events with chat primitives', async ({
   });
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/');
+  await page.goto('/agents');
   await page.getByRole('link', { name: 'Open Review the changes.' }).click();
   await expect(
     page.getByRole('heading', { name: 'Review the changes.', exact: true }),
@@ -252,7 +252,7 @@ test('renders persisted and streamed PI events with chat primitives', async ({
         .locator('form[aria-label="Chat with agent"] .bg-card')
         .evaluate((element) => getComputedStyle(element).backgroundColor),
     )
-    .toMatch(/oklch\(0\.205|rgb\((?:[0-6]?\d),/);
+    .toMatch(/oklch\(0\.205|lab\(7\.|rgb\((?:[0-6]?\d),/);
   await page.screenshot({
     path: `.impeccable/review/conversation-dark-${viewport}.png`,
     fullPage: true,
@@ -284,7 +284,7 @@ test('shows running agents in the overview and opens each run as a tab', async (
   await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, () => undefined);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/');
+  await page.goto('/agents');
   await expect(page.getByRole('heading', { name: 'Running agents' })).toBeVisible();
   await expect(page.getByRole('region', { name: 'Running agents' })).toContainText(
     'Review the changes.',
@@ -309,7 +309,7 @@ test('shows running agents in the overview and opens each run as a tab', async (
   });
 
   await runLink.click();
-  await expect(page).toHaveURL(new RegExp(`/sessions/${run.id}$`));
+  await expect(page).toHaveURL(new RegExp(`/agents/servers/local/sessions/${run.id}$`));
   await expect(page.getByRole('tablist')).toHaveCount(0);
   expect(errors).toEqual([]);
 });
@@ -337,7 +337,7 @@ test('accepts dropped images in the chat composer', async ({ page }, testInfo) =
   await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, () => undefined);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/');
+  await page.goto('/agents');
   await page.getByRole('link', { name: 'Open Review the changes.' }).click();
   await expect(page.getByRole('textbox', { name: 'Message agent' })).toBeVisible();
 
@@ -397,7 +397,7 @@ test('navigates skills and reports extension availability honestly', async ({ pa
   );
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/new');
+  await page.goto('/agents/new');
   await page.getByRole('button', { name: 'Open agent settings' }).click();
   const settings = page.getByRole('dialog', { name: 'Settings' });
   await expect(settings).toBeVisible();
@@ -478,7 +478,7 @@ test('chooses a saved project or prepares a new workspace', async ({ page }, tes
   );
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/new');
+  await page.goto('/agents/new');
   await page.getByRole('button', { name: 'Choose project' }).click();
   const picker = page.getByRole('dialog', { name: 'Choose project' });
   await expect(picker.getByRole('option', { name: /workspace/ })).toBeVisible();
@@ -534,7 +534,7 @@ test('adds a server and selects it in the composer', async ({ page }, testInfo) 
   );
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/new');
+  await page.goto('/agents/new');
   await page.getByRole('button', { name: 'Settings' }).click();
   const settings = page.getByRole('dialog', { name: 'Settings' });
   await settings.getByRole('button', { name: /^Servers/ }).click();
@@ -615,31 +615,30 @@ test('applies composer commands and completes @ file references in a new session
   });
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/new');
+  await page.goto('/agents/new');
   const composer = page.getByRole('textbox', { name: 'Session task' });
   const composerForm = page.getByRole('form', { name: 'New session composer' });
-  const sessionSettings = page.getByRole('group', { name: 'Session settings' });
-  await expect(sessionSettings).toBeVisible();
+  const agentSettings = page.getByRole('group', { name: 'Agent settings' });
+  const projectSettings = page.getByRole('group', { name: 'Project settings' });
+  await expect(agentSettings).toBeVisible();
+  await expect(projectSettings).toBeVisible();
   await expect
     .poll(() => composerForm.evaluate((element) => getComputedStyle(element).opacity))
     .toBe('1');
-  await expect
-    .poll(() => sessionSettings.evaluate((element) => element.scrollWidth <= element.clientWidth))
-    .toBe(true);
-  await expect
-    .poll(() =>
-      sessionSettings.evaluate(
-        (element) =>
-          new Set(
-            [...element.children].map((child) => Math.round(child.getBoundingClientRect().top)),
-          ).size,
-      ),
-    )
-    .toBeGreaterThan(1);
+
+  const layerOrder = await composerForm
+    .locator('fieldset, textarea')
+    .evaluateAll((elements) => elements.map((element) => element.getAttribute('aria-label')));
+  expect(layerOrder).toEqual(['Agent settings', 'Session task', 'Project settings']);
+  await expect(agentSettings.getByRole('combobox', { name: 'Agent profile' })).toBeVisible();
+  await expect(agentSettings.getByRole('combobox', { name: 'Model' })).toBeVisible();
+  await expect(agentSettings.getByRole('combobox', { name: 'Thinking level' })).toBeVisible();
+  await expect(projectSettings.getByRole('button', { name: 'Choose project' })).toBeVisible();
+  await expect(projectSettings.getByRole('combobox', { name: 'Execution mode' })).toBeVisible();
 
   mkdirSync('.impeccable/review', { recursive: true });
   await page.screenshot({
-    path: `.impeccable/review/composer-wrapped-settings-${testInfo.project.name}.png`,
+    path: `.impeccable/review/composer-layered-settings-${testInfo.project.name}.png`,
     fullPage: true,
   });
 
@@ -694,7 +693,8 @@ test('switches sessions from the global command palette', async ({ page }, testI
   );
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/');
+  await page.goto('/agents');
+  await expect(page.getByRole('heading', { name: 'Running agents' })).toBeVisible();
   await page.keyboard.press('Control+K');
   const palette = page.getByRole('dialog', { name: 'Switch session' });
   await expect(palette).toBeVisible();
@@ -705,7 +705,7 @@ test('switches sessions from the global command palette', async ({ page }, testI
     palette.getByRole('option', { name: /Fleet|Inbox|Settings|New session/ }),
   ).toHaveCount(0);
   await result.click();
-  await expect(page).toHaveURL(new RegExp(`/sessions/${run.id}$`));
+  await expect(page).toHaveURL(new RegExp(`/agents/servers/local/sessions/${run.id}$`));
   await expect(page.getByRole('heading', { name: 'Review the changes.' })).toBeVisible();
   await expect(page.getByRole('form', { name: 'Chat with agent' })).toHaveCSS('opacity', '1');
   expect(errors).toEqual([]);
@@ -749,7 +749,7 @@ test('creates an agent and starts a managed run', async ({ page }, testInfo) => 
   await page.routeWebSocket(`**/v1/runs/${run.id}/stream?**`, () => undefined);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/new');
+  await page.goto('/agents/new');
   await page.getByRole('button', { name: 'Open agent settings' }).click();
   const settingsDialog = page.getByRole('dialog', { name: 'Settings' });
   await expect(settingsDialog).toBeVisible();

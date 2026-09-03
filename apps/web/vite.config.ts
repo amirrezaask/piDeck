@@ -1,88 +1,70 @@
-import { defineConfig, type Plugin } from "vite-plus";
-import react from "@vitejs/plugin-react";
-import tailwindcss from "@tailwindcss/vite";
-import path from "node:path";
-import { applyDevBuildBrandingToHtml } from "../../packages/yaade-app/src/build-branding-html.js";
+import path from "node:path"
+import react from "@vitejs/plugin-react"
+import tailwindcss from "@tailwindcss/vite"
+import { defineConfig, type Plugin } from "vite-plus"
 
-const appRoot = path.resolve(__dirname, "../../packages/yaade-app");
-const uiRoot = path.resolve(__dirname, "../../packages/yaade-ui/src");
-
-const browserTargets = ["chrome107", "edge107", "firefox104", "safari16"];
-const viteHost = process.env.YAADE_WEB_HOST ?? process.env.YAADE_HOST ?? "127.0.0.1";
+const repoRoot = path.resolve(import.meta.dirname, "../..")
+const agentsRoot = path.join(repoRoot, "packages/agents-client/src")
+const tasksRoot = path.join(repoRoot, "packages/tasks-client/src")
+const browserTargets = ["chrome107", "edge107", "firefox104", "safari16"]
+const viteHost = process.env.YAADE_WEB_HOST ?? process.env.YAADE_HOST ?? "127.0.0.1"
 const rawProxyHost =
   process.env.YAADE_PROXY_HOST ??
-  (viteHost === "0.0.0.0" || viteHost === "::" ? "127.0.0.1" : viteHost);
+  (viteHost === "0.0.0.0" || viteHost === "::" ? "127.0.0.1" : viteHost)
 const proxyHost =
-  rawProxyHost.includes(":") && !rawProxyHost.startsWith("[") ? `[${rawProxyHost}]` : rawProxyHost;
+  rawProxyHost.includes(":") && !rawProxyHost.startsWith("[") ? `[${rawProxyHost}]` : rawProxyHost
+const serverOrigin = `http://${proxyHost}:${process.env.YAADE_PORT ?? 7774}`
 const configuredAllowedHosts = (process.env.YAADE_ALLOWED_HOSTS ?? "")
   .split(",")
-  .map((host) => host.trim())
-  .filter(Boolean);
+  .map(host => host.trim())
+  .filter(Boolean)
 const isLoopbackHost = (host: string): boolean =>
   ["localhost", "127.0.0.1", "::1"].includes(
-    host
-      .trim()
-      .toLowerCase()
-      .replace(/^\[|\]$/g, ""),
-  );
+    host.trim().toLowerCase().replace(/^\[|\]$/g, ""),
+  )
 const allowedHosts =
   configuredAllowedHosts.length > 0
     ? configuredAllowedHosts
     : isLoopbackHost(viteHost)
       ? ["ide.local"]
-      : true;
-
-function yaadeBuildBranding(command: "build" | "serve"): Plugin {
-  return {
-    name: "yaade-build-branding",
-    transformIndexHtml(html) {
-      // `vite` / `vite --mode development` → badged favicon + DEV title seed.
-      // Production `vite build` keeps the release icons in index.html as-is.
-      if (command !== "serve") return html;
-      return applyDevBuildBrandingToHtml(html);
-    },
-  };
+      : true
+const hostProxy = {
+  "^/terminal(?:/|$)": { target: serverOrigin, ws: true },
+  "/tasks/api": { target: serverOrigin, changeOrigin: true },
+  "/agents/v1": { target: serverOrigin, changeOrigin: true, ws: true },
 }
 
-export default defineConfig(({ command }) => ({
+export default defineConfig({
   base: "/",
   build: {
     target: browserTargets,
     cssTarget: browserTargets,
-    outDir: path.resolve(__dirname, "dist"),
+    outDir: "dist",
     emptyOutDir: true,
-    rolldownOptions: {
-      input: { index: path.resolve(appRoot, "index.html") },
-
-    },
   },
   plugins: [
-    yaadeBuildBranding(command),
-    // The app still contains imperative integrations and third-party hooks that
-    // are not safe for infer-mode compilation. Adopt the compiler explicitly
-    // with "use memo" once a component has been audited.
     react({ compiler: { compilationMode: "annotation" } }) as unknown as Plugin,
     tailwindcss() as unknown as Plugin,
   ],
-  root: appRoot,
+  publicDir: path.join(repoRoot, "packages/yaade-app/public"),
   resolve: {
+    dedupe: ["react", "react-dom", "motion", "framer-motion"],
     alias: {
-      "@yaade/ui/styles.css": path.resolve(uiRoot, "styles/globals.css"),
-      "@": uiRoot,
+      "@agents": agentsRoot,
+      "@tasks": tasksRoot,
+      "@": path.join(repoRoot, "packages/yaade-ui/src"),
+      "@nextflow/contracts": path.join(repoRoot, "packages/contracts/src/index.ts"),
     },
   },
   server: {
     port: Number(process.env.YAADE_WEB_PORT ?? 5174),
-    // Tauri's dev shell targets this exact URL, so never silently move ports.
     strictPort: true,
     host: viteHost,
     allowedHosts,
-    proxy: {
-      "/terminal": {
-        target: `http://${proxyHost}:${process.env.YAADE_PORT ?? 7774}`,
-        ws: true,
-      },
-    },
+    proxy: hostProxy,
+  },
+  preview: {
+    proxy: hostProxy,
   },
   clearScreen: false,
-}));
+})

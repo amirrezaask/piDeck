@@ -26,7 +26,8 @@ function run(command, args) {
   if (result.status !== 0) process.exit(result.status ?? 1)
 }
 
-run(vpBin, ["run", "@yaade/web#build"])
+run(vpBin, ["run", "@pideck/client-web#build"])
+run("pnpm", ["build:agents-switcher"])
 run("cargo", [
   "build",
   "--release",

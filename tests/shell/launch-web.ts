@@ -25,6 +25,8 @@ export type LaunchWebOptions = {
   launchWithoutWorkspace?: boolean
   /** Allow AppRoot to stop at its actionable route error screen. */
   expectBootError?: boolean
+  /** Wait for the initial terminal surface. Defaults to true on terminal routes. */
+  withTerminal?: boolean
   /** Browser pathname to open. Defaults to the terminal multiplexer root. */
   startPath?: string
   /**
@@ -292,7 +294,7 @@ export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchS
     })
   })
 
-  const startPath = options.startPath ?? "/"
+  const startPath = options.startPath ?? "/terminals"
   const startUrl = `${url}${startPath.startsWith("/") ? startPath : `/${startPath}`}`
   await browserPage.goto(startUrl, { waitUntil: "domcontentloaded" })
   if (options.expectBootError) {
@@ -303,6 +305,12 @@ export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchS
   } else {
     await browserPage.waitForFunction(() => window.__yaadeTest != null, null, { timeout: 30_000 })
     await browserPage.evaluate(() => window.__yaadeTest!.waitForReady())
+    if (options.withTerminal !== false && startPath.startsWith("/terminals")) {
+      await browserPage.locator("[data-yaade-terminal-panel]").waitFor({
+        state: "visible",
+        timeout: 30_000,
+      })
+    }
   }
 
   return {
