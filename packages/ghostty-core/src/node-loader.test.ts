@@ -21,6 +21,7 @@ test("Node loader instantiates the pinned Ghostty core without browser globals",
   )
   try {
     core.write("hello\n世界")
+    assert.equal(core.selectionText(), "")
     const snapshot = core.snapshot(false)
     assert.equal(snapshot.cols, 20)
     assert.equal(snapshot.rows, 3)
@@ -53,6 +54,42 @@ test("Node loader instantiates the pinned Ghostty core without browser globals",
   renderOnly.write("\u001b[0c")
   renderOnly.dispose()
   assert.equal(responses, 0)
+})
+
+test("binary snapshots restore unfinished parser state atomically", async () => {
+  const source = await nodeGhosttyWasmSource()
+  const core = await GhosttyTerminalCore.create(
+    20,
+    3,
+    8,
+    16,
+    {
+      foreground: { r: 229, g: 231, b: 235 },
+      background: { r: 0, g: 0, b: 0 },
+      cursor: { r: 229, g: 231, b: 235 },
+    },
+    () => undefined,
+    source,
+    "render-only",
+  )
+  try {
+    core.write("before\r\n\u001b]2;split")
+    const binary = core.binarySnapshot(4 * 1024 * 1024)
+    assert.equal(new TextDecoder().decode(binary.subarray(0, 8)), "GHOSTSNP")
+
+    core.write(" first\u001b\\")
+    assert.equal(core.title(), "split first")
+    core.restoreBinarySnapshot(binary)
+    core.write(" restored\u001b\\")
+    assert.equal(core.title(), "split restored")
+
+    const corrupt = Uint8Array.from(binary)
+    corrupt[corrupt.length - 1] ^= 0xff
+    assert.throws(() => core.restoreBinarySnapshot(corrupt))
+    assert.equal(core.title(), "split restored")
+  } finally {
+    core.dispose()
+  }
 })
 
 test("packed render updates retain the same Ghostty viewport semantics", async () => {

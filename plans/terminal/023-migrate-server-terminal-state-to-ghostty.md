@@ -44,13 +44,11 @@
 
 ## Resolved blocker (2026-09-03)
 
-The pinned public `libghostty-vt` terminal stream discarded OSC 4/10/11/12 color
-query actions even though Ghostty's application stream handler answered them.
-The repository now applies
-`patches/ghostty/lib-vt-osc-color-reports.patch` during source preparation. The
-patch emits Ghostty's default 16-bit reports through the existing bounded
-write-PTY effect. Native and WASM builds verify and consume the same patched
-source tree, and their shared corpus matches.
+The original pin discarded OSC 4/10/11/12 color-query actions in the public
+terminal stream, so this plan initially shipped a local patch. Revision
+`07bccf7a311acdfa6afc77f2016160d49b1f1982` provides equivalent public behavior
+upstream. The patch has been removed, source preparation requires a clean
+checkout, and native/WASM corpus parity still passes.
 
 This keeps the server on one parser. No compatibility scanner remains. Focused
 browser tests now pass background queries and DEC 2031 theme-change workflows.
@@ -88,14 +86,13 @@ baseline described by the original plan:
   `theme_updates_enabled`, and `Option<vt100::Parser>`.
 - `resize_terminal` resizes the PTY and the `vt100` screen in the same owner
   turn; command batching preserves latest-wins resize behavior.
-- checkpoint v1 remains synthetic VT bootstrap bytes consumed by web and GPUI
-  clients. Plan 024, not this migration, decides whether true parser restore is
-  feasible.
+- Plan 024 subsequently replaced checkpoint-v1 formatter output with bounded
+  public Ghostty snapshots and atomic browser restore.
 - `crates/ghostty-vt` already exposes a bounded, thread-confined `Terminal`,
   public state, VT formatter, resize/reset, modes, colors, title/cwd effects,
   bells, host-query callbacks, and exact write-PTY response bytes.
-- Plan 022 parity passes on Linux, macOS, and Windows at Ghostty revision
-  `9f62873bf195e4d8a762d768a1405a5f2f7b1697`.
+- Plan 022 parity has been revalidated at Ghostty revision
+  `07bccf7a311acdfa6afc77f2016160d49b1f1982`.
 
 ## Target architecture
 
@@ -106,7 +103,7 @@ bounded PTY reader Bytes
        -> copy/drain bounded effects after write returns
             write-PTY bytes -> same owner-held PTY writer, before later input
             title/cwd/bell  -> bounded owner metadata/events
-       -> optional public VT formatter -> checkpoint-v1 synthetic bootstrap
+       -> public snapshot encoder -> checkpoint-v2 opaque memento
        -> original Bytes -> replay -> history -> live fan-out
 
 resize owner turn

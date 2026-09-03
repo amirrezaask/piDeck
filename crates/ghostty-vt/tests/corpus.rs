@@ -1474,6 +1474,95 @@ fn corpus_manifest_accepts_reviewed_fixtures_and_rejects_malformed_inputs() {
 }
 
 #[test]
+fn every_fixture_restores_and_continues_from_a_binary_snapshot() {
+    let corpus = load_corpus(&corpus_root()).expect("reviewed corpus must load");
+    for fixture in &corpus.fixtures {
+        let options = &fixture.definition.initial;
+        let make_terminal = || {
+            let effects = effect_options(&options.host, &corpus.manifest.limits)?;
+            let mut terminal = Terminal::new(TerminalOptions {
+                cols: options.columns,
+                rows: options.rows,
+                scrollback: options.scrollback,
+                effects,
+            })
+            .map_err(|error| error.to_string())?;
+            terminal
+                .set_default_cursor_blink(options.default_cursor_blink)
+                .map_err(|error| error.to_string())?;
+            apply_theme(&mut terminal, &options.theme, &fixture.definition.id)?;
+            terminal
+                .resize(
+                    options.columns,
+                    options.rows,
+                    options.cell_width,
+                    options.cell_height,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(terminal)
+        };
+
+        let split = fixture.payload.len() / 2;
+        let mut uninterrupted = make_terminal().expect("uninterrupted terminal");
+        uninterrupted
+            .write(&fixture.payload[..split])
+            .expect("prefix write");
+        let snapshot = uninterrupted
+            .snapshot(HARD_MAX_OBSERVATION_BYTES)
+            .expect("snapshot encode");
+        let effects =
+            effect_options(&options.host, &corpus.manifest.limits).expect("restored effects");
+        let mut restored = Terminal::from_snapshot(&snapshot, effects).expect("snapshot restore");
+
+        let expected_effects = uninterrupted
+            .write(&fixture.payload[split..])
+            .expect("uninterrupted suffix")
+            .pty_responses()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        let restored_effects = restored
+            .write(&fixture.payload[split..])
+            .expect("restored suffix")
+            .pty_responses()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored_effects, expected_effects,
+            "{} effects",
+            fixture.definition.id
+        );
+        assert_eq!(
+            restored.state().expect("restored state"),
+            uninterrupted.state().expect("uninterrupted state"),
+            "{} state",
+            fixture.definition.id,
+        );
+        let expected = observe(
+            &mut uninterrupted,
+            &corpus.manifest,
+            "snapshot-continuation",
+            fixture.definition.events.len(),
+            &[],
+        )
+        .expect("uninterrupted observation");
+        let actual = observe(
+            &mut restored,
+            &corpus.manifest,
+            "snapshot-continuation",
+            fixture.definition.events.len(),
+            &[],
+        )
+        .expect("restored observation");
+        assert_eq!(
+            serde_json::to_value(actual).expect("actual JSON"),
+            serde_json::to_value(expected).expect("expected JSON"),
+            "{} render state",
+            fixture.definition.id,
+        );
+    }
+}
+
+#[test]
 fn corpus_native_assertions_and_optional_export() {
     let corpus = load_corpus(&corpus_root()).expect("reviewed corpus must load");
     let output = run_corpus(&corpus).expect("native corpus must satisfy hand-authored assertions");

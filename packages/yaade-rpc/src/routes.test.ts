@@ -2,6 +2,11 @@ import assert from "node:assert/strict"
 import { test } from "vite-plus/test"
 import { MoveTerminalToTab } from "./mux-session.js"
 import {
+  GHOSTTY_ENGINE_REVISION,
+  TERMINAL_CHECKPOINT_MAGIC,
+  TERMINAL_CHECKPOINT_VERSION,
+} from "./host.js"
+import {
   decodeHostRouteArgs,
   decodeHostRouteResult,
   getHostRoute,
@@ -113,6 +118,55 @@ test("terminal attach preserves the owner identity used by binary snapshots", ()
   const control = terminalAttachControlResult(encoded)
   assert.ok(control)
   assert.equal("semanticSnapshot" in control, false)
+})
+
+test("terminal checkpoints preserve compatibility metadata and reject unsafe bounds", () => {
+  const checkpoint = {
+    magic: TERMINAL_CHECKPOINT_MAGIC,
+    checkpointVersion: TERMINAL_CHECKPOINT_VERSION,
+    terminalEpoch: "terminal-epoch",
+    sequence: 12,
+    cols: 80,
+    rows: 24,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    engine: "ghostty-vt",
+    engineRevision: GHOSTTY_ENGINE_REVISION,
+    snapshotFormatVersion: 1,
+    codec: "none",
+    payloadBytes: 10,
+    payloadSha256: "0".repeat(64),
+    snapshotBytes: "R0hPU1RTTlABAA==",
+  }
+  const attach = {
+    id: "pty-1",
+    title: null,
+    terminalEpoch: "terminal-epoch",
+    checkpoint,
+    replayQuality: "checkpoint",
+    outputChunks: [],
+    output: "",
+    replayTruncated: true,
+    replayNeedsQueryResponses: false,
+    archiveAvailable: true,
+    lastSequence: 12,
+    cols: 80,
+    rows: 24,
+    status: "running",
+    exitCode: null,
+    signal: null,
+  }
+  assert.ok(decodeHostRouteResult("terminal:attach", attach)?.checkpoint)
+  assert.equal(
+    decodeHostRouteResult("terminal:attach", {
+      ...attach,
+      checkpoint: { ...checkpoint, engineRevision: "other" },
+    })?.checkpoint?.engineRevision,
+    "other",
+  )
+  assert.throws(() => decodeHostRouteResult("terminal:attach", {
+    ...attach,
+    checkpoint: { ...checkpoint, payloadBytes: 384 * 1024 + 1 },
+  }))
 })
 
 test("hot terminal routes are selected from the same registry", () => {

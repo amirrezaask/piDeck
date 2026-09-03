@@ -34,8 +34,20 @@ test('loads Switcher, uses one isolated overlay, manages tabs, and opens the res
       await invoker.evaluate(() => chrome.runtime.sendMessage({ type: 'test/invoke' }));
     };
 
+    await invoker.evaluate(async () => {
+      const tabs = await chrome.tabs.query({ title: 'Dispatch' });
+      const tabId = tabs[0]?.id;
+      if (tabId === undefined) throw new Error('Dispatch tab was not found.');
+      await chrome.tabs.setZoom(tabId, 1.5);
+    });
     await invoke();
     const search = first.getByRole('combobox', { name: 'Search tabs' });
+    const overlay = first.getByTestId('switcher-overlay');
+    await expect(overlay).toHaveAttribute('style', /transform: scale\(0\.666/);
+    const compensatedWidth = await first.evaluate(() => window.innerWidth * 1.5);
+    await expect
+      .poll(() => overlay.evaluate((element) => Number.parseFloat(element.style.width)))
+      .toBeCloseTo(compensatedWidth, 0);
     await expect(search).toBeVisible();
     await expect(first.locator('.switcher-root')).toHaveAttribute('dir', 'ltr');
     await expect(first.getByRole('option')).toHaveCount(0);
@@ -69,7 +81,30 @@ test('loads Switcher, uses one isolated overlay, manages tabs, and opens the res
     await grafanaRow.getByRole('button', { name: 'Close tab' }).click();
     await expect.poll(() => second.isClosed()).toBe(true);
 
-    await first.keyboard.press('Escape');
+    await invoke();
+    await expect(overlay).toBeHidden();
+    await invoke();
+    const shortcutSearch = first.getByRole('combobox', { name: 'Search tabs' });
+    await expect(shortcutSearch).toBeVisible();
+    await shortcutSearch.fill('dispatch');
+    await first
+      .getByRole('button', { name: 'Customize Switcher keyboard shortcut' })
+      .dispatchEvent('click');
+    await expect
+      .poll(() =>
+        invoker.evaluate(async () => {
+          const tabs = await chrome.tabs.query({});
+          return tabs.some((tab) => tab.url === 'chrome://extensions/shortcuts');
+        }),
+      )
+      .toBe(true);
+    const shortcutSettingsTabId = await invoker.evaluate(async () => {
+      const tabs = await chrome.tabs.query({});
+      return tabs.find((tab) => tab.url === 'chrome://extensions/shortcuts')?.id;
+    });
+    if (shortcutSettingsTabId !== undefined)
+      await invoker.evaluate((tabId) => chrome.tabs.remove(tabId), shortcutSettingsTabId);
+
     const chromePage = await context.newPage();
     await chromePage.goto('chrome://extensions');
     await chromePage.bringToFront();

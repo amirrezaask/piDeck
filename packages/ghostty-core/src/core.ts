@@ -24,6 +24,7 @@ const GHOSTTY_SUCCESS = 0;
 const GHOSTTY_OUT_OF_SPACE = -3;
 const GHOSTTY_NO_VALUE = -4;
 const MAX_SCROLLBACK_ROWS = 10_000;
+const MAX_CONTINUATION_BYTES = 1024 * 1024;
 const INITIAL_IO_BUFFER_SIZE = 64;
 const CELL_META_COUNT = 2;
 const CELL_META_KEYS_SIZE = CELL_META_COUNT * 4;
@@ -302,21 +303,25 @@ export class GhosttyTerminalCore {
     onPtyData: (data: string) => void,
     responsePolicy: GhosttyResponsePolicy,
   ): void {
-    const optionsSize = this.runtime.layout("GhosttyTerminalOptions").size;
-    const options = this.runtime.alloc(optionsSize);
-    this.runtime.setField(options, "GhosttyTerminalOptions", "cols", cols);
-    this.runtime.setField(options, "GhosttyTerminalOptions", "rows", rows);
-    this.runtime.setField(
-      options,
-      "GhosttyTerminalOptions",
-      "max_scrollback",
-      MAX_SCROLLBACK_ROWS,
-    );
     this.terminalSlot = this.runtime.allocOpaque();
-    const terminalResult = this.runtime.call("ghostty_terminal_new", 0, this.terminalSlot, options);
-    this.runtime.free(options, optionsSize);
-    this.assertSuccess("ghostty_terminal_new", terminalResult);
+    this.assertSuccess(
+      "ghostty_terminal_new",
+      this.runtime.call("ghostty_terminal_new", 0, this.terminalSlot, cols, rows),
+    );
     this.terminal = this.runtime.readPointer(this.terminalSlot);
+    const sizeValue = this.runtime.alloc(4);
+    const sizeView = this.runtime.view(sizeValue, 4);
+    sizeView.setUint32(0, MAX_SCROLLBACK_ROWS, true);
+    this.assertSuccess(
+      "ghostty_terminal_set(scrollback)",
+      this.runtime.call("ghostty_terminal_set", this.terminal, 28, sizeValue),
+    );
+    sizeView.setUint32(0, MAX_CONTINUATION_BYTES, true);
+    this.assertSuccess(
+      "ghostty_terminal_set(continuation)",
+      this.runtime.call("ghostty_terminal_set", this.terminal, 31, sizeValue),
+    );
+    this.runtime.free(sizeValue, 4);
     this.applyDefaultCursorBlink();
     this.ptyWriter = responsePolicy === "authoritative" ? onPtyData : null;
     if (this.ptyWriter) {
@@ -381,7 +386,7 @@ export class GhosttyTerminalCore {
     values.setUint32(0, this.scratch, true);
     values.setUint32(4, this.scratch + 4, true);
     this.rowSelection = this.runtime.alloc(ROW_SELECTION_SIZE);
-    this.encodedSize = this.runtime.call("ghostty_wasm_alloc_usize");
+    this.encodedSize = this.runtime.alloc(4);
     this.ensureIoBuffer(INITIAL_IO_BUFFER_SIZE);
     this.ensureEncodeBuffer(INITIAL_IO_BUFFER_SIZE);
     const mouseSizeLayout = this.runtime.layout("GhosttyMouseEncoderSize");
@@ -401,6 +406,115 @@ export class GhosttyTerminalCore {
     this.ensureIoBuffer(bytes.length);
     this.runtime.bytes(this.ioBuffer, bytes.length).set(bytes);
     this.runtime.call("ghostty_terminal_vt_write", this.terminal, this.ioBuffer, bytes.length);
+  }
+
+  /** Encode complete terminal and parser state using Ghostty's binary snapshot format. */
+  binarySnapshot(maxBytes: number): Uint8Array {
+    this.ensureActive();
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > 0xffff_ffff) {
+      throw new Error(`invalid Ghostty snapshot limit: ${maxBytes}`);
+    }
+    const written = this.runtime.alloc(4);
+    try {
+      const sizing = this.runtime.call(
+        "ghostty_snapshot_encode_buf",
+        this.terminal,
+        0,
+        0,
+        written,
+      );
+      if (sizing !== GHOSTTY_OUT_OF_SPACE && sizing !== GHOSTTY_SUCCESS) {
+        this.assertSuccess("ghostty_snapshot_encode_buf(size)", sizing);
+      }
+      const required = this.runtime.view(written, 4).getUint32(0, true);
+      if (required > maxBytes) {
+        throw new Error(`Ghostty snapshot requires ${required} bytes, limit is ${maxBytes}`);
+      }
+      const output = this.runtime.alloc(required);
+      try {
+        this.assertSuccess(
+          "ghostty_snapshot_encode_buf",
+          this.runtime.call(
+            "ghostty_snapshot_encode_buf",
+            this.terminal,
+            output,
+            required,
+            written,
+          ),
+        );
+        const length = this.runtime.view(written, 4).getUint32(0, true);
+        if (length > required) throw new Error("Ghostty snapshot exceeded its sized buffer");
+        return Uint8Array.from(this.runtime.bytes(output, length));
+      } finally {
+        this.runtime.free(output, required);
+      }
+    } finally {
+      this.runtime.free(written, 4);
+    }
+  }
+
+  /** Atomically replace this replica with a validated complete Ghostty snapshot. */
+  restoreBinarySnapshot(snapshot: Uint8Array): void {
+    this.ensureActive();
+    if (snapshot.length === 0) throw new Error("Ghostty snapshot is empty");
+    const input = this.runtime.alloc(snapshot.length);
+    this.runtime.bytes(input, snapshot.length).set(snapshot);
+    const decoderSlot = this.runtime.allocOpaque();
+    const terminalSlot = this.runtime.allocOpaque();
+    let decoder = 0;
+    let restored = 0;
+    try {
+      this.assertSuccess(
+        "ghostty_snapshot_decoder_new_buf",
+        this.runtime.call(
+          "ghostty_snapshot_decoder_new_buf",
+          0,
+          decoderSlot,
+          input,
+          snapshot.length,
+        ),
+      );
+      decoder = this.runtime.readPointer(decoderSlot);
+      const option = this.runtime.alloc(4);
+      try {
+        this.runtime.view(option, 4).setUint32(0, MAX_CONTINUATION_BYTES, true);
+        this.assertSuccess(
+          "ghostty_snapshot_decoder_set(max_continuation)",
+          this.runtime.call("ghostty_snapshot_decoder_set", decoder, 0, option),
+        );
+        this.runtime.bytes(option, 1)[0] = 1;
+        this.assertSuccess(
+          "ghostty_snapshot_decoder_set(retain_continuation)",
+          this.runtime.call("ghostty_snapshot_decoder_set", decoder, 1, option),
+        );
+      } finally {
+        this.runtime.free(option, 4);
+      }
+      this.assertSuccess(
+        "ghostty_snapshot_decoder_decode",
+        this.runtime.call("ghostty_snapshot_decoder_decode", decoder, terminalSlot),
+      );
+      restored = this.runtime.readPointer(terminalSlot);
+      if (restored === 0) throw new Error("Ghostty snapshot decoder returned a null terminal");
+
+      if (this.ptyWriterId !== 0) {
+        this.runtime.detachPtyWriter(this.terminal, this.ptyWriterId);
+        this.ptyWriterId = 0;
+      }
+      this.runtime.call("ghostty_terminal_free", this.terminal);
+      this.terminal = restored;
+      restored = 0;
+      if (this.ptyWriter) {
+        this.ptyWriterId = this.runtime.attachPtyWriter(this.terminal, this.ptyWriter);
+      }
+      this.rows = [];
+    } finally {
+      if (restored !== 0) this.runtime.call("ghostty_terminal_free", restored);
+      if (decoder !== 0) this.runtime.call("ghostty_snapshot_decoder_free", decoder);
+      this.runtime.freeOpaque(terminalSlot);
+      this.runtime.freeOpaque(decoderSlot);
+      this.runtime.free(input, snapshot.length);
+    }
   }
 
   /**
@@ -772,7 +886,7 @@ export class GhosttyTerminalCore {
   hyperlinkAt(col: number, row: number): string | null {
     this.ensureActive();
     const ref = this.gridRef(col, row);
-    const written = this.runtime.call("ghostty_wasm_alloc_usize");
+    const written = this.runtime.alloc(4);
     const sizeResult = this.runtime.call("ghostty_grid_ref_hyperlink_uri", ref, 0, 0, written);
     const outputSize = this.runtime.view(written, 4).getUint32(0, true);
     let hyperlink: string | null = null;
@@ -791,7 +905,7 @@ export class GhosttyTerminalCore {
       }
       this.runtime.free(output, outputSize);
     }
-    this.runtime.call("ghostty_wasm_free_usize", written);
+    this.runtime.free(written, 4);
     this.runtime.free(ref, this.runtime.layout("GhosttyGridRef").size);
     return hyperlink;
   }
@@ -966,7 +1080,7 @@ export class GhosttyTerminalCore {
     optionsView.setUint8(8, 1);
     optionsView.setUint8(9, 1);
     optionsView.setUint32(12, 0, true);
-    const written = this.runtime.call("ghostty_wasm_alloc_usize");
+    const written = this.runtime.alloc(4);
     const sizeResult = this.runtime.call(
       "ghostty_terminal_selection_format_buf",
       this.terminal,
@@ -993,7 +1107,7 @@ export class GhosttyTerminalCore {
       }
       this.runtime.free(output, outputSize);
     }
-    this.runtime.call("ghostty_wasm_free_usize", written);
+    this.runtime.free(written, 4);
     this.runtime.free(options, SELECTION_FORMAT_OPTIONS_SIZE);
     return text;
   }
@@ -1049,7 +1163,7 @@ export class GhosttyTerminalCore {
     if (this.ioBuffer) this.runtime.free(this.ioBuffer, this.ioBufferCapacity);
     if (this.encodeBuffer) this.runtime.free(this.encodeBuffer, this.encodeBufferCapacity);
     if (this.graphemeBuffer) this.runtime.free(this.graphemeBuffer, this.graphemeBufferCapacity * 4);
-    if (this.encodedSize) this.runtime.call("ghostty_wasm_free_usize", this.encodedSize);
+    if (this.encodedSize) this.runtime.free(this.encodedSize, 4);
     if (this.mouseSize) this.runtime.free(this.mouseSize, this.mouseSizeSize);
     if (this.mousePosition) this.runtime.free(this.mousePosition, this.mousePositionSize);
     if (this.scratch) this.runtime.free(this.scratch, 16);
@@ -1394,10 +1508,12 @@ export class GhosttyTerminalCore {
 
   private readMode(mode: number): boolean {
     this.ensureActive();
-    this.runtime.bytes(this.scratch, 1)[0] = 0;
+    const config = this.runtime.view(this.scratch, 4);
+    config.setUint16(0, mode, true);
+    config.setUint8(2, 0);
     return (
-      this.runtime.call("ghostty_terminal_mode_get", this.terminal, mode, this.scratch) ===
-        GHOSTTY_SUCCESS && this.runtime.bytes(this.scratch, 1)[0] !== 0
+      this.runtime.call("ghostty_terminal_get", this.terminal, 37, this.scratch) ===
+        GHOSTTY_SUCCESS && config.getUint8(2) !== 0
     );
   }
 

@@ -28,7 +28,7 @@ The terminal interface hides Unix PTY and Windows ConPTY differences. Client dis
 
 The host emits the negotiated raw binary terminal stream. It omits the terminal-level semantic `protocolVersion` and rejects explicit `semantic` or `both` attaches until semantic transport lands. Native Ghostty owns server-side parsing, query effects, title and working-directory metadata, modes, resize state, and bounded synthetic replay checkpoints. The server has no `vt100` parser or parallel OSC/query scanner.
 
-The repository applies `patches/ghostty/lib-vt-osc-color-reports.patch` to the pinned Ghostty revision during source preparation. The patch makes the public terminal stream emit Ghostty's 16-bit OSC 4/10/11/12 color reports through its existing write-PTY effect. Preparation and native builds verify the exact patch bytes, include the patch identity in cache keys, and reject modified source trees. Native and WASM builds consume the same patched source.
+The pinned Ghostty revision provides OSC 4/10/11/12 color responses, complete terminal snapshots, parser continuation restore, and scrollback compression through public libghostty-vt APIs. Source preparation requires a clean checkout; native and WASM builds consume the same revision.
 
 ## Implemented behavior
 

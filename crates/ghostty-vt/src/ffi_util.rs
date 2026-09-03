@@ -50,6 +50,9 @@ pub(crate) fn ffi_result(
             limit: 0,
         }),
         ffi::Result::NO_VALUE => Err(GhosttyError::NoValue { operation }),
+        ffi::Result::IO_ERROR => Err(GhosttyError::Io { operation }),
+        ffi::Result::LIMIT_EXCEEDED => Err(GhosttyError::LimitExceeded { operation }),
+        ffi::Result::REJECTED => Err(GhosttyError::Rejected { operation }),
         unknown => Err(GhosttyError::AbiViolation {
             operation,
             violation: AbiViolation::UnknownResult(unknown),

@@ -1,22 +1,49 @@
 import assert from "node:assert/strict"
 import { test } from "vite-plus/test"
+import {
+  GHOSTTY_ENGINE_REVISION,
+  TERMINAL_CHECKPOINT_MAGIC,
+  TERMINAL_CHECKPOINT_VERSION,
+  type TerminalCheckpoint,
+} from "@yaade/rpc"
 import type { YaadeHostTransport } from "./transport.js"
 import { createYaadeApi } from "./create-yaade-api.js"
 
 const encode = (value: string): Uint8Array => new TextEncoder().encode(value)
 const decode = (value: Uint8Array): string => new TextDecoder().decode(value)
 
+async function checkpoint(
+  terminalEpoch: string,
+  sequence: number,
+): Promise<TerminalCheckpoint> {
+  const snapshotBytes = new Uint8Array([
+    ...encode("GHOSTSNP"), 1, 0, 1, 2, 3, 4,
+  ])
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", snapshotBytes))
+  let payloadSha256 = ""
+  for (const byte of digest) payloadSha256 += byte.toString(16).padStart(2, "0")
+  return {
+    magic: TERMINAL_CHECKPOINT_MAGIC,
+    checkpointVersion: TERMINAL_CHECKPOINT_VERSION,
+    terminalEpoch,
+    sequence,
+    cols: 80,
+    rows: 24,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    engine: "ghostty-vt",
+    engineRevision: GHOSTTY_ENGINE_REVISION,
+    snapshotFormatVersion: 1,
+    codec: "none",
+    payloadBytes: snapshotBytes.byteLength,
+    payloadSha256,
+    snapshotBytes,
+  }
+}
+
 type AttachResult = {
   id: string
-  checkpoint?: {
-    checkpointVersion: 1
-    terminalEpoch: string
-    sequence: number
-    cols: number
-    rows: number
-    createdAt: string
-    syntheticBytes: Uint8Array
-  }
+  terminalEpoch?: string
+  checkpoint?: TerminalCheckpoint
   outputChunks: Uint8Array[]
   output: Uint8Array
   lastSequence: number
@@ -263,19 +290,13 @@ test("a cold archive fetches its newest page before ordered history replay", asy
   )
 })
 
-test("a newest-screen checkpoint previews without skipping older scrollback", async () => {
+test("a validated checkpoint restores before ordered post-cut bytes", async () => {
   const transport = new FakeTransport()
+  const snapshot = await checkpoint("epoch-1", 3)
   transport.queueAttach({
     id: "pty-checkpoint-preview",
-    checkpoint: {
-      checkpointVersion: 1,
-      terminalEpoch: "epoch-1",
-      sequence: 3,
-      cols: 80,
-      rows: 24,
-      createdAt: "2026-01-01T00:00:00.000Z",
-      syntheticBytes: encode("current-screen"),
-    },
+    terminalEpoch: "epoch-1",
+    checkpoint: snapshot,
     outputChunks: [encode("current-delta")],
     output: new Uint8Array(),
     lastSequence: 4,
@@ -283,8 +304,8 @@ test("a newest-screen checkpoint previews without skipping older scrollback", as
     status: "running",
   })
   transport.queueReplayPage({
-    chunks: [encode("history-1"), encode("history-2"), encode("history-3"), encode("history-4")],
-    firstSequence: 1,
+    chunks: [encode("current-delta")],
+    firstSequence: 4,
     lastSequence: 4,
     nextSequence: 4,
     complete: true,
@@ -293,6 +314,10 @@ test("a newest-screen checkpoint previews without skipping older scrollback", as
   const delivery: string[] = []
   await createYaadeApi(transport).terminal.attach("pty-checkpoint-preview", {
     replay: "full",
+    onCheckpoint: value => {
+      assert.deepEqual(value.snapshotBytes, snapshot.snapshotBytes)
+      delivery.push("checkpoint")
+    },
     onReplayPreview: chunk => {
       delivery.push(`preview:${decode(chunk.data)}`)
     },
@@ -301,17 +326,54 @@ test("a newest-screen checkpoint previews without skipping older scrollback", as
     },
   })
 
-  assert.deepEqual(delivery, [
-    "preview:current-screencurrent-delta",
-    "replay:history-1history-2history-3history-4",
-  ])
+  assert.deepEqual(delivery, ["checkpoint", "replay:current-delta"])
   assert.deepEqual(
     transport.calls.filter(call => call.channel === "terminal:readReplayPage").at(-1),
     {
       channel: "terminal:readReplayPage",
-      args: ["pty-checkpoint-preview", 0, 256 * 1024],
+      args: ["pty-checkpoint-preview", 3, 256 * 1024],
       via: "http",
     },
+  )
+})
+
+test("a corrupt checkpoint falls back to exact raw replay", async () => {
+  const transport = new FakeTransport()
+  const corrupt = {
+    ...await checkpoint("epoch-corrupt", 3),
+    payloadSha256: "0".repeat(64),
+  }
+  transport.queueAttach({
+    id: "pty-corrupt-checkpoint",
+    terminalEpoch: "epoch-corrupt",
+    checkpoint: corrupt,
+    outputChunks: [encode("tail")],
+    output: new Uint8Array(),
+    lastSequence: 4,
+    archiveAvailable: true,
+    status: "running",
+  })
+  transport.queueReplayPage({
+    chunks: [encode("history"), encode("tail")],
+    firstSequence: 1,
+    lastSequence: 4,
+    nextSequence: 4,
+    complete: true,
+  })
+
+  let restoreCalls = 0
+  const replay: string[] = []
+  await createYaadeApi(transport).terminal.attach("pty-corrupt-checkpoint", {
+    replay: "full",
+    onCheckpoint: () => { restoreCalls += 1 },
+    onReplay: chunk => { replay.push(decode(chunk.data)) },
+  })
+
+  assert.equal(restoreCalls, 0)
+  assert.deepEqual(replay, ["historytail"])
+  assert.deepEqual(
+    transport.calls.filter(call => call.channel === "terminal:readReplayPage").at(-1)?.args,
+    ["pty-corrupt-checkpoint", 0, 256 * 1024],
   )
 })
 

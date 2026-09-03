@@ -59,6 +59,10 @@ export const handleRequest = (
         ...(shortcut === undefined ? {} : { shortcut }),
       };
     }
+    if (request.type === 'keyboard-shortcut/configure') {
+      yield* commands.openShortcutSettings();
+      return { ok: true as const, type: 'done' as const, closePalette: true };
+    }
     if (request.type === 'theme/set') {
       yield* storage.setTheme(request.theme);
       return { ok: true as const, type: 'done' as const, closePalette: false };

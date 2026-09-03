@@ -24,6 +24,7 @@ export const BootstrapSnapshotSchema = Schema.Struct({
   shortcut: Schema.optional(Schema.String),
   theme: Schema.Literal('system', 'light', 'dark'),
   fallback: Schema.Boolean,
+  pageZoom: Schema.Number.pipe(Schema.positive()),
 });
 export type BootstrapSnapshot = typeof BootstrapSnapshotSchema.Type;
 

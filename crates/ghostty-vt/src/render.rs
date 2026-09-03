@@ -331,7 +331,11 @@ impl<'terminal> RenderView<'terminal> {
         // SAFETY: The state is live and immutably traversed, while `raw_colors`
         // is a correctly initialized public sized output struct.
         let result = unsafe {
-            ffi::ghostty_render_state_colors_get(resources.state.as_ptr(), &mut raw_colors)
+            ffi::ghostty_render_state_get(
+                resources.state.as_ptr(),
+                ffi::RenderStateData::COLORS,
+                ptr::from_mut(&mut raw_colors).cast::<c_void>(),
+            )
         };
         ffi_result(result, Operation::RenderStateGet)?;
         let colors = RenderColors {

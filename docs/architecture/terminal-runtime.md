@@ -1,5 +1,7 @@
 # Terminal runtime
 
+> This file describes the current implementation. The normative target and migration invariants live in [`../terminal-architecture.md`](../terminal-architecture.md). Where the files differ, the target document governs new terminal work.
+
 YAADE uses one host process as the terminal multiplexer:
 
 ```text
@@ -8,7 +10,7 @@ browser  <->  host server  <->  TerminalHost  <->  portable-pty children
 
 `TerminalHost` maps terminal IDs to handles. One owner thread per terminal constructs,
 mutates, and drops its `ghostty_vt::Terminal`. The same thread owns the PTY master,
-writer, child, replay, synthetic checkpoint state, and writer leases. Native Ghostty
+writer, child, replay, restorable checkpoint state, and writer leases. Native Ghostty
 never enters an `Arc`, mutex, async task, history worker, or socket path. A
 small 256 KiB-stack reader thread only reads the blocking PTY and sends at most
 64 immutable 64 KiB chunks over a bounded channel. The 1 MiB-stack owner
@@ -60,8 +62,10 @@ publishes the original opaque bytes to replay, history, or live clients. PTY
 output remains ordered `Bytes` through immutable replay/history/live frames,
 binary WebSocket payloads, browser
 `Uint8Array` replay coordination, and the Ghostty worker. Only terminal IDs and completed textual protocol metadata are UTF-8 decoded.
-Ghostty's public formatter produces bounded synthetic checkpoint-v1 bootstrap
-bytes; checkpoints do not serialize private parser memory. Durable history stores a
+Ghostty's public snapshot encoder produces bounded, CRC-protected checkpoint-v2
+payloads with exact parser continuation. The history owner atomically persists the
+opaque public payload and its YAADE envelope; private parser memory is never
+serialized. Durable history stores a
 versioned big-endian binary record stream inside compressed blocks, so malformed
 or incomplete UTF-8 replays exactly. Output is batched by byte count to reduce
 framing overhead, while small interactive chunks flush immediately. A

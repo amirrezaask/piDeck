@@ -57,7 +57,7 @@ function comparatorFixture(options?: {
   const effects = options?.reverseEffects ? [secondEffect, firstEffect] : [firstEffect, secondEffect]
   return CorpusResult.make({
     normalizerVersion: CORPUS_NORMALIZER_VERSION,
-    revision: options?.revision ?? "9f62873bf195e4d8a762d768a1405a5f2f7b1697",
+    revision: options?.revision ?? "07bccf7a311acdfa6afc77f2016160d49b1f1982",
     runner: options?.runner ?? "native",
     fixtures: [{
       id: "comparator-self-test",

@@ -1,9 +1,9 @@
 # Plan 034: Deliver current-screen-first reattach with progressive million-line scrollback and search
 
-> **Executor instructions**: Complete Plans 018, 023, 027, and 033. Preserve all
-> pre-existing working-tree changes. Plan 024 must
-> have reached a documented Outcome A, B, or C; this plan must work with that
-> decision and may not invent private Ghostty restore. Keep PTY output out of
+> **Executor instructions**: Complete Plans 018, 023, 024, and 027. Preserve all
+> pre-existing working-tree changes. Plan 024 selected Outcome A; use its public
+> Ghostty snapshot contract and do not invent private restore or revive rejected
+> Plan 033's semantic data plane. Keep PTY output out of
 > React state. Build an indexed cold-row provider behind the terminal surface,
 > not a standalone search application. Update this plan and its README row to
 > `DONE` when every quality gate passes.
@@ -28,10 +28,11 @@
 
 ## Status
 
+- **Status**: TODO (unblocked by Plan 024 Outcome A)
 - **Priority**: P1
 - **Effort**: L
 - **Risk**: HIGH
-- **Depends on**: Plans 018, 023, 024 (decision), 027, and 033
+- **Depends on**: Plans 018, 023, 024, and 027
 - **Category**: terminal UX / performance / history
 - **Planned at**: commit `a0bb3fc9`, 2026-08-30
 - **Source finding**: Superlogical current-screen-first and million-line history parity
@@ -40,8 +41,8 @@
 
 The browser currently requests `replay: "full"` and streams archive pages from
 sequence zero before it reaches the newest state. Large history can therefore
-delay a trustworthy interactive screen even though the host already has a
-semantic current snapshot. Browser Ghostty is also configured with
+delay a trustworthy interactive screen even though the host can export a
+restorable current snapshot. Browser Ghostty is also configured with
 `MAX_SCROLLBACK_ROWS = 10_000`, far below the reference's million-line quality
 case, and there is no terminal search UI.
 
@@ -60,19 +61,18 @@ demand without loading them all into browser memory.
 - `GhosttyViewportModel` retains only the active viewport; it has no asynchronous
   cold-row provider.
 - Plan 018 supplies exact indexed binary history. Plan 023 supplies one native
-  Ghostty semantic owner. Plan 033 supplies current snapshot/patch/hash.
-- Plan 024 decides whether raw parser restore is possible. Outcome C does not
-  permit faking parser continuation from painted rows.
+  Ghostty owner.
+- Plan 024 supplies complete native/WASM snapshot restore with exact parser
+  continuation. Painted rows remain a derived history/search projection.
 
 ## Target architecture
 
 ```text
 attach
-  -> semantic current snapshot (first trustworthy paint)
-  -> raw parser restore/replay in worker according to Plan 024
-  -> buffer ordered live bytes behind parser fence
-  -> compare canonical state hash
-  -> atomic semantic-preview -> raw-live handoff
+  -> restore current Ghostty snapshot in worker
+  -> buffer ordered live bytes behind the snapshot cut
+  -> receive server READY for that cut
+  -> release ordered live bytes and enable input atomically
 
 native Ghostty owner
   -> hot screen + bounded hot scrollback
@@ -86,9 +86,9 @@ terminal surface viewport
   -> terminal-local search results and reveal
 ```
 
-If Plan 024 Outcome C cannot meet an approved interactive handoff, keep semantic
-preview visible and mark raw input unavailable until exact catch-up. Do not allow
-keystrokes encoded from stale modes.
+If snapshot validation or import fails, discard the replica and request a new
+snapshot cut. Keep input unavailable until server READY and exact catch-up; never
+encode keystrokes from stale modes.
 
 Any new `@yaade/app` unit test file must also be listed in
 `packages/yaade-app/package.json`, per repository convention.
@@ -109,7 +109,7 @@ Any new `@yaade/app` unit test file must also be listed in
 - Native stable-row extraction and indexed cold-row history
 - Typed paged row/search RPC and browser transport
 - Terminal-surface virtualization, search overlay, result navigation/highlight
-- Current-screen semantic preview and exact raw handoff
+- Current-screen snapshot restore and exact ordered-byte handoff
 - Retention, corruption, resize/wrap, Unicode, and performance tests
 
 - Test manifests/scripts required by this plan, including
@@ -190,16 +190,15 @@ vp run test:server
 Expected: malformed cursors/epochs/bounds fail, first/next/previous search is
 stable, and retained-row deletion cannot return stale hits.
 
-### Step 4: Show current semantic screen before cold replay
+### Step 4: Restore the current screen before cold history
 
-On attach request `both` when supported. Paint Plan 033's current snapshot after
-one hash-validated decode. In parallel, restore/catch up the raw browser parser
-according to Plan 024, buffering live output with existing sequence/ACK bounds.
-Swap to the raw surface only when terminal epoch, dimensions, sequence fence, and
-canonical semantic hash match.
+Use Plan 024's bounded snapshot envelope at an exact byte cut. Restore it into a
+fresh browser Ghostty instance, buffer post-cut PTY bytes, then publish the new
+surface and release those bytes only after server READY. Snapshot failure or a
+sequence gap discards the stale replica and starts a new bounded resync.
 
-Input remains disabled or server-encoded until the parser has current modes. The
-preview must visibly indicate reconnect only if interaction is unavailable; it
+Input remains disabled until READY and the parser has current modes. The
+surface must visibly indicate reconnect only if interaction is unavailable; it
 must not flash blank or replay old output over the newest frame.
 
 **Verify**:
@@ -298,7 +297,8 @@ Expected: all functional gates and predeclared performance/memory ceilings pass.
 ## STOP conditions
 
 - The design requires one million rows in Ghostty, DOM, or React state.
-- A semantic preview is treated as parser restore or enables stale-mode input.
+- A render projection is treated as parser restore or input is enabled before
+  READY.
 - Stable row extraction requires private Ghostty memory.
 - Resize changes the content behind an existing row ID.
 - Search logs/index diagnostics can expose terminal content.

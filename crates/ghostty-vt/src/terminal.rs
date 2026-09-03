@@ -25,6 +25,42 @@ pub const MAX_APC_BYTES: usize = 1024 * 1024;
 static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_INITIALIZATION: OnceLock<Result<(), GhosttyError>> = OnceLock::new();
 
+struct BoundedSnapshotWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+unsafe extern "C" fn write_snapshot_bytes(
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    if userdata.is_null() || (data.is_null() && len != 0) {
+        return false;
+    }
+    // SAFETY: `snapshot` passes a live writer as userdata for the duration of
+    // the synchronous encode call, and Ghostty provides `len` readable bytes.
+    let writer = unsafe { &mut *userdata.cast::<BoundedSnapshotWriter>() };
+    let Some(next_len) = writer.bytes.len().checked_add(len) else {
+        writer.exceeded = true;
+        return false;
+    };
+    if next_len > writer.max_bytes || writer.bytes.try_reserve(len).is_err() {
+        writer.exceeded = true;
+        return false;
+    }
+    // SAFETY: Null is excluded for non-empty input above; a zero-length slice
+    // may use the dangling pointer value accepted by `from_raw_parts`.
+    let source = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    writer.bytes.extend_from_slice(source);
+    true
+}
+
 /// Construction options for a thread-confined terminal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalOptions {
@@ -127,6 +163,26 @@ pub struct TerminalColors {
     pub palette: [Rgb; 256],
 }
 
+/// Amount of scrollback compression work performed by one owner-loop command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompressionMode {
+    /// Perform one bounded idle-time step.
+    Incremental,
+    /// Scan every currently eligible page synchronously.
+    Full,
+}
+
+/// Scheduling result from a compression pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompressionStatus {
+    /// Retained-mapping reclamation is unavailable on this target.
+    Unsupported,
+    /// More incremental work remains.
+    Pending,
+    /// No continuation is needed until the activity token changes.
+    Complete,
+}
+
 /// Owned snapshot of public terminal state.
 ///
 /// This is observation data, not serializable parser state and not a
@@ -174,15 +230,21 @@ pub struct TerminalState {
 struct RawTerminal(NonNull<ffi::TerminalImpl>);
 
 impl RawTerminal {
-    fn new(options: ffi::TerminalOptions) -> Result<Self, GhosttyError> {
+    fn new(cols: u16, rows: u16) -> Result<Self, GhosttyError> {
         let mut raw = ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer, null consistently selects the
         // process-default allocator, and all dimensions were checked before C.
-        let result = unsafe { ffi::ghostty_terminal_new(ptr::null(), &mut raw, options) };
+        let result = unsafe { ffi::ghostty_terminal_new(ptr::null(), &mut raw, cols, rows) };
         ffi_result(result, Operation::TerminalNew)?;
         NonNull::new(raw)
             .map(Self)
             .ok_or_else(|| abi_violation(Operation::TerminalNew, AbiViolation::NullData))
+    }
+
+    fn from_ptr(raw: ffi::Terminal, operation: Operation) -> Result<Self, GhosttyError> {
+        NonNull::new(raw)
+            .map(Self)
+            .ok_or_else(|| abi_violation(operation, AbiViolation::NullData))
     }
 
     fn as_ptr(&self) -> ffi::Terminal {
@@ -230,27 +292,32 @@ impl Terminal {
         }
 
         let mut callbacks = Box::pin(CallbackState::new(options.effects)?);
-        let raw = RawTerminal::new(ffi::TerminalOptions {
-            cols,
-            rows,
-            max_scrollback: options.scrollback,
-        })?;
+        let raw = RawTerminal::new(cols, rows)?;
+
+        for (option, value) in [
+            (
+                ffi::TerminalOption::SCROLLBACK_MAX_LINES,
+                options.scrollback,
+            ),
+            (ffi::TerminalOption::APC_MAX_BYTES, MAX_APC_BYTES),
+            (ffi::TerminalOption::CONTINUATION_MAX_BYTES, MAX_APC_BYTES),
+        ] {
+            // SAFETY: The terminal is live and exclusively initializing. Each
+            // option documents a copied `size_t` input.
+            let result = unsafe {
+                ffi::ghostty_terminal_set(
+                    raw.as_ptr(),
+                    option,
+                    ptr::from_ref(&value).cast::<c_void>(),
+                )
+            };
+            ffi_result(result, Operation::TerminalSet)?;
+        }
+
         let callback_state = CallbackState::pinned_mut(callbacks.as_mut());
         callback_state.bind_terminal(raw.as_ptr());
         let state_ptr = ptr::from_mut(callback_state);
         register_callbacks(raw.as_ptr(), state_ptr)?;
-
-        let apc_limit = MAX_APC_BYTES;
-        // SAFETY: The terminal is live and exclusively initializing;
-        // `apc_limit` has the exact checked public option type and is copied.
-        let result = unsafe {
-            ffi::ghostty_terminal_set(
-                raw.as_ptr(),
-                ffi::TerminalOption::APC_MAX_BYTES,
-                ptr::from_ref(&apc_limit).cast::<c_void>(),
-            )
-        };
-        ffi_result(result, Operation::TerminalSet)?;
 
         let render = RenderResources::new()?;
         Ok(Self {
@@ -261,6 +328,135 @@ impl Terminal {
             id: next_terminal_id(),
             _thread_confined: PhantomData,
         })
+    }
+
+    /// Restore a complete CRC-protected Ghostty snapshot.
+    ///
+    /// Continuation tracking remains enabled so unfinished CSI, OSC, DCS,
+    /// APC, and UTF-8 input resumes deterministically.
+    pub fn from_snapshot(snapshot: &[u8], effects: EffectOptions) -> Result<Self, GhosttyError> {
+        initialize_process()?;
+        let mut callbacks = Box::pin(CallbackState::new(effects)?);
+        let mut decoder = ptr::null_mut();
+        // SAFETY: The decoder borrows immutable snapshot bytes and remains
+        // local until it is freed below.
+        let result = unsafe {
+            ffi::ghostty_snapshot_decoder_new_buf(
+                ptr::null(),
+                &mut decoder,
+                snapshot.as_ptr(),
+                snapshot.len(),
+            )
+        };
+        ffi_result(result, Operation::SnapshotDecode)?;
+        let decoder = NonNull::new(decoder)
+            .ok_or_else(|| abi_violation(Operation::SnapshotDecode, AbiViolation::NullData))?;
+
+        struct Decoder(NonNull<ffi::SnapshotDecoderImpl>);
+        impl Drop for Decoder {
+            fn drop(&mut self) {
+                // SAFETY: This guard uniquely owns the decoder handle.
+                unsafe { ffi::ghostty_snapshot_decoder_free(self.0.as_ptr()) };
+            }
+        }
+        let decoder = Decoder(decoder);
+        let continuation_limit = MAX_APC_BYTES;
+        let retain_continuation = true;
+        for (option, value) in [
+            (
+                ffi::SnapshotDecoderOption::GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES,
+                ptr::from_ref(&continuation_limit).cast::<c_void>(),
+            ),
+            (
+                ffi::SnapshotDecoderOption::GHOSTTY_SNAPSHOT_DECODER_OPT_RETAIN_CONTINUATION,
+                ptr::from_ref(&retain_continuation).cast::<c_void>(),
+            ),
+        ] {
+            // SAFETY: Each option is paired with its documented copied input
+            // type and decoding has not started.
+            let result =
+                unsafe { ffi::ghostty_snapshot_decoder_set(decoder.0.as_ptr(), option, value) };
+            ffi_result(result, Operation::SnapshotDecode)?;
+        }
+
+        let mut restored = ptr::null_mut();
+        // SAFETY: The configured decoder is live and `restored` is a valid
+        // out-pointer. One-shot decode validates through FINISH.
+        let result =
+            unsafe { ffi::ghostty_snapshot_decoder_decode(decoder.0.as_ptr(), &mut restored) };
+        ffi_result(result, Operation::SnapshotDecode)?;
+        let raw = RawTerminal::from_ptr(restored, Operation::SnapshotDecode)?;
+
+        let callback_state = CallbackState::pinned_mut(callbacks.as_mut());
+        callback_state.bind_terminal(raw.as_ptr());
+        register_callbacks(raw.as_ptr(), ptr::from_mut(callback_state))?;
+        let render = RenderResources::new()?;
+        Ok(Self {
+            render,
+            raw,
+            callbacks,
+            formatter_scratch: Vec::new(),
+            id: next_terminal_id(),
+            _thread_confined: PhantomData,
+        })
+    }
+
+    /// Encode complete terminal and parser state into Ghostty's binary
+    /// snapshot format, bounded by `max_bytes`.
+    pub fn snapshot(&self, max_bytes: usize) -> Result<Vec<u8>, GhosttyError> {
+        let mut output = BoundedSnapshotWriter {
+            bytes: Vec::with_capacity(max_bytes.min(64 * 1024)),
+            max_bytes,
+            exceeded: false,
+        };
+        let writer = ffi::Writer {
+            write: Some(write_snapshot_bytes),
+            userdata: ptr::from_mut(&mut output).cast(),
+        };
+        // SAFETY: The writer context and terminal remain live and immutable for
+        // the duration of Ghostty's synchronous encode call.
+        let result = unsafe { ffi::ghostty_snapshot_encode(self.raw.as_ptr(), writer) };
+        if output.exceeded {
+            return Err(GhosttyError::OutOfSpace {
+                operation: Operation::SnapshotEncode,
+                required: max_bytes.saturating_add(1),
+                limit: max_bytes,
+            });
+        }
+        ffi_result(result, Operation::SnapshotEncode)?;
+        Ok(output.bytes)
+    }
+
+    /// Return the opaque scrollback-compression activity token.
+    pub fn compression_activity(&self) -> Result<u64, GhosttyError> {
+        let mut activity = 0;
+        // SAFETY: The terminal is live and activity is writable.
+        let result =
+            unsafe { ffi::ghostty_terminal_compression_activity(self.raw.as_ptr(), &mut activity) };
+        ffi_result(result, Operation::TerminalCompression)?;
+        Ok(activity)
+    }
+
+    /// Compress eligible scrollback while preserving logical terminal state.
+    pub fn compress(&mut self, mode: CompressionMode) -> Result<CompressionStatus, GhosttyError> {
+        let mode = match mode {
+            CompressionMode::Incremental => ffi::TerminalCompressionMode::INCREMENTAL,
+            CompressionMode::Full => ffi::TerminalCompressionMode::FULL,
+        };
+        let mut status = ffi::TerminalCompressionResult::COMPLETE;
+        // SAFETY: The terminal is exclusively borrowed and status is writable.
+        let result =
+            unsafe { ffi::ghostty_terminal_compress(self.raw.as_ptr(), mode, &mut status) };
+        ffi_result(result, Operation::TerminalCompression)?;
+        match status {
+            ffi::TerminalCompressionResult::UNSUPPORTED => Ok(CompressionStatus::Unsupported),
+            ffi::TerminalCompressionResult::PENDING => Ok(CompressionStatus::Pending),
+            ffi::TerminalCompressionResult::COMPLETE => Ok(CompressionStatus::Complete),
+            _ => Err(abi_violation(
+                Operation::TerminalCompression,
+                AbiViolation::UnknownDiscriminant,
+            )),
+        }
     }
 
     /// Process arbitrary PTY bytes and return bounded effects.
@@ -320,22 +516,38 @@ impl Terminal {
 
     /// Read one checked ANSI or DEC-private mode.
     pub fn mode(&self, mode: Mode) -> Result<bool, GhosttyError> {
-        let mut output = false;
-        // SAFETY: The terminal is live, `mode` is constructible only through
-        // the checked packed representation, and output storage is valid.
+        let mut config = ffi::TerminalModeConfig {
+            mode: mode.as_ffi(),
+            value: false,
+        };
+        // SAFETY: The terminal is live and `config` is the exact in/out type
+        // documented for TERMINAL_DATA_MODE.
         let result = unsafe {
-            ffi::ghostty_terminal_mode_get(self.raw.as_ptr(), mode.as_ffi(), &mut output)
+            ffi::ghostty_terminal_get(
+                self.raw.as_ptr(),
+                ffi::TerminalData::MODE,
+                ptr::from_mut(&mut config).cast::<c_void>(),
+            )
         };
         ffi_result(result, Operation::TerminalMode)?;
-        Ok(output)
+        Ok(config.value)
     }
 
     /// Set one checked ANSI or DEC-private mode.
     pub fn set_mode(&mut self, mode: Mode, enabled: bool) -> Result<(), GhosttyError> {
-        // SAFETY: The terminal is live and exclusive, `mode` is checked, and
-        // this native mutation stores no borrowed Rust memory.
-        let result =
-            unsafe { ffi::ghostty_terminal_mode_set(self.raw.as_ptr(), mode.as_ffi(), enabled) };
+        let config = ffi::TerminalModeConfig {
+            mode: mode.as_ffi(),
+            value: enabled,
+        };
+        // SAFETY: The terminal is live and exclusive, and `config` is the
+        // exact copied input type documented for TERMINAL_OPT_MODE.
+        let result = unsafe {
+            ffi::ghostty_terminal_set(
+                self.raw.as_ptr(),
+                ffi::TerminalOption::MODE,
+                ptr::from_ref(&config).cast::<c_void>(),
+            )
+        };
         ffi_result(result, Operation::TerminalMode)
     }
 

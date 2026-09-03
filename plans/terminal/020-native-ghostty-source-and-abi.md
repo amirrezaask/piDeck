@@ -56,7 +56,7 @@ write a safe terminal wrapper or change server behavior.
 ## Current state
 
 `scripts/prepare-ghostty-source.mjs` now validates the shared `VERSION`, prepares
-a clean content-addressed checkout, pins Zig 0.15.2 with platform-specific
+a clean content-addressed checkout, pins Zig 0.16.0 with platform-specific
 SHA-256 checksums, and supports explicit offline source and compiler paths.
 The browser WASM build consumes this preparation result and reproduces the
 checked-in bytes.

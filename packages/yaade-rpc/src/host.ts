@@ -163,16 +163,33 @@ export const TerminalMutationFence = Schema.Struct({
 });
 export type TerminalMutationFence = Schema.Schema.Type<typeof TerminalMutationFence>;
 
-export const TerminalCheckpoint = Schema.Struct({
-  checkpointVersion: Schema.Literal(1),
+export const TERMINAL_CHECKPOINT_MAGIC = "YAADECP2" as const;
+export const TERMINAL_CHECKPOINT_VERSION = 2 as const;
+export const GHOSTTY_ENGINE_REVISION =
+  "07bccf7a311acdfa6afc77f2016160d49b1f1982" as const;
+export const GHOSTTY_SNAPSHOT_FORMAT_VERSION = 1 as const;
+export const MAX_TERMINAL_CHECKPOINT_BYTES = 384 * 1024;
+
+export class TerminalCheckpoint extends Schema.Class<TerminalCheckpoint>(
+  "TerminalCheckpoint",
+)({
+  magic: Schema.String.pipe(Schema.maxLength(16)),
+  checkpointVersion: Schema.Int.pipe(Schema.between(1, 255)),
   terminalEpoch: Schema.String,
-  sequence: Schema.Number,
-  cols: Schema.Number,
-  rows: Schema.Number,
+  sequence: Schema.Int.pipe(Schema.nonNegative()),
+  cols: Schema.Int.pipe(Schema.between(1, 1000)),
+  rows: Schema.Int.pipe(Schema.between(1, 1000)),
   createdAt: Schema.String,
-  syntheticBytes: Schema.Uint8ArrayFromBase64,
-});
-export type TerminalCheckpoint = Schema.Schema.Type<typeof TerminalCheckpoint>;
+  engine: Schema.String.pipe(Schema.maxLength(32)),
+  engineRevision: Schema.String.pipe(Schema.maxLength(128)),
+  snapshotFormatVersion: Schema.Int.pipe(Schema.between(0, 65_535)),
+  codec: Schema.String.pipe(Schema.maxLength(16)),
+  payloadBytes: Schema.Int.pipe(
+    Schema.between(10, MAX_TERMINAL_CHECKPOINT_BYTES),
+  ),
+  payloadSha256: Schema.String.pipe(Schema.pattern(/^[0-9a-f]{64}$/)),
+  snapshotBytes: Schema.Uint8ArrayFromBase64,
+}) {}
 
 export const TerminalLease = Schema.Struct({
   terminalId: Schema.String,

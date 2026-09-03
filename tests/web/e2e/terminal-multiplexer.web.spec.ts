@@ -384,6 +384,34 @@ test("terminal output is replayed after a browser reload", async ({ launchApp })
   }
 });
 
+test("browser reload restores a bounded Ghostty checkpoint before the replay tail", async ({ launchApp }) => {
+  const { page } = await launchApp({
+    workspaceRel: "fixtures/sample-workspace",
+  });
+  const marker = "YAADE_CHECKPOINT_RESTORED";
+
+  await focusTerminal(page);
+  await page.keyboard.type(
+    `node -e "process.stdout.write('\\x1b[H0'.repeat(1100000));console.log('\\n${marker}')"`,
+  );
+  await page.keyboard.press("Enter");
+
+  const terminalText = () =>
+    page.evaluate(() => {
+      const id = window.__yaadeTest?.getState().activeMuxTerminalId;
+      return id ? (window.__yaadeTest?.getTerminalText?.(id) ?? "") : "";
+    });
+  await expect.poll(terminalText, { timeout: 30_000 }).toContain(marker);
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.evaluate(() => window.__yaadeTest!.waitForReady());
+  const surface = page.locator("[data-ghostty-terminal]").filter({ visible: true }).first();
+  await expect(surface).toHaveAttribute("data-ghostty-terminal-snapshot-restore-count", "1", {
+    timeout: 30_000,
+  });
+  await expect.poll(terminalText, { timeout: 30_000 }).toContain(marker);
+});
+
 test("Windows and pane state survive a browser reload", async ({ launchApp }) => {
   const { page } = await launchApp({
     workspaceRel: "fixtures/sample-workspace",

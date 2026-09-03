@@ -52,7 +52,9 @@ export class GhosttyRuntime {
     while (end < bytes.length && bytes[end] !== 0) end += 1;
     // SAFETY: libghostty-vt returns this JSON from its pinned ABI table; the
     // runtime validates individual field lookups before using a layout.
-    this.layouts = JSON.parse(textDecoder.decode(bytes.subarray(jsonPointer, end))) as TypeLayouts;
+    const metadata = JSON.parse(textDecoder.decode(bytes.subarray(jsonPointer, end))) as
+      TypeLayouts & { readonly types?: TypeLayouts };
+    this.layouts = metadata.types ?? metadata;
   }
 
   static async load(source: GhosttyWasmSource): Promise<GhosttyRuntime> {
@@ -95,14 +97,14 @@ export class GhosttyRuntime {
   }
 
   alloc(size: number): number {
-    const pointer = this.call("ghostty_wasm_alloc_u8_array", size);
+    const pointer = this.call("ghostty_wasm_alloc", size);
     if (pointer === 0) throw new Error(`libghostty-vt failed to allocate ${size} bytes`);
     new Uint8Array(this.memory.buffer, pointer, size).fill(0);
     return pointer;
   }
 
   free(pointer: number, size: number): void {
-    if (pointer !== 0) this.call("ghostty_wasm_free_u8_array", pointer, size);
+    if (pointer !== 0) this.call("ghostty_wasm_free", pointer, size);
   }
 
   allocOpaque(): number {
@@ -175,6 +177,12 @@ export class GhosttyRuntime {
         view.setBigUint64(0, BigInt(value), true);
         return;
       default:
+        if (this.layouts[field.type]) {
+          if (field.size === 1) return view.setUint8(0, value);
+          if (field.size === 2) return view.setUint16(0, value, true);
+          if (field.size === 4) return view.setUint32(0, value, true);
+          if (field.size === 8) return view.setBigUint64(0, BigInt(value), true);
+        }
         throw new Error(`Unsupported libghostty-vt field type: ${field.type}`);
     }
   }
@@ -200,6 +208,12 @@ export class GhosttyRuntime {
       case "opaque":
         return view.getUint32(0, true);
       default:
+        if (this.layouts[field.type]) {
+          if (field.size === 1) return view.getUint8(0);
+          if (field.size === 2) return view.getUint16(0, true);
+          if (field.size === 4) return view.getUint32(0, true);
+          if (field.size === 8) return Number(view.getBigUint64(0, true));
+        }
         throw new Error(`Unsupported libghostty-vt field type: ${field.type}`);
     }
   }

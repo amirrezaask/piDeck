@@ -30,6 +30,8 @@ const TERMINAL_OPTION = {
   palette: 14,
   apcMaxBytes: 19,
   defaultCursorBlink: 23,
+  scrollbackMaxLines: 28,
+  continuationMaxBytes: 31,
 } as const
 const TERMINAL_DATA = {
   columns: 1,
@@ -117,6 +119,87 @@ class WasmCorpusTerminal {
     } catch (error) {
       terminal.dispose()
       throw error
+    }
+  }
+
+  writeRaw(data: Uint8Array): void {
+    const pointer = this.runtime.alloc(data.byteLength)
+    try {
+      this.runtime.bytes(pointer, data.byteLength).set(data)
+      this.runtime.call("ghostty_terminal_vt_write", this.terminal, pointer, data.byteLength)
+    } finally {
+      this.runtime.free(pointer, data.byteLength)
+    }
+  }
+
+  clearEffects(): void {
+    this.effects.length = 0
+    this.currentCallbackIndex = 0
+  }
+
+  binarySnapshot(): Uint8Array {
+    const written = this.runtime.alloc(4)
+    try {
+      const sizing = this.runtime.call("ghostty_snapshot_encode_buf", this.terminal, 0, 0, written)
+      if (sizing !== -3 && sizing !== 0) this.assertSuccess("snapshot size", sizing)
+      const required = this.runtime.view(written, 4).getUint32(0, true)
+      const output = this.runtime.alloc(required)
+      try {
+        this.assertSuccess(
+          "snapshot encode",
+          this.runtime.call("ghostty_snapshot_encode_buf", this.terminal, output, required, written),
+        )
+        return Uint8Array.from(this.runtime.bytes(output, required))
+      } finally {
+        this.runtime.free(output, required)
+      }
+    } finally {
+      this.runtime.free(written, 4)
+    }
+  }
+
+  restoreSnapshot(snapshot: Uint8Array): void {
+    const input = this.runtime.alloc(snapshot.byteLength)
+    this.runtime.bytes(input, snapshot.byteLength).set(snapshot)
+    const decoderSlot = this.runtime.allocOpaque()
+    const restoredSlot = this.runtime.allocOpaque()
+    let decoder = 0
+    let restored = 0
+    try {
+      this.assertSuccess(
+        "snapshot decoder",
+        this.runtime.call("ghostty_snapshot_decoder_new_buf", 0, decoderSlot, input, snapshot.byteLength),
+      )
+      decoder = this.runtime.readPointer(decoderSlot)
+      const option = this.runtime.alloc(4)
+      try {
+        this.runtime.view(option, 4).setUint32(0, 1024 * 1024, true)
+        this.assertSuccess("snapshot continuation bound", this.runtime.call("ghostty_snapshot_decoder_set", decoder, 0, option))
+        this.runtime.bytes(option, 1)[0] = 1
+        this.assertSuccess("snapshot continuation retention", this.runtime.call("ghostty_snapshot_decoder_set", decoder, 1, option))
+      } finally {
+        this.runtime.free(option, 4)
+      }
+      this.assertSuccess("snapshot decode", this.runtime.call("ghostty_snapshot_decoder_decode", decoder, restoredSlot))
+      restored = this.runtime.readPointer(restoredSlot)
+      if (restored === 0) throw new Error("snapshot returned null terminal")
+      if (this.writerId !== 0) this.runtime.detachPtyWriter(this.terminal, this.writerId)
+      this.runtime.call("ghostty_terminal_free", this.terminal)
+      this.terminal = restored
+      restored = 0
+      this.writerId = this.runtime.attachPtyByteWriter(this.terminal, (bytes) => {
+        this.effects.push({
+          eventIndex: this.currentEventIndex,
+          callbackIndex: this.currentCallbackIndex++,
+          bytes: encodeCorpusBytes(bytes),
+        })
+      })
+    } finally {
+      if (restored !== 0) this.runtime.call("ghostty_terminal_free", restored)
+      if (decoder !== 0) this.runtime.call("ghostty_snapshot_decoder_free", decoder)
+      this.runtime.freeOpaque(restoredSlot)
+      this.runtime.freeOpaque(decoderSlot)
+      this.runtime.free(input, snapshot.byteLength)
     }
   }
 
@@ -338,15 +421,24 @@ class WasmCorpusTerminal {
     ) {
       throw new Error(`${fixture.id} requests host callbacks not installed by the shipped WASM core`)
     }
-    const terminalOptions = this.runtime.layout("GhosttyTerminalOptions")
-    const options = this.runtime.alloc(terminalOptions.size)
-    this.runtime.setField(options, "GhosttyTerminalOptions", "cols", initial.columns)
-    this.runtime.setField(options, "GhosttyTerminalOptions", "rows", initial.rows)
-    this.runtime.setField(options, "GhosttyTerminalOptions", "max_scrollback", initial.scrollback)
     this.terminalSlot = this.runtime.allocOpaque()
-    this.assertSuccess("ghostty_terminal_new", this.runtime.call("ghostty_terminal_new", 0, this.terminalSlot, options))
-    this.runtime.free(options, terminalOptions.size)
+    this.assertSuccess(
+      "ghostty_terminal_new",
+      this.runtime.call("ghostty_terminal_new", 0, this.terminalSlot, initial.columns, initial.rows),
+    )
     this.terminal = this.runtime.readPointer(this.terminalSlot)
+    const sizeValue = this.runtime.alloc(4)
+    this.runtime.view(sizeValue, 4).setUint32(0, initial.scrollback, true)
+    this.assertSuccess(
+      "ghostty_terminal_set(scrollback)",
+      this.runtime.call("ghostty_terminal_set", this.terminal, TERMINAL_OPTION.scrollbackMaxLines, sizeValue),
+    )
+    this.runtime.view(sizeValue, 4).setUint32(0, 1024 * 1024, true)
+    this.assertSuccess(
+      "ghostty_terminal_set(continuation)",
+      this.runtime.call("ghostty_terminal_set", this.terminal, TERMINAL_OPTION.continuationMaxBytes, sizeValue),
+    )
+    this.runtime.free(sizeValue, 4)
     this.writerId = this.runtime.attachPtyByteWriter(this.terminal, (bytes) => {
       this.effects.push({
         eventIndex: this.currentEventIndex,
@@ -431,9 +523,14 @@ class WasmCorpusTerminal {
 
   private mode(number: number, ansi: boolean): boolean {
     const packed = number | (ansi ? 0x8000 : 0)
-    this.runtime.bytes(this.scratch, 1)[0] = 0
-    this.assertSuccess("ghostty_terminal_mode_get", this.runtime.call("ghostty_terminal_mode_get", this.terminal, packed, this.scratch))
-    return this.runtime.bytes(this.scratch, 1)[0] !== 0
+    const config = this.runtime.view(this.scratch, 4)
+    config.setUint16(0, packed, true)
+    config.setUint8(2, 0)
+    this.assertSuccess(
+      "ghostty_terminal_get(mode)",
+      this.runtime.call("ghostty_terminal_get", this.terminal, 37, this.scratch),
+    )
+    return config.getUint8(2) !== 0
   }
 
   private readScrollbar(): CorpusObservation["state"]["scrollbar"] {
@@ -735,6 +832,32 @@ async function runWasmCorpus() {
   validateCorpusResult(json, corpus.manifest)
   return { corpus, output, json }
 }
+
+test("every WASM corpus fixture restores and continues from a binary snapshot", async () => {
+  const corpus = await loadTerminalCorpus()
+  for (const fixture of corpus.fixtures) {
+    const uninterrupted = await WasmCorpusTerminal.create(fixture.definition)
+    const restored = await WasmCorpusTerminal.create(fixture.definition)
+    try {
+      const split = Math.floor(fixture.payload.byteLength / 2)
+      uninterrupted.writeRaw(fixture.payload.subarray(0, split))
+      const snapshot = uninterrupted.binarySnapshot()
+      restored.restoreSnapshot(snapshot)
+      uninterrupted.clearEffects()
+      restored.clearEffects()
+      uninterrupted.writeRaw(fixture.payload.subarray(split))
+      restored.writeRaw(fixture.payload.subarray(split))
+      assert.deepEqual(
+        restored.observe("snapshot-continuation", 0, corpus.manifest.modes),
+        uninterrupted.observe("snapshot-continuation", 0, corpus.manifest.modes),
+        fixture.definition.id,
+      )
+    } finally {
+      restored.dispose()
+      uninterrupted.dispose()
+    }
+  }
+}, 30_000)
 
 test("WASM Ghostty satisfies the deterministic corpus and hand-authored assertions", async () => {
   const { corpus, output, json } = await runWasmCorpus()

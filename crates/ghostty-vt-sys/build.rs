@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const ZIG_VERSION: &str = "0.15.2";
+const ZIG_VERSION: &str = "0.16.0";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -23,18 +23,12 @@ fn main() {
     let version_file = repository.join("packages/ghostty-core/src/vendor/VERSION");
     println!("cargo:rerun-if-changed={}", version_file.display());
 
-    let patch_file = repository.join("patches/ghostty/lib-vt-osc-color-reports.patch");
-    println!("cargo:rerun-if-changed={}", patch_file.display());
-
     let revision = read_revision(&version_file);
-    let patch = fs::read(&patch_file)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", patch_file.display()));
-    let patch_id = patch_id(&patch);
-    let source = source_dir(&revision, patch_id);
-    validate_source(&source, &revision, &patch);
+    let source = source_dir(&revision);
+    validate_source(&source, &revision);
     let zig = zig_executable();
     validate_zig(&zig);
-    let zig_global_cache = zig_global_cache(&revision, patch_id);
+    let zig_global_cache = zig_global_cache(&revision);
 
     let target = required_env("TARGET");
     let profile = required_env("PROFILE");
@@ -45,7 +39,7 @@ fn main() {
     };
     let prefix = PathBuf::from(required_env("OUT_DIR"))
         .join("ghostty")
-        .join(format!("{revision}-{patch_id:016x}-{target}-{optimize}"));
+        .join(format!("{revision}-{target}-{optimize}"));
     let archive = static_archive(&prefix, &target);
 
     if !archive.is_file() {
@@ -130,26 +124,18 @@ fn cache_root() -> PathBuf {
     PathBuf::from(home).join(".cache/yaade/ghostty")
 }
 
-fn patch_id(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
-fn source_dir(revision: &str, patch_id: u64) -> PathBuf {
+fn source_dir(revision: &str) -> PathBuf {
     env::var_os("GHOSTTY_SOURCE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            cache_root().join(format!("source-{revision}-yaade-{patch_id:016x}"))
-        })
+        .unwrap_or_else(|| cache_root().join(format!("source-{revision}")))
 }
 
-fn zig_global_cache(revision: &str, patch_id: u64) -> PathBuf {
+fn zig_global_cache(revision: &str) -> PathBuf {
     let path = env::var_os("GHOSTTY_ZIG_GLOBAL_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| cache_root().join(format!("zig-global-{ZIG_VERSION}")));
     let stamp = path.join("yaade-prepared");
-    let expected = format!("{revision}\n{patch_id:016x}\n{ZIG_VERSION}\n");
+    let expected = format!("{revision}\n{ZIG_VERSION}\n");
     let actual = fs::read_to_string(&stamp).unwrap_or_else(|_| {
         panic!(
             "Ghostty Zig dependencies are not prepared at {}; run `vp run prepare:ghostty`",
@@ -168,12 +154,16 @@ fn zig_executable() -> OsString {
         return path;
     }
     let executable = if cfg!(windows) { "zig.exe" } else { "zig" };
-    let downloaded = cache_root().join(format!(
-        "zig-{ZIG_VERSION}-{}-{}/{}",
-        env::consts::OS,
-        env::consts::ARCH,
-        executable
-    ));
+    let host = match (env::consts::OS, env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("linux", "x86_64") => "linux-x64",
+        ("windows", "aarch64") => "win32-arm64",
+        ("windows", "x86_64") => "win32-x64",
+        _ => "unsupported",
+    };
+    let downloaded = cache_root().join(format!("zig-{ZIG_VERSION}-{host}/{executable}"));
     if downloaded.is_file() {
         downloaded.into_os_string()
     } else {
@@ -181,7 +171,7 @@ fn zig_executable() -> OsString {
     }
 }
 
-fn validate_source(source: &Path, revision: &str, patch: &[u8]) {
+fn validate_source(source: &Path, revision: &str) {
     if !source.join(".git").is_dir() {
         panic!(
             "Ghostty source is not prepared at {}; run `vp run prepare:ghostty`",
@@ -206,10 +196,9 @@ fn validate_source(source: &Path, revision: &str, patch: &[u8]) {
             .current_dir(source),
         "check prepared Ghostty patch",
     );
-    assert_eq!(
-        diff,
-        patch,
-        "prepared Ghostty source at {} does not match the repository patch",
+    assert!(
+        diff.is_empty(),
+        "prepared Ghostty source at {} is not a clean checkout",
         source.display()
     );
 }
@@ -273,7 +262,7 @@ fn build_ghostty(
         .arg("--global-cache-dir")
         .arg(zig_global_cache)
         .arg("--system")
-        .arg(zig_global_cache.join("p"));
+        .arg(source.join("zig-pkg"));
     run(&mut command, "build native libghostty-vt");
 }
 

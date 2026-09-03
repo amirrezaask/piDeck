@@ -5,10 +5,16 @@ import type {
 } from "@yaade/workspace"
 import { Schema } from "effect";
 import {
+  GHOSTTY_ENGINE_REVISION,
+  GHOSTTY_SNAPSHOT_FORMAT_VERSION,
+  MAX_TERMINAL_CHECKPOINT_BYTES,
   MuxEvent,
   TerminalPatchMessage,
   TerminalResyncRequiredMessage,
+  TERMINAL_CHECKPOINT_MAGIC,
+  TERMINAL_CHECKPOINT_VERSION,
   TerminalSnapshotMessage,
+  type TerminalCheckpoint,
 } from "@yaade/rpc";
 import type { YaadeHostTransport } from "./transport.js";
 import { TerminalV3Store } from "./terminal-v3-store.js";
@@ -38,15 +44,7 @@ type TerminalAttachResult = {
   ownerId?: string;
   ownerEpoch?: string;
   protocolVersion?: number;
-  checkpoint?: {
-    checkpointVersion: 1;
-    terminalEpoch: string;
-    sequence: number;
-    cols: number;
-    rows: number;
-    createdAt: string;
-    syntheticBytes: Uint8Array;
-  };
+  checkpoint?: TerminalCheckpoint;
   replayQuality?: "exact" | "checkpoint" | "degraded";
   outputChunks?: Uint8Array[];
   output: Uint8Array;
@@ -59,6 +57,37 @@ type TerminalAttachResult = {
   signal?: number;
   semanticSnapshot?: import("@yaade/rpc").TerminalSemanticSnapshot | null;
 };
+
+/** Reject stale or malformed checkpoint envelopes before invoking Ghostty. */
+async function validTerminalCheckpoint(
+  checkpoint: TerminalCheckpoint,
+  terminalEpoch: string | undefined,
+): Promise<boolean> {
+  const bytes = checkpoint.snapshotBytes
+  if (
+    checkpoint.magic !== TERMINAL_CHECKPOINT_MAGIC ||
+    checkpoint.checkpointVersion !== TERMINAL_CHECKPOINT_VERSION ||
+    checkpoint.terminalEpoch !== terminalEpoch ||
+    checkpoint.engine !== "ghostty-vt" ||
+    checkpoint.engineRevision !== GHOSTTY_ENGINE_REVISION ||
+    checkpoint.snapshotFormatVersion !== GHOSTTY_SNAPSHOT_FORMAT_VERSION ||
+    checkpoint.codec !== "none" ||
+    checkpoint.payloadBytes !== bytes.byteLength ||
+    checkpoint.payloadBytes > MAX_TERMINAL_CHECKPOINT_BYTES ||
+    bytes.byteLength < 10 ||
+    new TextDecoder().decode(bytes.subarray(0, 8)) !== "GHOSTSNP" ||
+    new DataView(bytes.buffer, bytes.byteOffset + 8, 2).getUint16(0, true) !==
+      GHOSTTY_SNAPSHOT_FORMAT_VERSION
+  ) return false
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) return false
+  const owned = new Uint8Array(bytes.byteLength)
+  owned.set(bytes)
+  const digest = new Uint8Array(await subtle.digest("SHA-256", owned.buffer))
+  let hex = ""
+  for (const byte of digest) hex += byte.toString(16).padStart(2, "0")
+  return hex === checkpoint.payloadSha256
+}
 
 /** Prefer acknowledged WS delivery for hot terminal I/O; fall back to HTTP RPC. */
 function invokeTerminalHot(
@@ -108,6 +137,10 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
     ReturnType<typeof setTimeout>
   >();
   const terminalReplayStreaming = new Set<string>();
+  const terminalCheckpointRestorers = new Map<
+    string,
+    NonNullable<TerminalAttachOptions["onCheckpoint"]>
+  >();
   let realtimeConnected = false;
   let reconnectGeneration = 0;
   let hadRealtimeDisconnect = false;
@@ -206,6 +239,25 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
     return transport.invoke("terminal:attach", id, afterSequence, mode);
   };
 
+  const restoreCheckpoint = async (
+    id: string,
+    result: TerminalAttachResult,
+    restore?: TerminalAttachOptions["onCheckpoint"],
+  ): Promise<number | null> => {
+    const checkpoint = result.checkpoint
+    const restoreSnapshot = restore ?? terminalCheckpointRestorers.get(id)
+    if (!checkpoint || !restoreSnapshot) return null
+    try {
+      if (!await validTerminalCheckpoint(checkpoint, result.terminalEpoch)) return null
+      await restoreSnapshot(checkpoint)
+      return checkpoint.sequence
+    } catch {
+      // The restore target is atomic. Fall back to exact raw history without
+      // exposing its rejected replacement core.
+      return null
+    }
+  }
+
   const previewNewestReplay = async (
     id: string,
     result: TerminalAttachResult,
@@ -218,9 +270,7 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
         : result.output.byteLength > 0
           ? [result.output]
           : [];
-    let previewChunks = result.checkpoint?.syntheticBytes.byteLength
-      ? [result.checkpoint.syntheticBytes, ...resultChunks]
-      : resultChunks;
+    let previewChunks = resultChunks;
     let replayTruncated = result.replayTruncated === true;
     if (previewChunks.length === 0) {
       try {
@@ -350,10 +400,12 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
           : result.output.byteLength > 0
             ? [result.output]
             : [];
+      const restoredSequence = await restoreCheckpoint(id, result)
+      const replayStart = restoredSequence ?? afterSequence
       const archived = await streamArchivedReplay(
         id,
-        result,
-        afterSequence,
+        restoredSequence === null ? result : { ...result, replayTruncated: false },
+        replayStart,
         generation,
       );
       if (archived.complete) chunks = [];
@@ -373,27 +425,6 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
       }
       terminalResyncing.delete(id);
       let firstReplayChunk = true;
-      if (result.checkpoint?.syntheticBytes.byteLength) {
-        const checkpoint = result.checkpoint.syntheticBytes;
-        if (
-          !deliverTerminalData(
-            id,
-            checkpoint,
-            true,
-            result.replayNeedsQueryResponses === true,
-            false,
-          )
-        ) {
-          bufferTerminalData(
-            id,
-            checkpoint,
-            0,
-            true,
-            result.replayNeedsQueryResponses === true,
-            false,
-          );
-        }
-      }
       for (const chunk of chunks) {
         const replayTruncated =
           firstReplayChunk && result.replayTruncated === true;
@@ -738,6 +769,9 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
         return { id: result.id }
       },
       attach: async (id, options) => {
+        if (options?.onCheckpoint) {
+          terminalCheckpointRestorers.set(id, options.onCheckpoint)
+        }
         const fullReplay = options?.replay === "full";
         const afterSequence = fullReplay
           ? 0
@@ -752,37 +786,26 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
           const result = await attachTerminal(id, afterSequence);
           if (!result) return result;
 
-          let replayDelivered = false;
-          let replayedThrough = result.lastSequence;
-          if (fullReplay && options?.onReplayPreview) {
+          const restoredSequence = await restoreCheckpoint(
+            id,
+            result,
+            options?.onCheckpoint,
+          )
+          let replayDelivered = restoredSequence !== null;
+          let replayedThrough = restoredSequence ?? replayAfterSequence;
+          if (restoredSequence === null && fullReplay && options?.onReplayPreview) {
             await previewNewestReplay(id, result, options.onReplayPreview);
           }
           if (options?.onReplay) {
-            let archiveCursor = replayAfterSequence;
-            if (!fullReplay && result.checkpoint?.syntheticBytes.byteLength) {
-              await options.onReplay({
-                data: result.checkpoint.syntheticBytes,
-                replayNeedsQueryResponses: false,
-                replayTruncated: false,
-              });
-              replayDelivered = true;
-              archiveCursor = Math.max(
-                archiveCursor,
-                result.checkpoint.sequence,
-              );
-            }
             const archived = await streamArchivedReplay(
               id,
-              result,
-              archiveCursor,
+              restoredSequence === null ? result : { ...result, replayTruncated: false },
+              restoredSequence ?? replayAfterSequence,
               undefined,
               options.onReplay,
             );
             replayDelivered = replayDelivered || archived.delivered;
-            replayedThrough = Math.max(
-              replayedThrough,
-              archived.lastSequence,
-            );
+            replayedThrough = Math.max(replayedThrough, archived.lastSequence);
             if (!archived.complete) {
               const chunks =
                 result.outputChunks && result.outputChunks.length > 0
@@ -803,13 +826,14 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
                 });
                 firstChunk = false;
                 replayDelivered = true;
+                replayedThrough = result.lastSequence;
               }
             }
           } else if ((terminalDataListeners.get(id)?.size ?? 0) > 0) {
             const archived = await streamArchivedReplay(
               id,
-              result,
-              replayAfterSequence,
+              restoredSequence === null ? result : { ...result, replayTruncated: false },
+              restoredSequence ?? replayAfterSequence,
             );
             replayedThrough = Math.max(
               replayedThrough,
@@ -937,6 +961,7 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
           terminalDataListeners.delete(id);
           terminalDataBuffers.delete(id);
           terminalDataBufferSizes.delete(id);
+          terminalCheckpointRestorers.delete(id);
           terminalBufferGaps.delete(id);
           terminalResyncing.delete(id);
           terminalResyncAgain.delete(id);
@@ -965,6 +990,7 @@ export function createYaadeApi(transport: YaadeHostTransport): YaadeHostAPI {
         terminalDataBuffers.delete(id);
         terminalDataBufferSizes.delete(id);
         terminalDataListeners.delete(id);
+        terminalCheckpointRestorers.delete(id);
         terminalReplayFloors.delete(id);
         terminalBufferGaps.delete(id);
         terminalResyncing.delete(id);

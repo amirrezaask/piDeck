@@ -39,7 +39,7 @@ pre-existing working-tree changes, honor STOP conditions, and update its status.
 | [021](021-safe-rust-libghostty-vt-wrapper.md) | Wrap libghostty-vt in a thread-confined safe Rust API | SolPro P1-7 wrapper | P2 | M | 020 | DONE |
 | [022](022-native-wasm-ghostty-differential-corpus.md) | Run one terminal corpus through native and WASM Ghostty | SolPro P1-7 parity | P2 | M | 015, 020, 021 | DONE |
 | [023](023-migrate-server-terminal-state-to-ghostty.md) | Replace server vt100 and custom scanners with native Ghostty | SolPro P1-7/8 migration | P2 | L | 019, 021, 022 | DONE |
-| [024](blocked/024-terminal-checkpoint-restore-contract.md) | Prove checkpoint restore feasibility before defining its wire format | SolPro P1-8 checkpoint | P2 | M | 018, 022, 023, 027 | BLOCKED (023) |
+| [024](024-terminal-checkpoint-restore-contract.md) | Integrate the proven Ghostty checkpoint restore contract | SolPro P1-8 checkpoint | P2 | M | 018, 022, 023, 027 | DONE |
 | [025](025-worker-presentation-suppression.md) | Suppress hidden and synchronized worker frame preparation | SolPro P1-9/10 | P2 | M | 014, 015, 016 | DONE |
 | [026](026-focused-terminal-worker-fairness.md) | Bound shared-worker queues and prioritize focused terminals fairly | SolPro worker priority | P2 | M | 015, 025, 027 | DONE |
 | [027](027-browser-terminal-subsystem-benchmarks.md) | Build a browser terminal subsystem benchmark harness | SolPro benchmark discipline | P2 | M | 014, 015, 016, 025 | DONE |
@@ -48,15 +48,15 @@ pre-existing working-tree changes, honor STOP conditions, and update its status.
 | [030](030-idle-high-water-buffer-reclamation.md) | Reclaim oversized terminal buffers after measured idle periods | SolPro idle reclamation | P3 | M | 016, 018, 019, 025, 027 | DONE |
 | [031](031-conditional-shaped-run-cache.md) | Add a shaped-run cache only when profiling or conformance requires it | SolPro conditional shaping | P3 | M | 009, 014, 022, 027 | TODO |
 | [032](032-restart-safe-workspace-catalog.md) | Preserve the workspace catalog and terminal history across host restart | SL continuity/history | P1 | L | 018, 019 | DONE |
-| [033](033-authoritative-semantic-terminal-stream.md) | Complete authoritative semantic snapshot/patch/resync streaming | SL exact reattach/observation | P1 | L | 017, 019, 022, 023 | TODO |
-| [034](034-progressive-scrollback-search.md) | Deliver current-screen-first reattach, million-line scrollback, and search | SL history/search/perf | P1 | L | 018, 023, 024 decision, 027, 033 | TODO |
+| [033](033-authoritative-semantic-terminal-stream.md) | Complete authoritative semantic snapshot/patch/resync streaming | SL exact reattach/observation | P1 | L | 017, 019, 022, 023 | REJECTED (wrong data plane) |
+| [034](034-progressive-scrollback-search.md) | Deliver current-screen-first reattach, million-line scrollback, and search | SL history/search/perf | P1 | L | 018, 023, 024, 027 | TODO |
 | [035](035-command-registry-and-palette.md) | Centralize commands and ship command/session palettes | SL command discovery | P1 | M | — | DONE |
-| [036](036-session-activity-history-notifications.md) | Surface truthful activity, lifecycle history, archives, and notifications | SL session intelligence | P2 | L | 032, 033, 035 | TODO |
+| [036](036-session-activity-history-notifications.md) | Surface truthful activity, lifecycle history, archives, and notifications | SL session intelligence | P2 | L | 024, 032, 035 | TODO |
 | [037](037-secure-host-onboarding-and-device-trust.md) | Turn device auth into secure remote-host onboarding and trust management | SL pairing/remote trust | P1 | L | — | TODO |
-| [038](038-device-scoped-collaboration-and-control.md) | Add device-scoped collaboration, presence, roles, and control transfer | SL collaboration | P2 | L | 033, 035, 036, 037 | TODO |
+| [038](038-device-scoped-collaboration-and-control.md) | Add device-scoped collaboration, presence, roles, and control transfer | SL collaboration | P2 | L | 024, 035, 036, 037 | TODO |
 | [039](039-terminal-safety-and-accessibility.md) | Harden clipboard, paste, links, and screen-reader behavior | SL safety/accessibility | P1 | L | 023, 034, 035, 037 | TODO |
-| [040](040-protocol-conformance-fuzz-compatibility.md) | Gate releases on conformance, fuzzing, and version compatibility | SL correctness/security | P1 | L | 015, 017, 018, 022, 023, 033, 037–039 | TODO |
-| [041](041-chaos-soak-and-durability-gates.md) | Prove reconnect, restart, multi-host, and resource durability | SL reliability/soak | P1 | L | 018, 019, 024 decision, 032, 033, 037, 040 | TODO |
+| [040](040-protocol-conformance-fuzz-compatibility.md) | Gate releases on conformance, fuzzing, and version compatibility | SL correctness/security | P1 | L | 015, 017, 018, 022–024, 037–039 | TODO |
+| [041](041-chaos-soak-and-durability-gates.md) | Prove reconnect, restart, multi-host, and resource durability | SL reliability/soak | P1 | L | 018, 019, 024, 032, 037, 040 | TODO |
 | [042](042-operational-telemetry-diagnostics-slos.md) | Establish content-safe diagnostics, telemetry, and enforced SLOs | SL operations/quality | P1 | L | 027, 032–034, 040, 041 | TODO |
 | [043](043-shared-native-desktop-ios-shells.md) | Harden Tauri desktop and validate an iOS/iPadOS remote shell | SL native platforms | P2 | L | 029, 035, 037, 039, 041 | TODO |
 | [044](044-signed-release-and-safe-updates.md) | Ship signed releases and non-surprising updates | SL distribution/lifecycle | P3 | L | 029, 032, 040, 042, 043 decision | TODO |
@@ -142,7 +142,7 @@ The demonstrated gaps and their owners are:
 | Demonstrated evidence at `a0bb3fc9` | Disposition |
 |---|---|
 | Host startup calls `reset_runtime_state`, discarding persisted Session/Window/terminal rows | Plan 032 preserves metadata/history and marks dead PTYs interrupted; it does not promise process resurrection |
-| Semantic/both attach is rejected; v3 codec wraps JSON; semantic renderer is not the active exact path | Plan 033 completes authoritative snapshot/patch/hash/resync on Plan 023's native Ghostty owner |
+| Attach lacks a restorable snapshot/READY cut; v3 wraps JSON and semantic diffs are not exact parser state | Plan 024 integrates public Ghostty snapshots plus ordered raw bytes; Plan 033 is rejected |
 | Reattach requests full history from the oldest page; browser Ghostty caps scrollback at 10,000 rows; no integrated find | Plan 034 adds current-screen-first handoff and bounded indexed cold rows/search |
 | Commands are split between IDs, a component switch, empty prefix groups, and separate pickers | Plan 035 creates one registry and searchable command/session palettes |
 | Low-level activity exists but no content-free lifecycle ledger, attention model, archive workflow, or notifications | Plan 036 adds truthful explicit-source session intelligence |
@@ -213,9 +213,9 @@ Three comparison expectations are constrained rather than silently promised:
   a native wrapper, and the same-revision WASM loader.
 - **023 after 019/021/022:** migrate only after the terminal actor can confine the
   native handle and parity fixtures explain semantic differences.
-- **024 after 018/022/023/027:** checkpoint decisions need indexed history,
+- **024 after 018/022/023/027:** snapshot integration needs indexed history,
   server/native parity, and measured maximum-history raw replay. The pinned ABI
-  is expected to block public state restore.
+  now provides complete public snapshot restore.
 - **025 after 014/015/016:** hidden/synchronized suppression relies on byte
   commands, recyclable slots, and stabilized retained-renderer semantics.
 - **027 after 025:** subsystem metrics must include final hidden/synchronized
@@ -233,19 +233,18 @@ Three comparison expectations are constrained rather than silently promised:
 - **032 after 018/019:** restart-safe catalog reconciliation needs durable
   archive ownership and a single terminal lifecycle owner; it keeps host death
   process-destructive.
-- **033 after 017/019/022/023:** semantic publication needs isolated outbound
-  lanes, one terminal actor, native/WASM public-state parity, and native Ghostty
-  as the server authority.
-- **034 after 018/023/024-decision/027/033:** current-screen-first handoff and
-  cold semantic rows depend on exact history, the final parser authority, the
-  checkpoint feasibility outcome, benchmark fences, and semantic snapshots.
+- **033 is rejected:** semantic screen diffs are not the capable-client data
+  plane; Plan 024 owns snapshot plus ordered-byte replication.
+- **034 after 018/023/024/027:** current-screen-first handoff and cold indexed
+  rows depend on exact history, the final parser authority, snapshot integration,
+  and benchmark fences.
 - **035 independently:** the command registry can land early and becomes the
   source for later activity, collaboration, accessibility, and native menus.
-- **036 after 032/033/035:** truthful history/activity uses durable lifecycle,
-  explicit semantic markers, and stable command surfaces.
+- **036 after 024/032/035:** truthful history/activity uses durable lifecycle,
+  replicated terminal markers, and stable command surfaces.
 - **037 independently:** secure pairing productizes existing device-auth owners
   and is required before collaboration or remote-native credential work.
-- **038 after 033/035/036/037:** collaboration needs exact observer state, stable
+- **038 after 024/035/036/037:** collaboration needs exact observer state, stable
   commands/activity events, and verified device identity.
 - **039 after 023/034/035/037:** OSC policy belongs to the native parser owner;
   accessibility consumes paged rows and commands; permissions bind verified hosts.
@@ -292,16 +291,16 @@ first incomplete dependency rather than rerunning completed migrations.
 5. Run Plan 025 after 015/016. Run Plan 023 after 019/021/022.
 6. Run Plan 027 after 025. Then Plans 026, 028, and 031 may run as isolated,
    measured experiments and may correctly end `REJECTED`.
-7. Run Plans 024 and 029 after 023/027. Plan 024 may correctly end `BLOCKED` if
-   the pinned public Ghostty API cannot restore parser state. Run Plan 030 after
-   all of its owner/benchmark dependencies.
+7. Run Plans 024 and 029 after 023/027. Plan 024 selected Outcome A and completed
+   production snapshot integration using the pinned public Ghostty interface.
+   Run Plan 030 after all of its owner/benchmark dependencies.
 8. Run Plan 032 after 018/019. It can proceed before native Ghostty migration but
    must reconcile Plan 023 state if that migration already landed.
-9. Run Plan 033 after 017/019/022/023, then Plan 034 after the Plan 024 decision
-   and Plan 027 measurements.
-10. Run Plan 036 after 032/033/035. Run Plan 039 after 023/034/035/037. These may
+9. Do not run rejected Plan 033. Run Plan 034 after Plan 024's snapshot path and
+   Plan 027 measurements.
+10. Run Plan 036 after 024/032/035. Run Plan 039 after 023/034/035/037. These may
     use isolated worktrees but both touch shared Session/terminal chrome.
-11. Run Plan 038 after 033/035/036/037.
+11. Run Plan 038 after 024/035/036/037.
 12. Run Plan 040 after 038/039 so the conformance manifest covers the final auth,
     collaboration, clipboard, and accessibility protocol boundaries.
 13. Run Plan 041 after 040, then Plan 042 after one valid chaos/soak campaign.
@@ -579,13 +578,12 @@ passing broad legacy ceilings.
 - **Moving Canvas/WebGL to OffscreenCanvas before measurement:** deferred. Plans
   004/005 remove parser contention first; Plan 007 must show remaining renderer
   submission work before another worker/canvas failure domain is justified.
-- **Persisting Ghostty page memory as a checkpoint:** rejected. The pinned C ABI
-  exposes render traversal but no public versioned parser-state restore. Plan 024
-  must not persist private pages, pointers, offsets, or allocator state.
-- **Treating a compact render snapshot as restorable terminal state:** rejected
-  until libghostty-vt exposes matching public export/import or YAADE chooses a
-  different terminal-state authority. Plan 023 keeps the current synthetic
-  bootstrap as a transitional path; Plan 024 may end `BLOCKED`.
+- **Persisting Ghostty page memory as a checkpoint:** rejected. Plan 024 uses the
+  public versioned snapshot format, never private pages, pointers, offsets, or
+  allocator state.
+- **Treating a compact render snapshot as restorable terminal state:** rejected.
+  The pinned libghostty-vt snapshot API restores complete parser continuation;
+  render projections and the synthetic bootstrap do not.
 - **Adding shared-worker priority without contention evidence:** rejected by
   default. Plan 026 implements it only when measured FIFO misses explicit latency
   or fairness bounds.

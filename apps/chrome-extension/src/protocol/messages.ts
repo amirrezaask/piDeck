@@ -16,6 +16,7 @@ export const RuntimeRequestSchema = Schema.Union(
   Schema.Struct({ type: Schema.Literal('tab/set-pinned'), tabId: Id, pinned: Schema.Boolean }),
   Schema.Struct({ type: Schema.Literal('tab/set-muted'), tabId: Id, muted: Schema.Boolean }),
   Schema.Struct({ type: Schema.Literal('keyboard-shortcut/get') }),
+  Schema.Struct({ type: Schema.Literal('keyboard-shortcut/configure') }),
   Schema.Struct({ type: Schema.Literal('theme/set'), theme: ThemeSchema }),
   Schema.Struct({ type: Schema.Literal('test/invoke') }),
 );

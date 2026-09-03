@@ -61,7 +61,7 @@ Open it with the toolbar action or:
 - macOS: **Command+Shift+K**
 - Windows/Linux: **Ctrl+Shift+K**
 
-Chrome can decline a suggested command or another extension may claim it. Visit `chrome://extensions/shortcuts` to assign or change the shortcut. Switcher shows a footer warning and an `!` toolbar badge while it is unassigned.
+Chrome can decline a suggested command or another extension may claim it. Select the shortcut in Switcher’s footer to open Chrome’s shortcut settings, where you can assign or change it. Switcher shows a footer warning and an `!` toolbar badge while it is unassigned.
 
 Search matches tab titles, hostnames, paths, and full URLs. Switcher keeps the result area hidden until you type.
 

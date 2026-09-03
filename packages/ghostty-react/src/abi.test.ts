@@ -30,7 +30,10 @@ function layoutsFor(instance: WebAssembly.Instance): Record<string, Layout> {
   const bytes = new Uint8Array(memory.buffer)
   let end = typeJson
   while (end < bytes.length && bytes[end] !== 0) end += 1
-  return JSON.parse(new TextDecoder().decode(bytes.subarray(typeJson, end))) as Record<string, Layout>
+  const metadata = JSON.parse(
+    new TextDecoder().decode(bytes.subarray(typeJson, end)),
+  ) as Record<string, Layout> & { types?: Record<string, Layout> }
+  return metadata.types ?? metadata
 }
 
 test("vendored Ghostty WASM is pinned to its declared source revision", async () => {
@@ -42,8 +45,8 @@ test("vendored Ghostty WASM is pinned to its declared source revision", async ()
   const instance = getInstance(instantiated)
   const memory = instance.exports.memory
   assert.ok(memory instanceof WebAssembly.Memory)
-  const alloc = getFunction(instance.exports, "ghostty_wasm_alloc_u8_array")
-  const free = getFunction(instance.exports, "ghostty_wasm_free_u8_array")
+  const alloc = getFunction(instance.exports, "ghostty_wasm_alloc")
+  const free = getFunction(instance.exports, "ghostty_wasm_free")
   const buildInfo = getFunction(instance.exports, "ghostty_build_info")
   const output = alloc(8)
 
@@ -66,34 +69,33 @@ test("vendored Ghostty ABI supports the adapter's initialization and mode paths"
   const memory = instance.exports.memory
   assert.ok(memory instanceof WebAssembly.Memory)
   const layouts = layoutsFor(instance)
-  assert.equal(layouts.GhosttyTerminalOptions?.size, 8)
-  assert.equal(layouts.GhosttyTerminalOptions?.fields?.max_scrollback?.type, "u32")
-  assert.equal("GhosttyTerminalModeConfig" in layouts, false)
+  assert.equal(layouts.GhosttyTerminalModeConfig?.size, 4)
+  assert.equal(layouts.GhosttyTerminalModeConfig?.fields?.mode?.type, "GhosttyMode")
 
-  const alloc = getFunction(instance.exports, "ghostty_wasm_alloc_u8_array")
-  const free = getFunction(instance.exports, "ghostty_wasm_free_u8_array")
+  const alloc = getFunction(instance.exports, "ghostty_wasm_alloc")
+  const free = getFunction(instance.exports, "ghostty_wasm_free")
   const allocOpaque = getFunction(instance.exports, "ghostty_wasm_alloc_opaque")
   const freeOpaque = getFunction(instance.exports, "ghostty_wasm_free_opaque")
   const terminalNew = getFunction(instance.exports, "ghostty_terminal_new")
   const terminalFree = getFunction(instance.exports, "ghostty_terminal_free")
-  const terminalModeGet = getFunction(instance.exports, "ghostty_terminal_mode_get")
-  const options = alloc(8)
-  const optionsView = new DataView(memory.buffer, options, 8)
-  optionsView.setUint16(0, 80, true)
-  optionsView.setUint16(2, 24, true)
-  optionsView.setUint32(4, 10_000, true)
+  const terminalSet = getFunction(instance.exports, "ghostty_terminal_set")
+  const terminalGet = getFunction(instance.exports, "ghostty_terminal_get")
   const terminalSlot = allocOpaque()
 
-  assert.equal(terminalNew(0, terminalSlot, options), 0)
+  assert.equal(terminalNew(0, terminalSlot, 80, 24), 0)
   const terminal = new DataView(memory.buffer).getUint32(terminalSlot, true)
-  const mode = alloc(1)
-  assert.equal(terminalModeGet(terminal, 1003, mode), 0)
-  assert.equal(new Uint8Array(memory.buffer, mode, 1)[0], 0)
+  const value = alloc(4)
+  const valueView = new DataView(memory.buffer, value, 4)
+  valueView.setUint32(0, 10_000, true)
+  assert.equal(terminalSet(terminal, 28, value), 0)
+  valueView.setUint16(0, 1003, true)
+  valueView.setUint8(2, 0)
+  assert.equal(terminalGet(terminal, 37, value), 0)
+  assert.equal(valueView.getUint8(2), 0)
 
-  free(mode, 1)
+  free(value, 4)
   terminalFree(terminal)
   freeOpaque(terminalSlot)
-  free(options, 8)
 })
 
 test("PTY trampoline stays a tiny single-callback asset", async () => {

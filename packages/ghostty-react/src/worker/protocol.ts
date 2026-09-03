@@ -8,7 +8,7 @@ import {
   type GhosttyTheme,
 } from "../core.js";
 
-export const TERMINAL_WORKER_PROTOCOL_VERSION = 2 as const;
+export const TERMINAL_WORKER_PROTOCOL_VERSION = 3 as const;
 
 export type SerializedKeyEvent = {
   readonly key: string;
@@ -36,6 +36,7 @@ export type TerminalWorkerCommandPayload =
   | { readonly type: "writeBytes"; readonly data: Uint8Array<ArrayBuffer> }
   | { readonly type: "writeReplayBytes"; readonly chunks: readonly Uint8Array<ArrayBuffer>[] }
   | { readonly type: "resetAndWriteBytes"; readonly data: Uint8Array<ArrayBuffer> }
+  | { readonly type: "restoreSnapshot"; readonly data: Uint8Array<ArrayBuffer> }
   | { readonly type: "recycleRenderUpdate"; readonly slotId: number; readonly leaseToken: number; readonly buffers: GhosttyRenderUpdateBuffers }
   | { readonly type: "resize"; readonly cols: number; readonly rows: number; readonly cellWidth: number; readonly cellHeight: number }
   | { readonly type: "setTheme"; readonly theme: GhosttyTheme }
@@ -89,10 +90,12 @@ export type TerminalRuntimeState = {
 export type TerminalWorkerEvent = Envelope & (
   | { readonly type: "ready" }
   | { readonly type: "completed" }
-  | { readonly type: "packedUpdate"; readonly slotId: number; readonly leaseToken: number; readonly update: GhosttyRenderUpdate; readonly state: TerminalRuntimeState }
+  | { readonly type: "packedUpdate"; readonly slotId: number; readonly leaseToken: number; readonly update: GhosttyRenderUpdate; readonly state: TerminalRuntimeState; readonly diagnostics: TerminalWorkerDiagnostics }
   | { readonly type: "encodedInput"; readonly data: string }
   | { readonly type: "parsed"; readonly diagnostics: TerminalWorkerDiagnostics }
   | { readonly type: "selectionResult"; readonly result: unknown }
+  | { readonly type: "snapshotRestored" }
+  | { readonly type: "snapshotRejected"; readonly message: string }
   | { readonly type: "recoverableError" | "fatalError"; readonly message: string }
   | { readonly type: "disposed" }
 );
@@ -109,7 +112,7 @@ function validEnvelope(value: Record<string, unknown>): boolean {
 }
 
 const COMMAND_TYPES = new Set([
-  "create", "writeBytes", "writeReplayBytes", "resetAndWriteBytes", "recycleRenderUpdate", "resize", "setTheme", "setPresentationState",
+  "create", "writeBytes", "writeReplayBytes", "resetAndWriteBytes", "restoreSnapshot", "recycleRenderUpdate", "resize", "setTheme", "setPresentationState",
   "setFontMetrics", "key", "paste", "text", "mouse", "setSelection", "clearSelection",
   "selectAll", "selectWord", "selectLine", "scroll", "scrollToBottom",
   "viewportPointToScreen", "screenPointToViewport", "requestFullFrame", "dispose",
@@ -118,7 +121,7 @@ const COMMAND_TYPES = new Set([
 export function validateTerminalWorkerCommand(value: unknown): value is TerminalWorkerCommand {
   if (!isRecord(value) || !validEnvelope(value) || !COMMAND_TYPES.has(String(value.type))) return false;
   switch (value.type) {
-    case "writeBytes": case "resetAndWriteBytes":
+    case "writeBytes": case "resetAndWriteBytes": case "restoreSnapshot":
       return value.data instanceof Uint8Array && value.data.byteLength > 0 && value.data.buffer.byteLength > 0;
     case "writeReplayBytes":
       return Array.isArray(value.chunks) && value.chunks.length > 0 &&
@@ -166,15 +169,16 @@ function validateState(value: unknown): value is TerminalRuntimeState {
 export function validateTerminalWorkerEvent(value: unknown): value is TerminalWorkerEvent {
   if (!isRecord(value) || !validEnvelope(value) || typeof value.type !== "string") return false;
   switch (value.type) {
-    case "ready": case "completed": case "disposed": return true;
+    case "ready": case "completed": case "snapshotRestored": case "disposed": return true;
     case "parsed": return validateDiagnostics(value.diagnostics);
     case "encodedInput": return typeof value.data === "string";
     case "packedUpdate": return Number.isSafeInteger(value.slotId) && Number(value.slotId) >= 0 &&
       Number.isSafeInteger(value.leaseToken) && Number(value.leaseToken) >= 1 &&
       validateGhosttyRenderUpdate(value.update) && validateState(value.state) &&
+      validateDiagnostics(value.diagnostics) &&
       value.update.version === GHOSTTY_RENDER_UPDATE_VERSION;
     case "selectionResult": return "result" in value;
-    case "recoverableError": case "fatalError": return typeof value.message === "string";
+    case "snapshotRejected": case "recoverableError": case "fatalError": return typeof value.message === "string";
     default: return false;
   }
 }
@@ -200,7 +204,7 @@ export function terminalRenderUpdateBufferTransferList(buffers: GhosttyRenderUpd
 }
 
 export function terminalByteCommandTransferList(
-  command: Extract<TerminalWorkerCommand, { readonly type: "writeBytes" | "writeReplayBytes" | "resetAndWriteBytes" }>,
+  command: Extract<TerminalWorkerCommand, { readonly type: "writeBytes" | "writeReplayBytes" | "resetAndWriteBytes" | "restoreSnapshot" }>,
 ): Transferable[] {
   return command.type === "writeReplayBytes"
     ? command.chunks.map(chunk => chunk.buffer)

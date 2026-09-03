@@ -30,6 +30,8 @@ const BLOCK_HEADER_BYTES: usize = 16;
 const RECORD_HEADER_BYTES: usize = 12;
 const ACTIVE_RECORD_HEADER_BYTES: usize = 16;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
+const MAX_CHECKPOINT_BYTES: usize = 1024 * 1024;
+const CHECKPOINT_FILE: &str = "checkpoint.json";
 const MAX_BLOCK_RECORDS: usize = 1_000_000;
 const INGEST_MAX_MESSAGES: usize = 1024;
 const INGEST_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -201,8 +203,14 @@ struct AppendCommand {
     data: Bytes,
 }
 
+struct CheckpointCommand {
+    terminal_id: String,
+    data: Bytes,
+}
+
 enum IngestCommand {
     Append(AppendCommand),
+    Checkpoint(CheckpointCommand),
     Snapshot(mpsc::Sender<Result<(), String>>),
     Barrier(mpsc::Sender<Result<(), String>>),
     Shutdown(mpsc::Sender<Result<(), String>>),
@@ -341,6 +349,41 @@ impl TerminalHistoryArchive {
             return Err(HistoryError::Corrupt("history owner stopped".to_owned()));
         }
         Ok(())
+    }
+
+    /// Queue an opaque validated checkpoint for atomic replacement by the
+    /// history owner. The previous file remains valid until rename commits.
+    pub fn persist_checkpoint(&self, terminal_id: &str, data: Bytes) -> Result<(), HistoryError> {
+        if data.is_empty() || data.len() > MAX_CHECKPOINT_BYTES {
+            return Err(HistoryError::Corrupt(format!(
+                "checkpoint must contain 1..={MAX_CHECKPOINT_BYTES} bytes"
+            )));
+        }
+        self.shared.reserve_ingest_bytes(data.len());
+        let bytes = data.len();
+        if self
+            .ingest_tx
+            .send(IngestCommand::Checkpoint(CheckpointCommand {
+                terminal_id: terminal_id.to_owned(),
+                data,
+            }))
+            .is_err()
+        {
+            self.shared.release_ingest_bytes(bytes);
+            return Err(HistoryError::Corrupt("history owner stopped".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Read the latest atomically committed opaque checkpoint.
+    pub fn read_checkpoint(&self, terminal_id: &str) -> Result<Option<Bytes>, HistoryError> {
+        self.snapshot()?;
+        let path = self.shared.terminal_dir(terminal_id).join(CHECKPOINT_FILE);
+        match fs::read(path) {
+            Ok(data) => Ok(Some(Bytes::from(data))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn inspect(
@@ -717,6 +760,26 @@ impl HistoryShared {
         self.budget.available.notify_all();
     }
 
+    fn persist_checkpoint_owned(&self, command: CheckpointCommand) -> Result<(), HistoryError> {
+        let state = self.state_for(&command.terminal_id)?;
+        let dir = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .dir
+            .clone();
+        let target = dir.join(CHECKPOINT_FILE);
+        let temporary = dir.join(format!("{CHECKPOINT_FILE}.tmp"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&command.data)?;
+        file.sync_all()?;
+        fs::rename(temporary, target)?;
+        Ok(())
+    }
+
     fn append_owned(&self, command: AppendCommand) -> Result<(), HistoryError> {
         let state = self.state_for(&command.terminal_id)?;
         let mut state = state
@@ -1054,6 +1117,13 @@ fn run_history_owner(
             IngestCommand::Append(command) => {
                 let bytes = command.data.len();
                 if let Err(error) = shared.append_owned(command) {
+                    shared.record_error(&error);
+                }
+                shared.release_ingest_bytes(bytes);
+            }
+            IngestCommand::Checkpoint(command) => {
+                let bytes = command.data.len();
+                if let Err(error) = shared.persist_checkpoint_owned(command) {
                     shared.record_error(&error);
                 }
                 shared.release_ingest_bytes(bytes);
@@ -1600,6 +1670,42 @@ mod tests {
         assert_eq!(older.last_sequence, 2);
         assert!(older.complete);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn checkpoint_replacement_is_atomic_and_bounded() {
+        let root = temp_dir();
+        let archive = TerminalHistoryArchive::with_limits(&root, 1024, 1024).expect("archive");
+        archive
+            .persist_checkpoint("term-checkpoint", Bytes::from_static(b"first"))
+            .expect("first checkpoint");
+        assert_eq!(
+            archive
+                .read_checkpoint("term-checkpoint")
+                .expect("read first")
+                .as_deref(),
+            Some(b"first".as_slice())
+        );
+        archive
+            .persist_checkpoint("term-checkpoint", Bytes::from_static(b"second"))
+            .expect("replacement checkpoint");
+        assert_eq!(
+            archive
+                .read_checkpoint("term-checkpoint")
+                .expect("read replacement")
+                .as_deref(),
+            Some(b"second".as_slice())
+        );
+        assert!(
+            archive
+                .persist_checkpoint(
+                    "term-checkpoint",
+                    Bytes::from(vec![0; MAX_CHECKPOINT_BYTES + 1])
+                )
+                .is_err()
+        );
+        drop(archive);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

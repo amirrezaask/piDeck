@@ -3,7 +3,7 @@ const escape = String.fromCodePoint(27)
 const backgroundQuery = `${escape}]11;?\x07`
 const statusQuery = `${escape}[5n`
 const backgroundResponse = new RegExp(
-  `${escape}\\]11;rgb:([\\da-f]{1,4}\\/[\\da-f]{1,4}\\/[\\da-f]{1,4})${escape}\\\\`,
+  `${escape}\\]11;rgb:([\\da-f]{1,4}\\/[\\da-f]{1,4}\\/[\\da-f]{1,4})(?:\x07|${escape}\\\\)`,
   "i",
 )
 

@@ -91,6 +91,10 @@ const commandShortcut = (): Effect.Effect<string | undefined, ChromeApiError> =>
 
 const makeCommands = () => ({
   getShortcut: commandShortcut,
+  openShortcutSettings: () =>
+    fromPromise('tabs.create.shortcut-settings', () =>
+      browser.tabs.create({ url: 'chrome://extensions/shortcuts' }),
+    ).pipe(Effect.asVoid),
   updateBadge: () =>
     commandShortcut().pipe(
       Effect.flatMap((shortcut) =>
@@ -110,17 +114,26 @@ const makeTabs = (
   storage: ReturnType<typeof makeStorage>,
   commands: ReturnType<typeof makeCommands>,
 ) => {
-  const snapshot = (context: InvocationContext, fallback: boolean) =>
-    Effect.all(
+  const snapshot = (context: InvocationContext, fallback: boolean) => {
+    const tabId = context.tabId;
+    const pageZoom =
+      fallback || tabId === undefined
+        ? Effect.succeed(1)
+        : fromPromise('tabs.getZoom', () => browser.tabs.getZoom(tabId), { tabId }).pipe(
+            Effect.catchAll(() => Effect.succeed(1)),
+          );
+
+    return Effect.all(
       [
         fromPromise('tabs.query', () => browser.tabs.query({ windowType: 'normal' })),
         commands.getShortcut(),
         storage.getTheme(),
+        pageZoom,
       ],
       { concurrency: 'unbounded' },
     ).pipe(
       Effect.tap(() => commands.updateBadge()),
-      Effect.map(([tabs, shortcut, theme]) => ({
+      Effect.map(([tabs, shortcut, theme, zoom]) => ({
         ok: true as const,
         type: 'snapshot' as const,
         data: {
@@ -133,9 +146,11 @@ const makeTabs = (
           ...(shortcut === undefined ? {} : { shortcut }),
           theme,
           fallback,
+          pageZoom: zoom,
         },
       })),
     );
+  };
 
   const updateTab = (tabId: number, change: chrome.tabs.UpdateProperties, operation: string) =>
     fromPromise(operation, () => browser.tabs.update(tabId, change), { tabId }).pipe(

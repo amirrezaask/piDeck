@@ -1,46 +1,21 @@
 use std::ffi::c_void;
-use std::mem::{align_of, offset_of, size_of};
+use std::mem::{align_of, size_of};
 use std::ptr;
 
 use ghostty_vt_sys as ffi;
 
 unsafe extern "C" {
-    fn yaade_abi_terminal_options_size() -> usize;
-    fn yaade_abi_terminal_options_align() -> usize;
-    fn yaade_abi_terminal_options_cols_offset() -> usize;
-    fn yaade_abi_terminal_options_rows_offset() -> usize;
-    fn yaade_abi_terminal_options_scrollback_offset() -> usize;
     fn yaade_abi_string_size() -> usize;
     fn yaade_abi_string_align() -> usize;
     fn yaade_abi_result_success() -> i32;
-    fn yaade_abi_build_info_simd() -> u32;
-    fn yaade_abi_build_info_version_build() -> u32;
+    fn yaade_abi_build_info_simd() -> i32;
+    fn yaade_abi_build_info_version_build() -> i32;
 }
 
 #[test]
 fn public_layout_and_discriminants_match_c() {
     // SAFETY: These verifier functions take no pointers and return C compile-time values.
     unsafe {
-        assert_eq!(
-            size_of::<ffi::TerminalOptions>(),
-            yaade_abi_terminal_options_size()
-        );
-        assert_eq!(
-            align_of::<ffi::TerminalOptions>(),
-            yaade_abi_terminal_options_align()
-        );
-        assert_eq!(
-            offset_of!(ffi::TerminalOptions, cols),
-            yaade_abi_terminal_options_cols_offset()
-        );
-        assert_eq!(
-            offset_of!(ffi::TerminalOptions, rows),
-            yaade_abi_terminal_options_rows_offset()
-        );
-        assert_eq!(
-            offset_of!(ffi::TerminalOptions, max_scrollback),
-            yaade_abi_terminal_options_scrollback_offset()
-        );
         assert_eq!(size_of::<ffi::String>(), yaade_abi_string_size());
         assert_eq!(align_of::<ffi::String>(), yaade_abi_string_align());
         assert_eq!(ffi::Result::SUCCESS, yaade_abi_result_success());
@@ -80,6 +55,68 @@ fn build_info_identifies_the_pinned_non_simd_artifact() {
 }
 
 #[test]
+fn checkpoint_capability_exports_and_imports_public_state() {
+    let mut terminal: ffi::Terminal = ptr::null_mut();
+    let input = b"before\x1b[31";
+    // SAFETY: All handles and buffers follow the public libghostty-vt contract.
+    unsafe {
+        assert_eq!(
+            ffi::ghostty_terminal_new(ptr::null(), &raw mut terminal, 80, 24),
+            ffi::Result::SUCCESS
+        );
+        let continuation_limit = 1024 * 1024usize;
+        assert_eq!(
+            ffi::ghostty_terminal_set(
+                terminal,
+                ffi::TerminalOption::CONTINUATION_MAX_BYTES,
+                ptr::from_ref(&continuation_limit).cast::<c_void>(),
+            ),
+            ffi::Result::SUCCESS
+        );
+        ffi::ghostty_terminal_vt_write(terminal, input.as_ptr(), input.len());
+        let mut required = 0usize;
+        assert_eq!(
+            ffi::ghostty_snapshot_encode_buf(terminal, ptr::null_mut(), 0, &raw mut required,),
+            ffi::Result::OUT_OF_SPACE
+        );
+        let mut snapshot = vec![0u8; required];
+        let mut written = 0usize;
+        assert_eq!(
+            ffi::ghostty_snapshot_encode_buf(
+                terminal,
+                snapshot.as_mut_ptr(),
+                snapshot.len(),
+                &raw mut written,
+            ),
+            ffi::Result::SUCCESS
+        );
+        snapshot.truncate(written);
+        assert_eq!(&snapshot[..8], b"GHOSTSNP");
+        assert_eq!(u16::from_le_bytes([snapshot[8], snapshot[9]]), 1);
+
+        let mut decoder: ffi::SnapshotDecoder = ptr::null_mut();
+        assert_eq!(
+            ffi::ghostty_snapshot_decoder_new_buf(
+                ptr::null(),
+                &raw mut decoder,
+                snapshot.as_ptr(),
+                snapshot.len(),
+            ),
+            ffi::Result::SUCCESS
+        );
+        let mut restored: ffi::Terminal = ptr::null_mut();
+        assert_eq!(
+            ffi::ghostty_snapshot_decoder_decode(decoder, &raw mut restored),
+            ffi::Result::SUCCESS
+        );
+        assert!(!restored.is_null());
+        ffi::ghostty_terminal_free(restored);
+        ffi::ghostty_snapshot_decoder_free(decoder);
+        ffi::ghostty_terminal_free(terminal);
+    }
+}
+
+#[test]
 fn terminal_lifecycle_accepts_arbitrary_pty_bytes() {
     let inputs: [&[u8]; 5] = [
         b"",
@@ -91,14 +128,9 @@ fn terminal_lifecycle_accepts_arbitrary_pty_bytes() {
 
     for iteration in 0..64 {
         let mut terminal: ffi::Terminal = ptr::null_mut();
-        let options = ffi::TerminalOptions {
-            cols: 80,
-            rows: 24,
-            max_scrollback: 10_000,
-        };
         // SAFETY: terminal is a valid out-pointer, the default allocator is selected by NULL,
-        // and options satisfy Ghostty's documented nonzero dimension requirements.
-        let result = unsafe { ffi::ghostty_terminal_new(ptr::null(), &raw mut terminal, options) };
+        // and dimensions satisfy Ghostty's documented nonzero requirements.
+        let result = unsafe { ffi::ghostty_terminal_new(ptr::null(), &raw mut terminal, 80, 24) };
         assert_eq!(result, ffi::Result::SUCCESS);
         assert!(!terminal.is_null());
 

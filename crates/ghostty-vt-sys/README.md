@@ -15,7 +15,7 @@ cargo test --manifest-path crates/ghostty-vt-sys/Cargo.toml
 `build.rs` runs Zig in `--system` mode and performs no network access. The
 preparation command fetches the pinned, content-hashed Zig dependency tree. The
 build rejects a missing, dirty, or wrong Ghostty checkout, an unprepared package
-cache, and a Zig version other than 0.15.2. Native builds link the static archive. SIMD remains disabled until Plan 028 validates the shipped
+cache, and a Zig version other than 0.16.0. Native builds link the static archive. SIMD remains disabled until Plan 028 validates the shipped
 artifact and its performance on all supported platforms.
 
 Set `GHOSTTY_SOURCE_DIR`, `GHOSTTY_ZIG`, and

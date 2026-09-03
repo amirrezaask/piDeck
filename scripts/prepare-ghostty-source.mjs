@@ -8,37 +8,36 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-const ZIG_VERSION = "0.15.2";
+const ZIG_VERSION = "0.16.0";
 const GHOSTTY_REPOSITORY = "https://github.com/ghostty-org/ghostty.git";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const VERSION_FILE = join(ROOT, "packages/ghostty-core/src/vendor/VERSION");
 const COMPAT_VERSION_FILE = join(ROOT, "packages/ghostty-react/src/vendor/VERSION");
-const GHOSTTY_PATCH_FILE = join(ROOT, "patches/ghostty/lib-vt-osc-color-reports.patch");
 
 const ZIG_ARCHIVES = {
   "darwin-arm64": {
     url: `https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz`,
-    sha256: "3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b",
+    sha256: "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
   },
   "darwin-x64": {
     url: `https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-macos-${ZIG_VERSION}.tar.xz`,
-    sha256: "375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f",
+    sha256: "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7",
   },
   "linux-arm64": {
     url: `https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz`,
-    sha256: "958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f",
+    sha256: "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
   },
   "linux-x64": {
     url: `https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz`,
-    sha256: "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239",
+    sha256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
   },
   "win32-arm64": {
     url: `https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-windows-${ZIG_VERSION}.zip`,
-    sha256: "b926465f8872bf983422257cd9ec248bb2b270996fbe8d57872cca13b56fc370",
+    sha256: "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef",
   },
   "win32-x64": {
     url: `https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-windows-${ZIG_VERSION}.zip`,
-    sha256: "3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c",
+    sha256: "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e",
   },
 };
 
@@ -80,19 +79,8 @@ function cacheRoot() {
   );
 }
 
-function patchId(bytes) {
-  let hash = 0xcbf29ce484222325n;
-  for (const byte of bytes) {
-    hash ^= BigInt(byte);
-    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-  }
-  return hash.toString(16).padStart(16, "0");
-}
-
-function sourcePath(revision, id) {
-  return resolve(
-    process.env.GHOSTTY_SOURCE_DIR ?? join(cacheRoot(), `source-${revision}-yaade-${id}`),
-  );
+function sourcePath(revision) {
+  return resolve(process.env.GHOSTTY_SOURCE_DIR ?? join(cacheRoot(), `source-${revision}`));
 }
 
 function zigExecutableName() {
@@ -130,7 +118,7 @@ function verifyZig(candidate) {
   return result.status === 0 && result.stdout.trim() === ZIG_VERSION;
 }
 
-async function verifySource(path, revision, patch) {
+async function verifySource(path, revision) {
   if (!existsSync(join(path, ".git"))) {
     fail(`Ghostty source is not prepared at ${path}; run \`vp run prepare:ghostty\``);
   }
@@ -142,8 +130,8 @@ async function verifySource(path, revision, patch) {
     cwd: path,
     capture: true,
   });
-  if (diff !== patch.toString("utf8").trim()) {
-    fail(`Ghostty source at ${path} does not match the repository patch`);
+  if (diff !== "") {
+    fail(`Ghostty source at ${path} is not a clean checkout`);
   }
   const requiredZig = await readFile(join(path, "build.zig.zon"), "utf8");
   if (!requiredZig.includes(`.minimum_zig_version = "${ZIG_VERSION}"`)) {
@@ -151,9 +139,9 @@ async function verifySource(path, revision, patch) {
   }
 }
 
-async function prepareSource(path, revision, patch) {
+async function prepareSource(path, revision) {
   if (existsSync(path)) {
-    await verifySource(path, revision, patch);
+    await verifySource(path, revision);
     return;
   }
   await mkdir(dirname(path), { recursive: true });
@@ -162,8 +150,7 @@ async function prepareSource(path, revision, patch) {
     run("git", ["clone", "--filter=blob:none", "--no-checkout", GHOSTTY_REPOSITORY, temporary]);
     run("git", ["fetch", "--depth=1", "origin", revision], { cwd: temporary });
     run("git", ["checkout", "--detach", revision], { cwd: temporary });
-    run("git", ["apply", "--whitespace=error-all", GHOSTTY_PATCH_FILE], { cwd: temporary });
-    await verifySource(temporary, revision, patch);
+    await verifySource(temporary, revision);
     await rename(temporary, path);
   } catch (error) {
     await rm(temporary, { recursive: true, force: true });
@@ -256,7 +243,7 @@ function checkZig() {
   return candidate;
 }
 
-async function prepareZigDependencies(source, zig, revision, patchFingerprint) {
+async function prepareZigDependencies(source, zig, revision) {
   const globalCache = zigGlobalCachePath();
   await mkdir(globalCache, { recursive: true });
   run(
@@ -274,20 +261,17 @@ async function prepareZigDependencies(source, zig, revision, patchFingerprint) {
     ],
     { cwd: source },
   );
-  await writeFile(
-    join(globalCache, "yaade-prepared"),
-    `${revision}\n${patchFingerprint}\n${ZIG_VERSION}\n`,
-  );
+  await writeFile(join(globalCache, "yaade-prepared"), `${revision}\n${ZIG_VERSION}\n`);
   return globalCache;
 }
 
-async function checkZigDependencies(revision, patchFingerprint) {
+async function checkZigDependencies(source, revision) {
   const globalCache = zigGlobalCachePath();
   const stamp = join(globalCache, "yaade-prepared");
-  if (!existsSync(stamp) || !existsSync(join(globalCache, "p"))) {
+  if (!existsSync(stamp) || !existsSync(join(source, "zig-pkg"))) {
     fail(`Ghostty Zig dependencies are not prepared; run \`vp run prepare:ghostty\``);
   }
-  const expected = `${revision}\n${patchFingerprint}\n${ZIG_VERSION}\n`;
+  const expected = `${revision}\n${ZIG_VERSION}\n`;
   if ((await readFile(stamp, "utf8")) !== expected) {
     fail(`Ghostty Zig dependency cache does not match ${revision}`);
   }
@@ -298,26 +282,22 @@ async function main() {
   const checkOnly = process.argv.includes("check") || process.argv.includes("--check");
   const json = process.argv.includes("--json");
   const revision = await readRevision();
-  const patch = await readFile(GHOSTTY_PATCH_FILE);
-  const patchSha256 = createHash("sha256").update(patch).digest("hex");
-  const patchFingerprint = patchId(patch);
-  const source = sourcePath(revision, patchFingerprint);
+  const source = sourcePath(revision);
 
   if (checkOnly) {
-    await verifySource(source, revision, patch);
+    await verifySource(source, revision);
   } else {
-    await prepareSource(source, revision, patch);
+    await prepareSource(source, revision);
   }
   const zig = checkOnly ? checkZig() : await prepareZig();
   const zigGlobalCache = checkOnly
-    ? await checkZigDependencies(revision, patchFingerprint)
-    : await prepareZigDependencies(source, zig, revision, patchFingerprint);
+    ? await checkZigDependencies(source, revision)
+    : await prepareZigDependencies(source, zig, revision);
   const identity = createHash("sha256")
-    .update(`${revision}\0${patchSha256}\0${ZIG_VERSION}\0${platform()}\0${arch()}`)
+    .update(`${revision}\0${ZIG_VERSION}\0${platform()}\0${arch()}`)
     .digest("hex");
   const result = {
     revision,
-    patchSha256,
     source,
     zig,
     zigGlobalCache,

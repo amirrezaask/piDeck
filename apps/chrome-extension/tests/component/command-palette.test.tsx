@@ -40,6 +40,7 @@ const snapshot: BootstrapSnapshot = {
   shortcut: 'Ctrl+Shift+K',
   theme: 'system',
   fallback: false,
+  pageZoom: 1,
 };
 
 const makeClient = (overrides: Partial<PaletteClient> = {}) => {
@@ -136,16 +137,20 @@ describe('CommandPalette', () => {
 
   it('closes on Escape and displays empty, error, shortcut warning, and theme states', async () => {
     const noShortcut = { ...snapshot, shortcut: undefined, theme: 'dark' as const };
-    const { client } = makeClient({
+    const { client, sent } = makeClient({
       bootstrap: async () => noShortcut,
       refresh: async () => noShortcut,
       loadItems: async () => [],
     });
     const { onClose, container } = renderPalette(client);
-    const input = screen.getByRole('combobox', { name: 'Search tabs' });
+    const input = await screen.findByRole('combobox', { name: 'Search tabs' });
     await userEvent.type(input, 'missing');
     await screen.findByText('No matching tabs.');
     expect(screen.getByText('Shortcut unassigned')).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Customize Switcher keyboard shortcut' }),
+    );
+    expect(sent).toContainEqual({ type: 'keyboard-shortcut/configure' });
     expect(container.querySelector('.dark')).not.toBeNull();
     input.focus();
     await userEvent.keyboard('{Escape}');
@@ -169,5 +174,9 @@ describe('CommandPalette', () => {
     expect(container.querySelector('.light')).not.toBeNull();
     expect(screen.getByTestId('switcher-overlay')).toHaveAttribute('data-theme', 'light');
     expect(screen.getByTestId('switcher-overlay')).toHaveAttribute('dir', 'ltr');
+    expect(screen.getByTestId('switcher-overlay')).toHaveStyle({
+      width: `${window.innerWidth}px`,
+      transform: 'scale(1)',
+    });
   });
 });

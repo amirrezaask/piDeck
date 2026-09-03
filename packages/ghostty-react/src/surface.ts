@@ -778,6 +778,7 @@ export class GhosttyTerminalSurface {
   private inputLeft = -1;
   private inputTop = -1;
   private attachCount = 0;
+  private snapshotRestoreCount = 0;
   private resizeCount = 0;
   private geometryGeneration = 0;
   private lastSubmittedModelFrame = 0;
@@ -1060,6 +1061,16 @@ export class GhosttyTerminalSurface {
     this.contentGeneration += 1;
     this.core.write(data, onParsed);
     if (this.core.kind === "main") this.afterTerminalWrite();
+  }
+
+  /** Atomically replace parser and terminal state from a validated snapshot. */
+  async restoreSnapshot(snapshot: Uint8Array): Promise<void> {
+    if (this.disposed) throw new Error("Terminal surface is disposed")
+    await this.core.restoreSnapshot(snapshot)
+    this.snapshotRestoreCount += 1
+    this.mount.dataset.ghosttyTerminalSnapshotRestoreCount = String(this.snapshotRestoreCount)
+    this.contentGeneration += 1
+    if (this.core.kind === "main") this.afterTerminalWrite(true)
   }
 
   /** Feed attach/reconnect output with Ghostty's PTY callback detached. */

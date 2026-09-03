@@ -17,6 +17,7 @@ import type {
   SelectSessionTab,
   SessionId,
   SessionTab,
+  TerminalCheckpoint,
   TerminalLease,
 } from "@yaade/rpc"
 
@@ -61,6 +62,10 @@ export type TerminalReplayChunk = {
 export type TerminalAttachOptions = {
   /** A new parser has no continuity with the previous renderer. */
   readonly replay: "resume" | "full"
+  /** Atomically restores a validated parser snapshot before post-cut bytes. */
+  readonly onCheckpoint?: (
+    checkpoint: TerminalCheckpoint,
+  ) => void | Promise<void>
   /** Paints a bounded newest-tail preview while exact replay catches up. */
   readonly onReplayPreview?: (
     chunk: TerminalReplayChunk,
@@ -96,15 +101,7 @@ export type HostTerminal = {
     ownerId?: string
     ownerEpoch?: string
     protocolVersion?: number
-    checkpoint?: {
-      checkpointVersion: 1
-      terminalEpoch: string
-      sequence: number
-      cols: number
-      rows: number
-      createdAt: string
-      syntheticBytes: Uint8Array
-    }
+    checkpoint?: TerminalCheckpoint
     replayQuality?: "exact" | "checkpoint" | "degraded"
     outputChunks?: Uint8Array[]
     output: Uint8Array

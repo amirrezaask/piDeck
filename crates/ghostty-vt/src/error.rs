@@ -55,6 +55,12 @@ pub enum Operation {
     TerminalGet,
     /// Terminal mode access.
     TerminalMode,
+    /// Complete terminal snapshot encoding.
+    SnapshotEncode,
+    /// Complete terminal snapshot restoration.
+    SnapshotDecode,
+    /// Scrollback compression scheduling or execution.
+    TerminalCompression,
     /// Render-state allocation.
     RenderStateNew,
     /// Render-state update.
@@ -154,6 +160,21 @@ pub enum GhosttyError {
         /// The operation that attempted the allocation.
         operation: Operation,
     },
+    /// Native external I/O failed.
+    Io {
+        /// The operation performing I/O.
+        operation: Operation,
+    },
+    /// Encoded input exceeded a native safety limit.
+    LimitExceeded {
+        /// The operation enforcing the limit.
+        operation: Operation,
+    },
+    /// Native safety policy rejected an operation.
+    Rejected {
+        /// The rejected operation.
+        operation: Operation,
+    },
     /// A bounded output buffer was too small.
     OutOfSpace {
         /// The operation producing output.
@@ -215,6 +236,13 @@ impl fmt::Display for GhosttyError {
             }
             Self::OutOfMemory { operation } => {
                 write!(formatter, "native allocation failed during {operation:?}")
+            }
+            Self::Io { operation } => write!(formatter, "native I/O failed during {operation:?}"),
+            Self::LimitExceeded { operation } => {
+                write!(formatter, "native limit exceeded during {operation:?}")
+            }
+            Self::Rejected { operation } => {
+                write!(formatter, "native safety policy rejected {operation:?}")
             }
             Self::OutOfSpace {
                 operation,

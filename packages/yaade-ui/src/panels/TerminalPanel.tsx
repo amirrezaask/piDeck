@@ -255,7 +255,6 @@ function applyAttachReplay(
   attached: {
     output?: Uint8Array;
     outputChunks?: Uint8Array[];
-    checkpoint?: { syntheticBytes: Uint8Array };
     replayTruncated?: boolean;
     replayNeedsQueryResponses?: boolean;
   },
@@ -270,9 +269,7 @@ function applyAttachReplay(
       : attached.output?.byteLength
         ? [attached.output]
         : []
-  const chunks = attached.checkpoint?.syntheticBytes.byteLength
-    ? [attached.checkpoint.syntheticBytes, ...rawChunks]
-    : rawChunks
+  const chunks = rawChunks
   if (chunks.length === 0) return
   onOutput?.(tabId)
   if (attached.replayTruncated) {
@@ -525,13 +522,14 @@ export function TerminalPanel({
       surfaceMount.dataset.yaadeTerminalReplayPhase = "preview"
     }
 
-    const consumeAttachReplay = (replay: {
+    const consumeAttachReplay = async (replay: {
       data: Uint8Array
       replayNeedsQueryResponses: boolean
       replayTruncated: boolean
-    }): void => {
+    }): Promise<void> => {
       if (cancelled) throw new Error("terminal replay cancelled")
       if (!outputWriter || replay.data.byteLength === 0) return
+      const writer = outputWriter
       const replacingPreview = replayPreviewActive
       if (replacingPreview) {
         replayPreviewActive = false
@@ -543,20 +541,33 @@ export function TerminalPanel({
       if (replay.replayTruncated || replacingPreview) {
         outputWriter.enqueueReplay(new Uint8Array([0x1b, 0x63]))
       }
-      if (replay.replayNeedsQueryResponses) {
-        outputWriter.enqueue(replay.data)
-      } else {
-        outputWriter.enqueueReplay(replay.data)
-      }
-      // Archive pages are bounded by the host. Parse each page before asking
-      // for the next one so a large scrollback never becomes one browser task
-      // or one unbounded client-side queue.
-      outputWriter.flush()
+      await new Promise<void>(resolve => {
+        if (replay.replayNeedsQueryResponses) {
+          writer.enqueue(replay.data, resolve)
+        } else {
+          writer.enqueueReplay(replay.data, resolve)
+        }
+        // Archive pages are bounded by the host. Parse each page before asking
+        // for the next one so a large scrollback never becomes one browser task
+        // or one unbounded client-side queue.
+        writer.flush()
+      })
+    }
+    const consumeAttachCheckpoint = async (checkpoint: {
+      snapshotBytes: Uint8Array
+    }): Promise<void> => {
+      if (cancelled || !surface) throw new Error("terminal replay cancelled")
+      outputWriter?.discardPending()
+      frameScheduler.resetGeneration()
+      replayPreviewActive = false
+      await surface.restoreSnapshot(checkpoint.snapshotBytes)
+      onOutputRef.current?.(tabId)
     }
     const attachToNewSurface = (id: string) => {
       surface?.recordAttach()
       return terminalApi.attach(id, {
         replay: "full",
+        onCheckpoint: consumeAttachCheckpoint,
         onReplayPreview: consumeAttachPreview,
         onReplay: consumeAttachReplay,
       }).finally(() => {

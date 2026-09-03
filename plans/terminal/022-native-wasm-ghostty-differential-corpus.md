@@ -259,7 +259,7 @@ Expected locally: all pass. Plan completion requires the three-platform matrix.
 
 ## Implementation result
 
-The repository now has six deterministic binary fixtures, independent native and WASM runners, sparse hand-authored assertions, bounded Effect Schema and serde decoders, and a strict comparator. Native, WASM, and parity gates pass at revision `9f62873bf195e4d8a762d768a1405a5f2f7b1697`.
+The repository now has six deterministic binary fixtures, independent native and WASM runners, sparse hand-authored assertions, bounded Effect Schema and serde decoders, and a strict comparator. Native, WASM, and parity gates were revalidated at revision `07bccf7a311acdfa6afc77f2016160d49b1f1982`.
 
 Plan 022 merged in PR #2 (`5a5d81e3`). The `test:ghostty:parity` step passed on macOS 14, Ubuntu 24.04, and Windows 2022 in hosted CI runs `33341881921` and `33342764168`. Those jobs later failed in unrelated bindgen/server-clippy steps, but the three-platform parity gate itself completed successfully. A final local parity run at `b2e03509` also passed all six fixtures with matching native/WASM revisions.
 

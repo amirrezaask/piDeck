@@ -3,9 +3,9 @@
 > **Executor instructions**: This is a gated design/implementation plan. Complete
 > Plans 018, 022, 023, and 027 first. Preserve working-tree changes. Run the
 > public-API feasibility gate before editing production schemas. If the pinned
-> API cannot restore state and raw replay misses its approved budget, set this
-> plan and its README row to `BLOCKED (no public Ghostty restore API)` and stop.
-> Never substitute private Ghostty memory for a public restore contract.
+> API cannot restore state and raw replay misses its approved budget, stop rather
+> than substituting private Ghostty memory for a public restore contract. The
+> current pin passes this gate through upstream snapshot APIs.
 >
 > **Drift check (run first)**:
 >
@@ -31,7 +31,7 @@
 
 ## Status
 
-- **Status**: BLOCKED (Plan 023)
+- **Status**: DONE (Outcome A)
 - **Priority**: P2
 - **Effort**: M
 - **Risk**: HIGH
@@ -39,6 +39,10 @@
 - **Category**: feasibility / protocol / persistence
 - **Planned at**: commit `8bbcd017`, 2026-08-30
 - **Source finding**: SolPro P1-8 binary checkpoint recommendation
+
+## Feasibility result
+
+The native and WASM pin is now `07bccf7a311acdfa6afc77f2016160d49b1f1982`. Its public `libghostty-vt` interface exposes CRC-protected versioned snapshot encoding, one-shot and progressive snapshot decoding with a renderable READY boundary, exact unfinished VT/UTF-8 continuation restoration, and caller-scheduled scrollback compression. Outcome A applies. The checked Rust wrapper, checkpoint-v2 envelope, asynchronous durable replacement, host validation, atomic worker restore, exact raw fallback, and native/WASM continuation corpus tests are implemented. The decision record is [`../../docs/architecture/terminal-checkpoint-restore.md`](../../docs/architecture/terminal-checkpoint-restore.md).
 
 ## Why this matters
 
@@ -108,8 +112,8 @@ knowledge. Revision/format mismatch falls back to raw replay.
 | Purpose | Command | Expected result |
 |---|---|---|
 | Capability probe | wrapper/sys `checkpoint_capability` tests from Step 1 | exact public API result |
-| Replay measurement | `vp run test:bench` | maximum-history decision evidence |
-| Protocol | `vp run test:terminal:protocol` | bounded envelope/fallback tests when Outcome A |
+| Replay measurement | `vp exec playwright test --project=bench` | maximum-history decision evidence |
+| Protocol | focused `@yaade/rpc`, `@yaade/host-client`, and `yaade-server` tests | bounded envelope/fallback tests when Outcome A |
 | Parity | `vp run test:ghostty:parity` | restore-and-continue equals uninterrupted |
 | E2E | focused compatibility/multiplexer Playwright commands | restore/fallback or raw replay passes |
 
@@ -183,7 +187,7 @@ before Outcome B.
 **Verify**:
 
 ```bash
-vp run test:bench
+vp exec playwright test --project=bench
 ```
 
 Expected: a decision table names the tested history limits and pass/fail budget.
@@ -221,7 +225,8 @@ Do not put checkpoint bytes in React state or generic `HostEvent.args`.
 **Verify**:
 
 ```bash
-vp run test:terminal:protocol
+pnpm --filter @yaade/rpc test
+pnpm --filter @yaade/host-client test
 vp run typecheck
 ```
 
@@ -293,8 +298,9 @@ unused compatibility code.
 rg -n 'synthetic.*checkpoint|checkpoint.*ansi|format_replay_bootstrap' \
   apps/server packages
 vp run test:server
-vp run test:terminal:protocol
-vp run test:bench
+pnpm --filter @yaade/rpc test
+pnpm --filter @yaade/host-client test
+vp exec playwright test --project=bench
 ```
 
 Expected for A/B: no production synthetic bootstrap remains. Outcome C keeps it
@@ -311,13 +317,13 @@ and the plan stays `BLOCKED` with evidence.
 
 ## Done criteria
 
-- [ ] Public restore capability and raw-replay alternative have reproducible evidence.
-- [ ] An architecture decision selects Outcome A, B, or C.
-- [ ] No private Ghostty representation becomes persisted or transmitted.
-- [ ] Outcome A uses a bounded versioned envelope and proves continuation parity.
-- [ ] Outcome B has explicit product approval and exact replay/fallback tests.
-- [ ] Outcome C leaves production behavior unchanged and status `BLOCKED`.
-- [ ] Synthetic bootstrap is removed only after a correct replacement ships.
+- [x] Public restore capability and the raw-replay fallback have reproducible evidence.
+- [x] The architecture decision selects Outcome A.
+- [x] No private Ghostty representation is persisted or transmitted.
+- [x] Outcome A uses a bounded versioned envelope and proves continuation parity.
+- [x] Outcome B was not selected and requires no product approval.
+- [x] Outcome C was not selected.
+- [x] The synthetic bootstrap was removed after atomic restore and fallback tests passed.
 
 ## STOP conditions
 

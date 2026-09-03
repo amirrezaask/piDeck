@@ -174,6 +174,20 @@ export function CommandPalette({
     [checkedSend, refresh],
   );
 
+  const configureShortcut = useCallback(async () => {
+    setError(undefined);
+    try {
+      await checkedSend({ type: 'keyboard-shortcut/configure' });
+      onClose();
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : 'Chrome could not open keyboard shortcut settings.',
+      );
+    }
+  }, [checkedSend, onClose]);
+
   const setTheme = useCallback(
     async (theme: ThemePreference) => {
       if (snapshot === undefined) return;
@@ -249,17 +263,36 @@ export function CommandPalette({
   const hasQuery = query.trim().length > 0;
   const showContent = hasQuery || snapshot?.fallback === true || error !== undefined;
   const duration = reduceMotion ? 0 : 0.15;
+  const ready = standalone || snapshot !== undefined || error !== undefined;
+  const pageZoom = standalone ? 1 : (snapshot?.pageZoom ?? 1);
+  const compensatedWidth = window.innerWidth * pageZoom;
+  const compensatedHeight = window.innerHeight * pageZoom;
+  const compact = compensatedWidth <= 640;
+  const rootPadding = compact
+    ? '16px 8px'
+    : `${Math.min(120, Math.max(40, compensatedHeight * 0.13))}px 24px 24px`;
+  const rootStyle = standalone
+    ? { padding: rootPadding }
+    : {
+        width: `${compensatedWidth}px`,
+        height: `${compensatedHeight}px`,
+        padding: rootPadding,
+        transform: `scale(${1 / pageZoom})`,
+        transformOrigin: 'top left',
+      };
 
   return (
     <AnimatePresence>
-      {open ? (
+      {open && ready ? (
         <MotionConfig transition={{ duration, ease: [0.16, 1, 0.3, 1] }} reducedMotion="user">
           <motion.div
             className={`switcher-root ${resolvedDark ? 'dark' : 'light'}`}
             dir="ltr"
             data-theme={theme}
             data-host={standalone ? 'fallback' : 'overlay'}
+            data-layout={compact ? 'compact' : 'default'}
             data-testid="switcher-overlay"
+            style={rootStyle}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
@@ -370,6 +403,9 @@ export function CommandPalette({
                         <CommandFooter
                           shortcut={snapshot?.shortcut}
                           theme={theme}
+                          onConfigureShortcut={() => {
+                            void configureShortcut();
+                          }}
                           onTheme={(next) => {
                             void setTheme(next);
                           }}

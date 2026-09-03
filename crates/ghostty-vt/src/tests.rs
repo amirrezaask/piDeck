@@ -63,9 +63,10 @@ fn counted_allocations(action: impl FnOnce()) -> usize {
 }
 
 use crate::{
-    ActiveScreen, CellWidth, ColorScheme, CoordinateSpace, DeviceAttributes, EffectKind,
-    EffectLimits, EffectOptions, FormatOptions, GhosttyError, Mode, Rgb, SemanticPrompt, Terminal,
-    TerminalOptions, TerminalPoint, TerminalSize, ValueField,
+    ActiveScreen, CellWidth, ColorScheme, CompressionMode, CompressionStatus, CoordinateSpace,
+    DeviceAttributes, EffectKind, EffectLimits, EffectOptions, FormatOptions, GhosttyError, Mode,
+    Operation, Rgb, SemanticPrompt, Terminal, TerminalOptions, TerminalPoint, TerminalSize,
+    ValueField,
 };
 
 fn test_options() -> TerminalOptions {
@@ -87,6 +88,87 @@ fn test_options() -> TerminalOptions {
             xtversion: b"yaade 1".to_vec(),
         },
     }
+}
+
+#[test]
+fn checkpoint_capability_restores_unfinished_parser_state() -> Result<(), GhosttyError> {
+    let options = test_options();
+    let effects = options.effects.clone();
+    let mut terminal = Terminal::new(options)?;
+    terminal.write(b"before\r\n\x1b]2;split")?;
+
+    let snapshot = terminal.snapshot(4 * 1024 * 1024)?;
+    assert!(snapshot.starts_with(b"GHOSTSNP"));
+    let mut restored = Terminal::from_snapshot(&snapshot, effects)?;
+    let completion = restored.write(b" title\x1b\\after")?;
+    assert_eq!(completion.title(), Some(b"split title".as_slice()));
+    drop(completion);
+    assert_eq!(restored.state()?.title.as_str()?, "split title");
+
+    // Continuation tracking survives restore, allowing another exact snapshot.
+    restored.write(b"\x1b[31")?;
+    let second = restored.snapshot(4 * 1024 * 1024)?;
+    let mut restored_again = Terminal::from_snapshot(&second, EffectOptions::default())?;
+    restored_again.write(b"mred\x1b[0m")?;
+    Ok(())
+}
+
+#[test]
+fn snapshot_stops_at_the_callers_byte_limit() -> Result<(), GhosttyError> {
+    let terminal = Terminal::new(test_options())?;
+    let error = terminal
+        .snapshot(9)
+        .expect_err("snapshot envelope exceeds nine bytes");
+    assert!(matches!(
+        error,
+        GhosttyError::OutOfSpace {
+            operation: Operation::SnapshotEncode,
+            required: 10,
+            limit: 9,
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn snapshot_continuation_matches_uninterrupted_terminal() -> Result<(), GhosttyError> {
+    let cases: &[(&str, &[u8], &[u8])] = &[
+        ("utf8", b"prefix:\xe2\x82", b"\xac:after"),
+        ("csi", b"\x1b[31", b"mred\x1b[0m:after"),
+        ("osc", b"\x1b]2;split", b" title\x1b\\:after"),
+        ("dcs", b"\x1bP1;2|split", b" payload\x1b\\:after"),
+        ("apc", b"\x1b_Gsplit", b" payload\x1b\\:after"),
+    ];
+
+    for (name, prefix, suffix) in cases {
+        let mut uninterrupted = Terminal::new(test_options())?;
+        uninterrupted.write(prefix)?;
+        let snapshot = uninterrupted.snapshot(4 * 1024 * 1024)?;
+        let mut restored = Terminal::from_snapshot(&snapshot, EffectOptions::default())?;
+
+        uninterrupted.write(suffix)?;
+        restored.write(suffix)?;
+        assert_eq!(restored.state()?, uninterrupted.state()?, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn compression_preserves_logical_terminal_state() -> Result<(), GhosttyError> {
+    let mut terminal = Terminal::new(test_options())?;
+    for line in 0..512 {
+        terminal.write(format!("line-{line}\r\n").as_bytes())?;
+    }
+    let before = terminal.state()?;
+    let activity = terminal.compression_activity()?;
+    let status = terminal.compress(CompressionMode::Full)?;
+    assert!(matches!(
+        status,
+        CompressionStatus::Complete | CompressionStatus::Unsupported
+    ));
+    assert_eq!(terminal.compression_activity()?, activity);
+    assert_eq!(terminal.state()?, before);
+    Ok(())
 }
 
 #[test]
@@ -231,9 +313,9 @@ fn osc_color_queries_use_native_effects_and_configured_defaults() -> Result<(), 
     assert_eq!(
         responses,
         [
-            b"\x1b]10;rgb:1111/2222/3333\x1b\\".to_vec(),
+            b"\x1b]10;rgb:1111/2222/3333\x07".to_vec(),
             b"\x1b]11;rgb:4444/5555/6666\x1b\\".to_vec(),
-            b"\x1b]12;rgb:7777/8888/9999\x1b\\".to_vec(),
+            b"\x1b]12;rgb:7777/8888/9999\x07".to_vec(),
         ]
     );
     Ok(())

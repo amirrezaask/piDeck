@@ -53,6 +53,7 @@ test("validates every worker command family and rejects malformed envelopes", ()
     { ...envelope, type: "writeBytes", data: new Uint8Array([120]) },
     { ...envelope, type: "writeReplayBytes", chunks: [new Uint8Array([120])] },
     { ...envelope, type: "resetAndWriteBytes", data: new Uint8Array([120]) },
+    { ...envelope, type: "restoreSnapshot", data: new Uint8Array([120]) },
     {
       ...envelope,
       type: "recycleRenderUpdate",
@@ -116,6 +117,8 @@ test("requires payload-free worker capacity diagnostics", () => {
     schedulerInFlight: 0,
   }
   assert.equal(validateTerminalWorkerEvent({ ...envelope, type: "parsed", diagnostics }), true)
+  assert.equal(validateTerminalWorkerEvent({ ...envelope, type: "snapshotRestored" }), true)
+  assert.equal(validateTerminalWorkerEvent({ ...envelope, type: "snapshotRejected", message: "bad crc" }), true)
   const { renderBytesUsed: _, ...staleDiagnostics } = diagnostics
   assert.equal(
     validateTerminalWorkerEvent({ ...envelope, type: "parsed", diagnostics: staleDiagnostics }),
@@ -131,6 +134,27 @@ test("validates packed events and transfers ownership of every packed buffer", (
     slotId: 0,
     leaseToken: 1,
     update,
+    diagnostics: {
+      writes: 1,
+      bytesParsed: 8,
+      renderBuilds: 1,
+      transfers: 1,
+      suppressedHidden: 0,
+      suppressedSynchronized: 0,
+      fullCatchUps: 0,
+      synchronizationTimeouts: 0,
+      pendingPresentation: false,
+      slotsInFlight: 1,
+      bufferAllocations: 1,
+      renderBytesUsed: 8,
+      renderBytesAllocated: 16,
+      renderIdleTrims: 0,
+      renderIdleBytesReclaimed: 0,
+      renderIdleRegrows: 0,
+      schedulerQueueBytes: 0,
+      schedulerQueueCommands: 0,
+      schedulerInFlight: 0,
+    },
     state: {
       title: "",
       scrollbar: null,

@@ -16,12 +16,13 @@ use base64::Engine as _;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select_biased};
 use ghostty_vt::{
-    ColorScheme, DeviceAttributes, EffectOptions, Format, FormatOptions, Mode, Rgb,
-    Terminal as GhosttyTerminal, TerminalOptions as GhosttyTerminalOptions, TerminalSize,
+    ColorScheme, DeviceAttributes, EffectOptions, Mode, Rgb, Terminal as GhosttyTerminal,
+    TerminalOptions as GhosttyTerminalOptions, TerminalSize, build_revision,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -40,12 +41,18 @@ use crate::{
 
 const MAX_ENTRIES: usize = 64;
 const MAX_REPLAY_BYTES: usize = 2 * 1024 * 1024;
+const HOT_SCROLLBACK_ROWS: usize = 10_000;
 const EXITED_REPLAY_BYTES: usize = 256 * 1024;
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const OWNER_COMMAND_BATCH_MESSAGES: usize = 64;
 const OWNER_WRITE_BATCH_BYTES: usize = 256 * 1024;
 const CLEANUP_QUEUE_CAPACITY: usize = 256;
 const CHECKPOINT_BYTES: usize = 512 * 1024;
+// Base64 checkpoint plus a 256 KiB replay tail must fit the 1 MiB WS frame.
+const MAX_CHECKPOINT_BYTES: usize = 384 * 1024;
+const CHECKPOINT_MAGIC: &str = "YAADECP2";
+const CHECKPOINT_VERSION: u8 = 2;
+const GHOSTTY_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const EXITED_DISPOSE_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -135,6 +142,7 @@ pub enum TerminalProcessStatus {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalCheckpoint {
+    pub magic: &'static str,
     #[serde(rename = "checkpointVersion")]
     pub checkpoint_version: u8,
     #[serde(rename = "terminalEpoch")]
@@ -144,8 +152,18 @@ pub struct TerminalCheckpoint {
     pub rows: u16,
     #[serde(rename = "createdAt")]
     pub created_at: String,
-    #[serde(rename = "syntheticBytes")]
-    pub synthetic_bytes: Base64Bytes,
+    pub engine: &'static str,
+    #[serde(rename = "engineRevision")]
+    pub engine_revision: &'static str,
+    #[serde(rename = "snapshotFormatVersion")]
+    pub snapshot_format_version: u16,
+    pub codec: &'static str,
+    #[serde(rename = "payloadBytes")]
+    pub payload_bytes: usize,
+    #[serde(rename = "payloadSha256")]
+    pub payload_sha256: String,
+    #[serde(rename = "snapshotBytes")]
+    pub snapshot_bytes: Base64Bytes,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1099,9 +1117,9 @@ fn create_ghostty_terminal(state: &EntryState) -> Result<GhosttyTerminal, Termin
     let mut terminal = GhosttyTerminal::new(GhosttyTerminalOptions {
         cols: usize::from(state.cols),
         rows: usize::from(state.rows),
-        // Durable history owns scrollback. Native server state only needs the
-        // visible grid for query semantics and checkpoint-v1 bootstrap bytes.
-        scrollback: 0,
+        // Durable history remains the complete byte source. This bounded hot
+        // window makes checkpoints useful without making Ghostty the archive.
+        scrollback: HOT_SCROLLBACK_ROWS,
         effects: EffectOptions {
             size: Some(TerminalSize {
                 rows: state.rows,
@@ -1472,7 +1490,7 @@ fn handle_terminal_command_batch(
             }
             let resize_error = latest
                 .and_then(|(cols, rows)| {
-                    resize_terminal(master, entry, writer, state, terminal, cols, rows).err()
+                    resize_terminal(host, master, entry, writer, state, terminal, cols, rows).err()
                 })
                 .map(|error| error.to_string());
             for reply in replies {
@@ -1541,6 +1559,7 @@ fn write_terminal(writer: &mut Box<dyn Write + Send>, data: &Bytes) -> Result<()
 }
 
 fn resize_terminal(
+    host: &Weak<TerminalHost>,
     master: &dyn MasterPty,
     entry: &TerminalEntry,
     writer: &mut Box<dyn Write + Send>,
@@ -1576,7 +1595,7 @@ fn resize_terminal(
     state.cols = cols;
     state.rows = rows;
     if state.checkpoints {
-        store_checkpoint(&entry.terminal_epoch, state, terminal);
+        store_checkpoint(host, &entry.id, &entry.terminal_epoch, state, terminal);
     }
     Ok(())
 }
@@ -1665,7 +1684,7 @@ fn handle_terminal_command(
         }
         TerminalCommand::Resize { cols, rows, reply } => {
             let _ = reply.send(resize_terminal(
-                master, entry, writer, state, terminal, cols, rows,
+                host, master, entry, writer, state, terminal, cols, rows,
             ));
         }
         TerminalCommand::AuthorizeAndResize {
@@ -1678,7 +1697,7 @@ fn handle_terminal_command(
         } => {
             let result = authorize_terminal(control, entry, &principal_id, &connection_id, fence)
                 .and_then(|lease| {
-                    resize_terminal(master, entry, writer, state, terminal, cols, rows)
+                    resize_terminal(host, master, entry, writer, state, terminal, cols, rows)
                         .map(|()| lease)
                 });
             let _ = reply.send(result);
@@ -1953,7 +1972,7 @@ fn process_terminal_output(
         if state.bytes_since_checkpoint >= CHECKPOINT_BYTES
             || state.last_checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL
         {
-            store_checkpoint(&entry.terminal_epoch, state, terminal);
+            store_checkpoint(host, &entry.id, &entry.terminal_epoch, state, terminal);
         }
     }
     let Some(host) = host.upgrade() else { return };
@@ -1987,7 +2006,7 @@ fn observe_terminal_exit(
     state.status = TerminalProcessStatus::Exited;
     state.exit_code = Some(exit_code);
     if state.checkpoints {
-        store_checkpoint(&entry.terminal_epoch, state, terminal);
+        store_checkpoint(host, &entry.id, &entry.terminal_epoch, state, terminal);
     }
     state.signal = signal;
     while state.replay_bytes > EXITED_REPLAY_BYTES && state.replay.len() > 1 {
@@ -2010,51 +2029,80 @@ fn observe_terminal_exit(
         .blocking_send((entry.id.clone(), entry.terminal_epoch.clone()));
 }
 
-fn store_checkpoint(terminal_epoch: &str, state: &mut EntryState, terminal: &mut GhosttyTerminal) {
-    let terminal_state = match terminal.state() {
-        Ok(value) => value,
+fn store_checkpoint(
+    host: &Weak<TerminalHost>,
+    terminal_id: &str,
+    terminal_epoch: &str,
+    state: &mut EntryState,
+    terminal: &GhosttyTerminal,
+) {
+    let checkpoint = match encode_checkpoint(
+        terminal_epoch,
+        state.sequence,
+        state.cols,
+        state.rows,
+        terminal,
+    ) {
+        Ok(checkpoint) => checkpoint,
         Err(error) => {
             eprintln!("[terminal-checkpoint] {error}");
+            // A terminal whose complete snapshot exceeds the transport budget
+            // remains on exact raw replay. Back off before retrying so an
+            // oversized history cannot turn every PTY chunk into another
+            // snapshot traversal.
+            state.bytes_since_checkpoint = 0;
+            state.last_checkpoint_at = Instant::now();
             return;
         }
     };
-    let mut ansi = Vec::with_capacity(usize::from(state.cols) * usize::from(state.rows) + 64);
-    ansi.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
-    if terminal_state.alternate_screen {
-        ansi.extend_from_slice(b"\x1b[?1049h");
-    } else {
-        ansi.extend_from_slice(b"\x1b[?1049l");
-    }
-    if let Err(error) = terminal.format_into(
-        FormatOptions {
-            format: Format::Vt,
-            ..FormatOptions::default()
-        },
-        MAX_REPLAY_BYTES,
-        &mut ansi,
-    ) {
+    if let Some(host) = host.upgrade()
+        && let Ok(encoded) = serde_json::to_vec(&checkpoint)
+        && let Err(error) = host
+            .history
+            .persist_checkpoint(terminal_id, Bytes::from(encoded))
+    {
         eprintln!("[terminal-checkpoint] {error}");
-        return;
     }
-    ansi.extend_from_slice(
-        format!(
-            "\x1b[{};{}H",
-            terminal_state.cursor_row + 1,
-            terminal_state.cursor_column + 1
-        )
-        .as_bytes(),
-    );
-    state.checkpoint = Some(TerminalCheckpoint {
-        checkpoint_version: 1,
-        terminal_epoch: terminal_epoch.to_owned(),
-        sequence: state.sequence,
-        cols: state.cols,
-        rows: state.rows,
-        created_at: crate::model::now_iso(),
-        synthetic_bytes: Base64Bytes(Bytes::from(ansi)),
-    });
+    state.checkpoint = Some(checkpoint);
     state.bytes_since_checkpoint = 0;
     state.last_checkpoint_at = Instant::now();
+}
+
+fn encode_checkpoint(
+    terminal_epoch: &str,
+    sequence: u64,
+    cols: u16,
+    rows: u16,
+    terminal: &GhosttyTerminal,
+) -> Result<TerminalCheckpoint, TerminalError> {
+    let snapshot = terminal
+        .snapshot(MAX_CHECKPOINT_BYTES)
+        .map_err(ghostty_error)?;
+    if snapshot.len() < 10
+        || &snapshot[..8] != b"GHOSTSNP"
+        || u16::from_le_bytes([snapshot[8], snapshot[9]]) != GHOSTTY_SNAPSHOT_FORMAT_VERSION
+    {
+        return Err(TerminalError::Runtime(
+            "unsupported Ghostty snapshot envelope".to_owned(),
+        ));
+    }
+    let engine_revision = build_revision().map_err(ghostty_error)?;
+    Ok(TerminalCheckpoint {
+        magic: CHECKPOINT_MAGIC,
+        checkpoint_version: CHECKPOINT_VERSION,
+        terminal_epoch: terminal_epoch.to_owned(),
+        sequence,
+        cols,
+        rows,
+        created_at: crate::model::now_iso(),
+        engine: "ghostty-vt",
+        engine_revision,
+        snapshot_format_version: GHOSTTY_SNAPSHOT_FORMAT_VERSION,
+        codec: "none",
+        payload_bytes: snapshot.len(),
+        payload_sha256: format!("{:x}", Sha256::digest(&snapshot)),
+        snapshot_bytes: Base64Bytes(Bytes::from(snapshot)),
+    })
 }
 
 fn bounded_replay_tail(chunks: Vec<Base64Bytes>, max_bytes: usize) -> Vec<Base64Bytes> {
@@ -2414,7 +2462,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             response,
-            b"\x1b]11;rgb:1010/2020/3030\x1b\\\x1b[0n\x1b[?2031;2$y\x1b[?997;1n"
+            b"\x1b]11;rgb:1010/2020/3030\x07\x1b[0n\x1b[?2031;2$y\x1b[?997;1n"
         );
 
         assert!(
@@ -2430,6 +2478,38 @@ mod tests {
             .working_directory()
             .and_then(decode_terminal_working_directory);
         assert_eq!(cwd, Some(PathBuf::from("/tmp/last dir")));
+    }
+
+    #[test]
+    fn checkpoint_envelope_restores_exact_parser_continuation() {
+        let effects = EffectOptions::default();
+        let mut terminal = GhosttyTerminal::new(GhosttyTerminalOptions {
+            cols: 80,
+            rows: 24,
+            scrollback: 128,
+            effects: effects.clone(),
+        })
+        .expect("terminal");
+        terminal.write(b"before\x1b[31").expect("partial CSI");
+        let checkpoint =
+            encode_checkpoint("epoch-1", 7, 80, 24, &terminal).expect("checkpoint envelope");
+        assert_eq!(checkpoint.magic, CHECKPOINT_MAGIC);
+        assert_eq!(checkpoint.checkpoint_version, CHECKPOINT_VERSION);
+        assert_eq!(checkpoint.sequence, 7);
+        assert_eq!(checkpoint.payload_bytes, checkpoint.snapshot_bytes.0.len());
+        assert_eq!(
+            checkpoint.payload_sha256,
+            format!("{:x}", Sha256::digest(&checkpoint.snapshot_bytes.0))
+        );
+
+        let mut restored = GhosttyTerminal::from_snapshot(&checkpoint.snapshot_bytes.0, effects)
+            .expect("restore checkpoint");
+        terminal.write(b"mred\x1b[0m").expect("continue original");
+        restored.write(b"mred\x1b[0m").expect("continue restored");
+        assert_eq!(
+            restored.state().expect("restored state"),
+            terminal.state().expect("state")
+        );
     }
 
     #[test]

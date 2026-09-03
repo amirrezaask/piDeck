@@ -1,5 +1,7 @@
 # Plan 033: Complete an authoritative semantic terminal snapshot and resync stream
 
+> **Architecture decision**: REJECTED. [`docs/terminal-architecture.md`](../../docs/terminal-architecture.md) replaces this screen-snapshot/patch direction with restorable terminal snapshots plus ordered raw PTY bytes for capable clients. Do not execute this plan. A semantic projection may return later as an isolated compatibility adapter after the replicated-state path ships.
+>
 > **Executor instructions**: Complete Plans 017, 019, 022, and 023 first. Preserve
 > all pre-existing working-tree changes and all raw PTY streaming/replay behavior
 > while adding the semantic lane; raw
@@ -28,6 +30,7 @@
 
 ## Status
 
+- **Status**: REJECTED (screen diffs are not the capable-client data plane)
 - **Priority**: P1
 - **Effort**: L
 - **Risk**: HIGH

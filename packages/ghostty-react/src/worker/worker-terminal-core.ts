@@ -31,6 +31,7 @@ export interface TerminalCoreRuntime {
   readonly runtimeGeneration: number;
   write(data: string | Uint8Array, parsed?: ParsedCallback): void;
   writeReplay(chunks: readonly Uint8Array[], parsed?: ParsedCallback): void;
+  restoreSnapshot(data: Uint8Array): Promise<void>;
   resetAndWrite(data: string | Uint8Array, parsed?: ParsedCallback): void;
   resize(cols: number, rows: number, cellWidth: number, cellHeight: number): void;
   setTheme(theme: GhosttyTheme): void;
@@ -78,6 +79,9 @@ export class MainThreadTerminalCore implements TerminalCoreRuntime {
   }
   write(data: string | Uint8Array, parsed?: ParsedCallback): void { this.core.write(data); parsed?.(); }
   writeReplay(chunks: readonly Uint8Array[], parsed?: ParsedCallback): void { this.core.writeReplay(chunks); parsed?.(); }
+  restoreSnapshot(data: Uint8Array): Promise<void> {
+    return Promise.resolve().then(() => this.core.restoreBinarySnapshot(data))
+  }
   resetAndWrite(data: string | Uint8Array, parsed?: ParsedCallback): void { this.core.resetAndWrite(data); parsed?.(); }
   resize(cols: number, rows: number, cellWidth: number, cellHeight: number): void { this.core.resize(cols, rows, cellWidth, cellHeight); }
   setTheme(theme: GhosttyTheme): void { this.core.setTheme(theme); }
@@ -169,6 +173,10 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
     released: boolean
   }>()
   private readonly parsed = new Map<number, ParsedCallback>();
+  private readonly snapshotRestores = new Map<number, {
+    readonly resolve: () => void
+    readonly reject: (error: Error) => void
+  }>();
   private disposed = false;
   private recovering = false;
   private initializationReject: ((error: Error) => void) | null = null;
@@ -221,7 +229,8 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
       throw new Error("Invalid terminal worker command");
     }
     const transfer = command.type === "writeBytes" ||
-      command.type === "writeReplayBytes" || command.type === "resetAndWriteBytes"
+      command.type === "writeReplayBytes" || command.type === "resetAndWriteBytes" ||
+      command.type === "restoreSnapshot"
       ? terminalByteCommandTransferList(command)
       : command.type === "recycleRenderUpdate"
         ? terminalRenderUpdateBufferTransferList(command.buffers)
@@ -240,6 +249,7 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
     switch (value.type) {
       case "packedUpdate":
         this.state = value.state;
+        this.diagnostics = value.diagnostics;
         this.updateLeases.set(value.update, {
           slotId: value.slotId,
           leaseToken: value.leaseToken,
@@ -256,6 +266,16 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
       case "parsed":
         this.diagnostics = value.diagnostics;
         this.parsed.get(value.sequence)?.(); this.parsed.delete(value.sequence); return;
+      case "snapshotRestored": {
+        this.snapshotRestores.get(value.sequence)?.resolve()
+        this.snapshotRestores.delete(value.sequence)
+        return
+      }
+      case "snapshotRejected": {
+        this.snapshotRestores.get(value.sequence)?.reject(new Error(value.message))
+        this.snapshotRestores.delete(value.sequence)
+        return
+      }
       case "fatalError": case "recoverableError": this.fail(new Error(value.message)); return;
       default: return;
     }
@@ -274,6 +294,8 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
     }
     this.recovering = true;
     this.parsed.clear();
+    for (const pending of this.snapshotRestores.values()) pending.reject(error)
+    this.snapshotRestores.clear();
     this.updates.length = 0;
     this.state = EMPTY_STATE;
     this.generation += 1;
@@ -313,6 +335,16 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
     const owned = chunks.filter(chunk => chunk.byteLength > 0).map(ownedTerminalBytes)
     if (owned.length === 0) { parsed?.(); return }
     this.command({ type: "writeReplayBytes", chunks: owned }, parsed)
+  }
+  restoreSnapshot(data: Uint8Array): Promise<void> {
+    if (this.disposed || this.recovering || data.byteLength === 0) {
+      return Promise.reject(new Error("Terminal runtime cannot restore a snapshot"))
+    }
+    const owned = ownedTerminalBytes(data)
+    const sequence = this.send({ type: "restoreSnapshot", data: owned })
+    return new Promise((resolve, reject) => {
+      this.snapshotRestores.set(sequence, { resolve, reject })
+    })
   }
   resetAndWrite(data: string | Uint8Array, parsed?: ParsedCallback): void {
     const owned = ownedTerminalBytes(data)
@@ -377,6 +409,10 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
     this.command({ type: "dispose" });
     this.disposed = true;
     this.parsed.clear();
+    for (const pending of this.snapshotRestores.values()) {
+      pending.reject(new Error("Terminal runtime disposed during snapshot restore"))
+    }
+    this.snapshotRestores.clear();
     this.channel.release();
   }
 }

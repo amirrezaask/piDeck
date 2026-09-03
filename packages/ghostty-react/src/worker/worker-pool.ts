@@ -27,7 +27,7 @@ export const MAX_TERMINAL_WORKERS = 4;
 
 function workerCommandBytes(command: TerminalWorkerCommand): number {
   switch (command.type) {
-    case "writeBytes": case "resetAndWriteBytes": return command.data.byteLength
+    case "writeBytes": case "resetAndWriteBytes": case "restoreSnapshot": return command.data.byteLength
     case "writeReplayBytes": return command.chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
     case "recycleRenderUpdate": return Object.values(command.buffers)
       .reduce((total, buffer) => total + buffer.byteLength, 0)

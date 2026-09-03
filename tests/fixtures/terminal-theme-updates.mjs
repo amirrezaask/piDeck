@@ -6,7 +6,7 @@ const backgroundQuery = `${escape}]11;?\x07${escape}[5n`
 const modeResponse = new RegExp(`${escape}\\[\\?2031;([1-4])\\$y`)
 const preferenceResponse = new RegExp(`${escape}\\[\\?997;([12])n`)
 const backgroundResponse = new RegExp(
-  `${escape}\\]11;rgb:([\\da-f]{1,4}\\/[\\da-f]{1,4}\\/[\\da-f]{1,4})${escape}\\\\`,
+  `${escape}\\]11;rgb:([\\da-f]{1,4}\\/[\\da-f]{1,4}\\/[\\da-f]{1,4})(?:\x07|${escape}\\\\)`,
   "i",
 )
 

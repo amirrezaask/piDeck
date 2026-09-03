@@ -183,14 +183,17 @@ function emitUpdate(command: TerminalWorkerCommand, core: GhosttyTerminalCore, f
   const lease = core.tryRenderUpdate(true, forceFull)
   if (!lease) return false
   const entry = runtimes.get(command.terminalId);
-  if (entry) {
-    entry.diagnostics.renderBuilds += 1;
-    entry.diagnostics.transfers += 1;
+  if (!entry) {
+    core.releaseRenderUpdate(lease.update)
+    return false
   }
+  entry.diagnostics.renderBuilds += 1;
+  entry.diagnostics.transfers += 1;
   post(
     {
       ...envelope(command), type: "packedUpdate", slotId: lease.slotId,
       leaseToken: lease.leaseToken, update: lease.update, state: state(core),
+      diagnostics: diagnostics(entry),
     },
     terminalRenderUpdateTransferList(lease.update),
   )
@@ -280,6 +283,20 @@ function process(command: TerminalWorkerCommand, entry: RuntimeEntry): void {
     case "resetAndWriteBytes":
       entry.diagnostics.writes += 1; entry.diagnostics.bytesParsed += command.data.byteLength;
       core.resetAndWrite(command.data); requestPresentation(command, entry, true); parsed(command, entry); return;
+    case "restoreSnapshot":
+      try {
+        cancelPendingUpdate(command.terminalId)
+        core.restoreBinarySnapshot(command.data)
+        requestPresentation(command, entry, true)
+        post({ ...envelope(command), type: "snapshotRestored" })
+      } catch (error) {
+        post({
+          ...envelope(command),
+          type: "snapshotRejected",
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+      return
     case "recycleRenderUpdate": {
       if (core.reclaimRenderUpdate(command.slotId, command.leaseToken, command.buffers)) {
         const pending = pendingUpdates.get(command.terminalId)

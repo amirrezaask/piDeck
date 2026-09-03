@@ -65,8 +65,8 @@ pub use render::{
     ViewportPosition,
 };
 pub use terminal::{
-    ActiveScreen, MAX_APC_BYTES, MAX_SCROLLBACK_ROWS, Mode, ScrollbarState, Terminal,
-    TerminalColors, TerminalOptions, TerminalState, build_revision,
+    ActiveScreen, CompressionMode, CompressionStatus, MAX_APC_BYTES, MAX_SCROLLBACK_ROWS, Mode,
+    ScrollbarState, Terminal, TerminalColors, TerminalOptions, TerminalState, build_revision,
 };
 pub use types::{Rgb, TerminalText};
 

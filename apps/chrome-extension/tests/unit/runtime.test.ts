@@ -23,6 +23,18 @@ describe('runtime schemas and error mapping', () => {
       Effect.runPromise(decodeRequest({ type: 'tab/set-muted', tabId: 3, muted: true })),
     ).resolves.toMatchObject({ tabId: 3 });
     await expect(
+      Effect.runPromise(decodeRequest({ type: 'keyboard-shortcut/configure' })),
+    ).resolves.toMatchObject({ type: 'keyboard-shortcut/configure' });
+    await expect(
+      Effect.runPromise(
+        decodeResponse({
+          ok: true,
+          type: 'snapshot',
+          data: { tabs: [], theme: 'system', fallback: false, pageZoom: 1.25 },
+        }),
+      ),
+    ).resolves.toMatchObject({ data: { pageZoom: 1.25 } });
+    await expect(
       Effect.runPromise(decodeResponse({ ok: true, type: 'done', closePalette: true })),
     ).resolves.toMatchObject({ closePalette: true });
   });

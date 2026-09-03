@@ -33,7 +33,7 @@ log "building ${GHOSTTY_REVISION} for wasm32-freestanding"
     -Dlib-version-string="0.1.0-dev+${GHOSTTY_REVISION}" \
     --cache-dir "${build_root}/zig-cache" \
     --global-cache-dir "${GHOSTTY_ZIG_GLOBAL_CACHE_DIR}" \
-    --system "${GHOSTTY_ZIG_GLOBAL_CACHE_DIR}/p" \
+    --system "${GHOSTTY_SOURCE_DIR}/zig-pkg" \
     -p "${build_root}"
 )
 

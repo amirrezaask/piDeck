@@ -32,6 +32,7 @@ export class ChromeTabs extends Context.Tag('Switcher/ChromeTabs')<ChromeTabs, C
 
 export interface ChromeCommandsShape {
   readonly getShortcut: () => Effect.Effect<string | undefined, SwitcherError>;
+  readonly openShortcutSettings: () => Effect.Effect<void, SwitcherError>;
   readonly updateBadge: () => Effect.Effect<void, SwitcherError>;
 }
 export class ChromeCommands extends Context.Tag('Switcher/ChromeCommands')<
