@@ -183,6 +183,63 @@ fn host_queries_use_only_copied_callback_configuration() -> Result<(), GhosttyEr
 }
 
 #[test]
+fn host_color_scheme_can_change_without_rebuilding_terminal() -> Result<(), GhosttyError> {
+    let mut terminal = Terminal::new(test_options())?;
+    let dark = terminal
+        .write(b"\x1b[?996n")?
+        .pty_responses()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    terminal.set_color_scheme(Some(ColorScheme::Light));
+    let light = terminal
+        .write(b"\x1b[?996n")?
+        .pty_responses()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(dark, b"\x1b[?997;1n");
+    assert_eq!(light, b"\x1b[?997;2n");
+    Ok(())
+}
+
+#[test]
+fn osc_color_queries_use_native_effects_and_configured_defaults() -> Result<(), GhosttyError> {
+    let mut terminal = Terminal::new(test_options())?;
+    terminal.set_default_colors(
+        Some(Rgb {
+            r: 0x11,
+            g: 0x22,
+            b: 0x33,
+        }),
+        Some(Rgb {
+            r: 0x44,
+            g: 0x55,
+            b: 0x66,
+        }),
+        Some(Rgb {
+            r: 0x77,
+            g: 0x88,
+            b: 0x99,
+        }),
+    )?;
+    let responses = terminal
+        .write(b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07")?
+        .pty_responses()
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses,
+        [
+            b"\x1b]10;rgb:1111/2222/3333\x1b\\".to_vec(),
+            b"\x1b]11;rgb:4444/5555/6666\x1b\\".to_vec(),
+            b"\x1b]12;rgb:7777/8888/9999\x1b\\".to_vec(),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn callback_overflow_is_typed_and_never_silently_drops_query_bytes() {
     let mut options = test_options();
     options.effects.limits.pty_response_bytes = 1;

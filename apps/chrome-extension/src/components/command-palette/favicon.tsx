@@ -12,7 +12,7 @@ export function Favicon({ src, label }: FaviconProps) {
     const letter = label.trim().charAt(0).toLocaleUpperCase();
     return (
       <span
-        className="flex size-5 shrink-0 items-center justify-center rounded-sm bg-muted text-[9px] font-semibold text-muted-foreground"
+        className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted text-[10px] font-semibold text-muted-foreground"
         aria-hidden="true"
       >
         {letter || <Globe2Icon />}
@@ -23,7 +23,7 @@ export function Favicon({ src, label }: FaviconProps) {
     <img
       src={src}
       alt=""
-      className="size-5 shrink-0 rounded-sm object-contain"
+      className="size-6 shrink-0 rounded-md object-contain"
       referrerPolicy="no-referrer"
       onError={() => setFailed(true)}
     />

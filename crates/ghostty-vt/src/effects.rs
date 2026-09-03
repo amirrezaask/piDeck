@@ -350,6 +350,10 @@ impl CallbackState {
         }
     }
 
+    pub(crate) fn set_color_scheme(&mut self, color_scheme: Option<ColorScheme>) {
+        self.color_scheme = color_scheme;
+    }
+
     pub(crate) fn finish(&self) -> Result<TerminalEffects<'_>, GhosttyError> {
         if self.invalid_callback {
             return Err(GhosttyError::AbiViolation {

@@ -23,9 +23,12 @@ The terminal interface hides Unix PTY and Windows ConPTY differences. Client dis
 - `rusqlite` with bundled SQLite on the dedicated database worker.
 - Serde for wire models mirrored from `packages/yaade-rpc`.
 - `bytes` for binary terminal frames.
-- Ghostty in browser and desktop renderers as the authoritative terminal model.
+- Native Ghostty terminal state in each server terminal-owner thread.
+- Ghostty in browser and desktop renderers at the same pinned revision.
 
-The host emits the negotiated raw binary terminal stream. It omits the terminal-level semantic `protocolVersion` and rejects explicit `semantic` or `both` attaches until a native Ghostty adapter exists. `vt100` is used only to produce conservative replay checkpoints; it does not replace Ghostty rendering.
+The host emits the negotiated raw binary terminal stream. It omits the terminal-level semantic `protocolVersion` and rejects explicit `semantic` or `both` attaches until semantic transport lands. Native Ghostty owns server-side parsing, query effects, title and working-directory metadata, modes, resize state, and bounded synthetic replay checkpoints. The server has no `vt100` parser or parallel OSC/query scanner.
+
+The repository applies `patches/ghostty/lib-vt-osc-color-reports.patch` to the pinned Ghostty revision during source preparation. The patch makes the public terminal stream emit Ghostty's 16-bit OSC 4/10/11/12 color reports through its existing write-PTY effect. Preparation and native builds verify the exact patch bytes, include the patch identity in cache keys, and reject modified source trees. Native and WASM builds consume the same patched source.
 
 ## Implemented behavior
 

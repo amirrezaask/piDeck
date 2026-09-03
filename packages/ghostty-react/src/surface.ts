@@ -848,10 +848,11 @@ export class GhosttyTerminalSurface {
       onCommit: commit => this.commitGeometry(commit),
     });
     this.resizeObserver = new ResizeObserver(entries => {
-      const entry = entries.find(candidate => candidate.target === this.mount);
-      const width = entry?.contentRect.width ?? this.mount.clientWidth;
-      const height = entry?.contentRect.height ?? this.mount.clientHeight;
-      this.observeGeometry(width, height);
+      if (!entries.some(candidate => candidate.target === this.mount)) return;
+      // A queued entry can describe the resident host after the terminal has
+      // already been moved into a visible placement. Measure the mount now so
+      // stale one-row geometry cannot resize the shared PTY and hide output.
+      this.observeGeometry();
     });
     this.installEvents();
     this.watchDevicePixelRatio();

@@ -18,7 +18,7 @@
     "build:clients": "pnpm build:client && pnpm build:agents-switcher",
     "build:client": "vp run --filter @pideck/client-web build",
     "build:agents-desktop": "pnpm --filter @pideck/client build",
-    "build:agents-switcher": "pnpm --filter @pideck/switcher build && node scripts/stage-extension.mjs",
+    "build:extension": "pnpm --filter @pideck/switcher build && node scripts/stage-extension.mjs",
     "build:agents-libs": "pnpm --filter @nextflow/contracts build && pnpm --filter @nextflow/database build && pnpm --filter @nextflow/observability build && pnpm --filter @nextflow/agent-runtime build && pnpm --filter @nextflow/test-agents build && pnpm --filter @pideck/terminal-multiplexer build",
     "build:desktop": "vp run --filter @yaade/desktop build",
     "build:release": "node scripts/build-release.mjs",
@@ -63,15 +63,24 @@
   },
   "pnpm": {
     "peerDependencyRules": {
-      "allowAny": ["vite"],
-      "allowedVersions": { "vite": "*" }
+      "allowAny": [
+        "vite"
+      ],
+      "allowedVersions": {
+        "vite": "*"
+      }
     }
   },
   "overrides": {
     "vite": "npm:@voidzero-dev/vite-plus-core@0.2.9"
   },
   "workspaces": {
-    "packages": ["apps/*", "packages/*", "tests/*", "tests/*/*"],
+    "packages": [
+      "apps/*",
+      "packages/*",
+      "tests/*",
+      "tests/*/*"
+    ],
     "catalog": {
       "vite": "npm:@voidzero-dev/vite-plus-core@0.2.9",
       "vite-plus": "0.2.9"

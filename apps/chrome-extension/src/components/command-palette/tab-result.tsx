@@ -65,7 +65,7 @@ export function TabResult({
       onSelect={onActivate}
       aria-label={`${item.title}, ${item.hostname}${item.currentWindow ? '' : ', another window'}`}
       aria-selected={selected}
-      className="group/result min-h-10 gap-2.5 rounded-md px-2.5 py-1.5 text-[13px]"
+      className="group/result min-h-12 gap-3 rounded-lg px-3 py-2 text-sm"
     >
       <Favicon src={item.favIconUrl} label={item.hostname || item.title} />
       <span className="flex min-w-0 flex-1 flex-col">

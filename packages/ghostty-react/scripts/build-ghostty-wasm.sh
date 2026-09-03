@@ -31,6 +31,7 @@ log "building ${GHOSTTY_REVISION} for wasm32-freestanding"
     -Doptimize=ReleaseSmall \
     -Dstrip=true \
     -Dlib-version-string="0.1.0-dev+${GHOSTTY_REVISION}" \
+    --cache-dir "${build_root}/zig-cache" \
     --global-cache-dir "${GHOSTTY_ZIG_GLOBAL_CACHE_DIR}" \
     --system "${GHOSTTY_ZIG_GLOBAL_CACHE_DIR}/p" \
     -p "${build_root}"

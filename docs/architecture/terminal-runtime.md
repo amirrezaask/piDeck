@@ -3,19 +3,21 @@
 YAADE uses one host process as the terminal multiplexer:
 
 ```text
-browser  <->  host server  <->  TerminalHost  <->  node-pty children
+browser  <->  host server  <->  TerminalHost  <->  portable-pty children
 ```
 
-`TerminalHost` maps terminal IDs to handles. One owner thread per terminal owns
-the PTY master, writer, child, replay, checkpoint parser, and writer leases. A
+`TerminalHost` maps terminal IDs to handles. One owner thread per terminal constructs,
+mutates, and drops its `ghostty_vt::Terminal`. The same thread owns the PTY master,
+writer, child, replay, synthetic checkpoint state, and writer leases. Native Ghostty
+never enters an `Arc`, mutex, async task, history worker, or socket path. A
 small 256 KiB-stack reader thread only reads the blocking PTY and sends at most
 64 immutable 64 KiB chunks over a bounded channel. The 1 MiB-stack owner
 services 64-entry urgent and normal command lanes between 1 MiB output quanta.
 It drains up to 64 immediately available adjacent writes into one bounded 256
 KiB scratch batch and flushes once; a lone keystroke is never timer-delayed.
 Consecutive resize bursts are latest-wins within the same owner turn, all
-receipts resolve, and the final dimensions update the PTY, recorder, and
-checkpoint together. Terminal-map cleanup also uses a bounded 256-entry lane.
+receipts resolve, and the final dimensions update the PTY, native Ghostty state,
+and checkpoint together. Terminal-map cleanup also uses a bounded 256-entry lane.
 Queue saturation returns a typed runtime error.
 
 The history owner accepts records through a 1,024-message / 32 MiB ingest
@@ -51,10 +53,15 @@ fallback. It never adopts the old PTY or signals a reused PID.
 
 ## Data path
 
-PTY output remains opaque ordered bytes from each host read through immutable
-`Bytes` replay/history/live frames, binary WebSocket payloads, browser
-`Uint8Array` replay coordination, and the Ghostty worker. Only terminal IDs and
-completed textual protocol metadata are UTF-8 decoded. Durable history stores a
+Each PTY output chunk enters one native Ghostty write on its owner thread. The
+owner copies bounded query responses, title, working directory, and bell effects
+after the native call returns. It writes and flushes PTY responses before it
+publishes the original opaque bytes to replay, history, or live clients. PTY
+output remains ordered `Bytes` through immutable replay/history/live frames,
+binary WebSocket payloads, browser
+`Uint8Array` replay coordination, and the Ghostty worker. Only terminal IDs and completed textual protocol metadata are UTF-8 decoded.
+Ghostty's public formatter produces bounded synthetic checkpoint-v1 bootstrap
+bytes; checkpoints do not serialize private parser memory. Durable history stores a
 versioned big-endian binary record stream inside compressed blocks, so malformed
 or incomplete UTF-8 replays exactly. Output is batched by byte count to reduce
 framing overhead, while small interactive chunks flush immediately. A

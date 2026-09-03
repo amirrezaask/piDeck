@@ -62,6 +62,8 @@ impl Mode {
     pub const BRACKETED_PASTE: Self = Self(2004);
     /// Synchronized-output mode (DEC 2026).
     pub const SYNCHRONIZED_OUTPUT: Self = Self(2026);
+    /// Color-scheme change reports (DEC 2031).
+    pub const COLOR_SCHEME_UPDATES: Self = Self(2031);
     /// In-band resize reports (DEC 2048).
     pub const IN_BAND_RESIZE: Self = Self(2048);
     /// ANSI insert mode (ANSI 4).
@@ -349,6 +351,11 @@ impl Terminal {
             )
         };
         ffi_result(result, Operation::TerminalSet)
+    }
+
+    /// Update the copied host color scheme used by terminal query callbacks.
+    pub fn set_color_scheme(&mut self, color_scheme: Option<crate::ColorScheme>) {
+        self.callback_mut().set_color_scheme(color_scheme);
     }
 
     /// Set default foreground, background, and cursor colors.

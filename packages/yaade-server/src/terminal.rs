@@ -15,6 +15,10 @@ use std::{
 use base64::Engine as _;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select_biased};
+use ghostty_vt::{
+    ColorScheme, DeviceAttributes, EffectOptions, Format, FormatOptions, Mode, Rgb,
+    Terminal as GhosttyTerminal, TerminalOptions as GhosttyTerminalOptions, TerminalSize,
+};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -213,12 +217,10 @@ struct EntryState {
     rows: u16,
     disposed: bool,
     replay_ready_clients: HashSet<String>,
-    query_leftover: Vec<u8>,
-    osc7_scanner: Osc7Scanner,
+    title: Option<String>,
     terminal_theme: TerminalTheme,
-    theme_updates_enabled: bool,
     live_cwd: Option<PathBuf>,
-    recorder: Option<vt100::Parser>,
+    checkpoints: bool,
     checkpoint: Option<TerminalCheckpoint>,
     bytes_since_checkpoint: usize,
     last_checkpoint_at: Instant,
@@ -536,23 +538,17 @@ impl TerminalHost {
             rows,
             disposed: false,
             replay_ready_clients: HashSet::new(),
-            query_leftover: Vec::new(),
-            osc7_scanner: Osc7Scanner::default(),
+            title: title.clone(),
             terminal_theme,
-            theme_updates_enabled: false,
             live_cwd: None,
-            recorder: self.checkpoints.then(|| vt100::Parser::new(rows, cols, 0)),
+            checkpoints: self.checkpoints,
             checkpoint: None,
             bytes_since_checkpoint: 0,
             last_checkpoint_at: Instant::now(),
         };
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id.clone(), Arc::clone(&entry));
-
         let weak = Arc::downgrade(self);
         let owner_entry = Arc::clone(&entry);
+        let (init_tx, init_rx) = bounded(1);
         thread::Builder::new()
             .name(format!("yaade-terminal-owner-{id}"))
             .stack_size(1024 * 1024)
@@ -567,9 +563,19 @@ impl TerminalHost {
                     urgent_command_rx,
                     normal_command_rx,
                     output_rx,
+                    init_tx,
                 );
             })
             .map_err(|error| TerminalError::Runtime(error.to_string()))?;
+        init_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(|_| {
+                TerminalError::Runtime("terminal owner initialization timed out".to_owned())
+            })??;
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.clone(), Arc::clone(&entry));
         thread::Builder::new()
             .name(format!("yaade-pty-reader-{id}"))
             .stack_size(256 * 1024)
@@ -1069,6 +1075,58 @@ fn pty_reader_loop(output: Sender<OutputMessage>, reader: &mut Box<dyn Read + Se
     }
 }
 
+fn ghostty_error(error: ghostty_vt::GhosttyError) -> TerminalError {
+    TerminalError::Runtime(format!("native Ghostty terminal failure: {error}"))
+}
+
+fn ghostty_rgb(color: TerminalColor) -> Rgb {
+    Rgb {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+    }
+}
+
+fn ghostty_color_scheme(theme: TerminalTheme) -> ColorScheme {
+    if terminal_theme_preference(theme) == 2 {
+        ColorScheme::Light
+    } else {
+        ColorScheme::Dark
+    }
+}
+
+fn create_ghostty_terminal(state: &EntryState) -> Result<GhosttyTerminal, TerminalError> {
+    let mut terminal = GhosttyTerminal::new(GhosttyTerminalOptions {
+        cols: usize::from(state.cols),
+        rows: usize::from(state.rows),
+        // Durable history owns scrollback. Native server state only needs the
+        // visible grid for query semantics and checkpoint-v1 bootstrap bytes.
+        scrollback: 0,
+        effects: EffectOptions {
+            size: Some(TerminalSize {
+                rows: state.rows,
+                columns: state.cols,
+                cell_width: 1,
+                cell_height: 1,
+            }),
+            color_scheme: Some(ghostty_color_scheme(state.terminal_theme)),
+            device_attributes: Some(DeviceAttributes::default()),
+            enquiry_response: b"YAADE".to_vec(),
+            xtversion: format!("YAADE {}", env!("CARGO_PKG_VERSION")).into_bytes(),
+            ..EffectOptions::default()
+        },
+    })
+    .map_err(ghostty_error)?;
+    terminal
+        .set_default_colors(
+            Some(ghostty_rgb(state.terminal_theme.foreground)),
+            Some(ghostty_rgb(state.terminal_theme.background)),
+            Some(ghostty_rgb(state.terminal_theme.cursor)),
+        )
+        .map_err(ghostty_error)?;
+    Ok(terminal)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn terminal_owner_loop(
     host: Weak<TerminalHost>,
@@ -1080,12 +1138,27 @@ fn terminal_owner_loop(
     urgent_commands: Receiver<TerminalCommand>,
     normal_commands: Receiver<TerminalCommand>,
     output: Receiver<OutputMessage>,
+    initialized: Sender<Result<(), TerminalError>>,
 ) {
+    let mut terminal = match create_ghostty_terminal(&state) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = initialized.send(Err(error));
+            return;
+        }
+    };
     let mut control = TerminalControlRegistry::new();
-    if control
-        .register_terminal(&entry.id, &entry.terminal_epoch)
-        .is_err()
-    {
+    if let Err(error) = control.register_terminal(&entry.id, &entry.terminal_epoch) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = initialized.send(Err(error.into()));
+        return;
+    }
+    if initialized.send(Ok(())).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
         return;
     }
     macro_rules! handle {
@@ -1097,6 +1170,7 @@ fn terminal_owner_loop(
                 &mut writer,
                 &mut child,
                 &mut state,
+                &mut terminal,
                 &mut control,
                 $command,
             ) {
@@ -1113,6 +1187,7 @@ fn terminal_owner_loop(
                 &mut writer,
                 &mut child,
                 &mut state,
+                &mut terminal,
                 &mut control,
                 $commands,
                 $scratch,
@@ -1143,7 +1218,14 @@ fn terminal_owner_loop(
             match output.try_recv() {
                 Ok(OutputMessage::Bytes(data)) => {
                     output_bytes = output_bytes.saturating_add(data.len());
-                    process_terminal_output(&host, &entry, &mut writer, &mut state, data);
+                    process_terminal_output(
+                        &host,
+                        &entry,
+                        &mut writer,
+                        &mut state,
+                        &mut terminal,
+                        data,
+                    );
                 }
                 Ok(OutputMessage::ReadFailed(kind)) => {
                     eprintln!("[terminal-reader] {} failed: {kind:?}", entry.id);
@@ -1165,7 +1247,7 @@ fn terminal_owner_loop(
             }
         }
         if !output_open && !exit_observed {
-            observe_terminal_exit(&host, &entry, &mut child, &mut state);
+            observe_terminal_exit(&host, &entry, &mut child, &mut state, &mut terminal);
             exit_observed = true;
         }
         if !output_open {
@@ -1185,7 +1267,14 @@ fn terminal_owner_loop(
             },
             recv(output) -> message => match message {
                 Ok(OutputMessage::Bytes(data)) => {
-                    process_terminal_output(&host, &entry, &mut writer, &mut state, data);
+                    process_terminal_output(
+                        &host,
+                        &entry,
+                        &mut writer,
+                        &mut state,
+                        &mut terminal,
+                        data,
+                    );
                 }
                 Ok(OutputMessage::ReadFailed(kind)) => {
                     eprintln!("[terminal-reader] {} failed: {kind:?}", entry.id);
@@ -1253,6 +1342,7 @@ fn handle_terminal_command_batch(
     writer: &mut Box<dyn Write + Send>,
     child: &mut Box<dyn Child + Send + Sync>,
     state: &mut EntryState,
+    terminal: &mut GhosttyTerminal,
     control: &mut TerminalControlRegistry,
     commands: Vec<TerminalCommand>,
     write_scratch: &mut Vec<u8>,
@@ -1381,7 +1471,9 @@ fn handle_terminal_command_batch(
                 }
             }
             let resize_error = latest
-                .and_then(|(cols, rows)| resize_terminal(master, entry, state, cols, rows).err())
+                .and_then(|(cols, rows)| {
+                    resize_terminal(master, entry, writer, state, terminal, cols, rows).err()
+                })
                 .map(|error| error.to_string());
             for reply in replies {
                 match reply {
@@ -1402,7 +1494,9 @@ fn handle_terminal_command_batch(
             continue;
         }
 
-        if !handle_terminal_command(host, entry, master, writer, child, state, control, command) {
+        if !handle_terminal_command(
+            host, entry, master, writer, child, state, terminal, control, command,
+        ) {
             return false;
         }
     }
@@ -1449,7 +1543,9 @@ fn write_terminal(writer: &mut Box<dyn Write + Send>, data: &Bytes) -> Result<()
 fn resize_terminal(
     master: &dyn MasterPty,
     entry: &TerminalEntry,
+    writer: &mut Box<dyn Write + Send>,
     state: &mut EntryState,
+    terminal: &mut GhosttyTerminal,
     cols: u16,
     rows: u16,
 ) -> Result<(), TerminalError> {
@@ -1463,11 +1559,24 @@ fn resize_terminal(
             pixel_height: 0,
         })
         .map_err(|error| TerminalError::Runtime(error.to_string()))?;
+    let responses = terminal
+        .resize(usize::from(cols), usize::from(rows), 1, 1)
+        .map_err(ghostty_error)?
+        .pty_responses()
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    for response in responses {
+        writer
+            .write_all(&response)
+            .map_err(|error| TerminalError::Runtime(error.to_string()))?;
+    }
+    writer
+        .flush()
+        .map_err(|error| TerminalError::Runtime(error.to_string()))?;
     state.cols = cols;
     state.rows = rows;
-    if let Some(recorder) = state.recorder.as_mut() {
-        recorder.screen_mut().set_size(rows, cols);
-        store_checkpoint(&entry.terminal_epoch, state);
+    if state.checkpoints {
+        store_checkpoint(&entry.terminal_epoch, state, terminal);
     }
     Ok(())
 }
@@ -1480,6 +1589,7 @@ fn handle_terminal_command(
     writer: &mut Box<dyn Write + Send>,
     child: &mut Box<dyn Child + Send + Sync>,
     state: &mut EntryState,
+    terminal: &mut GhosttyTerminal,
     control: &mut TerminalControlRegistry,
     command: TerminalCommand,
 ) -> bool {
@@ -1487,7 +1597,7 @@ fn handle_terminal_command(
         TerminalCommand::Inspect { reply } => {
             let _ = reply.send(Ok(TerminalInspect {
                 id: entry.id.clone(),
-                title: entry.title.clone(),
+                title: state.title.clone(),
                 status: state.status,
                 exit_code: state.exit_code,
                 signal: state.signal,
@@ -1527,17 +1637,36 @@ fn handle_terminal_command(
             let _ = reply.send(result);
         }
         TerminalCommand::SetTheme { theme, reply } => {
-            if state.terminal_theme != theme {
-                state.terminal_theme = theme;
-                if state.theme_updates_enabled {
-                    let _ = write_terminal_theme_preference(&mut **writer, theme);
-                    let _ = writer.flush();
-                }
-            }
-            let _ = reply.send(Ok(()));
+            let result = if state.terminal_theme == theme {
+                Ok(())
+            } else {
+                terminal
+                    .set_default_colors(
+                        Some(ghostty_rgb(theme.foreground)),
+                        Some(ghostty_rgb(theme.background)),
+                        Some(ghostty_rgb(theme.cursor)),
+                    )
+                    .map_err(ghostty_error)
+                    .and_then(|()| {
+                        terminal.set_color_scheme(Some(ghostty_color_scheme(theme)));
+                        if terminal
+                            .mode(Mode::COLOR_SCHEME_UPDATES)
+                            .map_err(ghostty_error)?
+                        {
+                            write_terminal_theme_preference(&mut **writer, theme)
+                                .and_then(|()| writer.flush())
+                                .map_err(|error| TerminalError::Runtime(error.to_string()))?;
+                        }
+                        state.terminal_theme = theme;
+                        Ok(())
+                    })
+            };
+            let _ = reply.send(result);
         }
         TerminalCommand::Resize { cols, rows, reply } => {
-            let _ = reply.send(resize_terminal(master, entry, state, cols, rows));
+            let _ = reply.send(resize_terminal(
+                master, entry, writer, state, terminal, cols, rows,
+            ));
         }
         TerminalCommand::AuthorizeAndResize {
             principal_id,
@@ -1549,7 +1678,8 @@ fn handle_terminal_command(
         } => {
             let result = authorize_terminal(control, entry, &principal_id, &connection_id, fence)
                 .and_then(|lease| {
-                    resize_terminal(master, entry, state, cols, rows).map(|()| lease)
+                    resize_terminal(master, entry, writer, state, terminal, cols, rows)
+                        .map(|()| lease)
                 });
             let _ = reply.send(result);
         }
@@ -1586,7 +1716,7 @@ fn handle_terminal_command(
             }
             let _ = reply.send(Ok(TerminalAttach {
                 id: entry.id.clone(),
-                title: entry.title.clone(),
+                title: state.title.clone(),
                 terminal_epoch: entry.terminal_epoch.clone(),
                 replay_quality: if checkpoint.is_some() {
                     "checkpoint"
@@ -1766,11 +1896,45 @@ fn process_terminal_output(
     entry: &TerminalEntry,
     writer: &mut Box<dyn Write + Send>,
     state: &mut EntryState,
+    terminal: &mut GhosttyTerminal,
     data: Bytes,
 ) {
     if state.disposed {
         return;
     }
+    let (responses, title, working_directory, bells) = match terminal.write(&data) {
+        Ok(effects) => (
+            effects
+                .pty_responses()
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>(),
+            effects.title().map(<[u8]>::to_vec),
+            effects.working_directory().map(<[u8]>::to_vec),
+            effects.bells(),
+        ),
+        Err(error) => {
+            eprintln!("[terminal-ghostty] {}: {error}", entry.id);
+            (Vec::new(), None, None, 0)
+        }
+    };
+    let mut response_failed = false;
+    for response in responses {
+        if let Err(error) = writer.write_all(&response) {
+            eprintln!("[terminal-pty-response] {}: {error}", entry.id);
+            response_failed = true;
+            break;
+        }
+    }
+    if !response_failed && let Err(error) = writer.flush() {
+        eprintln!("[terminal-pty-response] {}: {error}", entry.id);
+    }
+    if let Some(title) = title {
+        state.title = Some(String::from_utf8_lossy(&title).into_owned());
+    }
+    if let Some(value) = working_directory {
+        state.live_cwd = decode_terminal_working_directory(&value);
+    }
+
     state.sequence += 1;
     let sequence = state.sequence;
     state.replay.push_back(ReplayChunk {
@@ -1784,32 +1948,12 @@ fn process_terminal_output(
             state.replay_truncated = true;
         }
     }
-    let terminal_requests = feed_terminal_requests(&mut state.query_leftover, &data);
-    let terminal_theme = state.terminal_theme;
-    for request in terminal_requests {
-        match request {
-            TerminalRequest::Query(query) => {
-                let _ = write_terminal_query_response(
-                    &mut **writer,
-                    query,
-                    terminal_theme,
-                    state.theme_updates_enabled,
-                );
-            }
-            TerminalRequest::SetThemeUpdates(enabled) => state.theme_updates_enabled = enabled,
-        }
-    }
-    let _ = writer.flush();
-    if let Some(cwd) = state.osc7_scanner.feed(&data) {
-        state.live_cwd = Some(cwd.canonicalize().unwrap_or(cwd));
-    }
-    if let Some(recorder) = state.recorder.as_mut() {
-        recorder.process(&data);
+    if state.checkpoints {
         state.bytes_since_checkpoint = state.bytes_since_checkpoint.saturating_add(data.len());
         if state.bytes_since_checkpoint >= CHECKPOINT_BYTES
             || state.last_checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL
         {
-            store_checkpoint(&entry.terminal_epoch, state);
+            store_checkpoint(&entry.terminal_epoch, state, terminal);
         }
     }
     let Some(host) = host.upgrade() else { return };
@@ -1818,6 +1962,9 @@ fn process_terminal_output(
     }
     host.events
         .emit_terminal(Arc::<str>::from(entry.id.as_str()), sequence, data);
+    for _ in 0..bells {
+        host.events.emit("terminal:bell", vec![json!(entry.id)]);
+    }
 }
 
 fn observe_terminal_exit(
@@ -1825,6 +1972,7 @@ fn observe_terminal_exit(
     entry: &TerminalEntry,
     child: &mut Box<dyn Child + Send + Sync>,
     state: &mut EntryState,
+    terminal: &mut GhosttyTerminal,
 ) {
     if state.disposed {
         return;
@@ -1838,8 +1986,8 @@ fn observe_terminal_exit(
     });
     state.status = TerminalProcessStatus::Exited;
     state.exit_code = Some(exit_code);
-    if state.recorder.is_some() {
-        store_checkpoint(&entry.terminal_epoch, state);
+    if state.checkpoints {
+        store_checkpoint(&entry.terminal_epoch, state, terminal);
     }
     state.signal = signal;
     while state.replay_bytes > EXITED_REPLAY_BYTES && state.replay.len() > 1 {
@@ -1862,21 +2010,40 @@ fn observe_terminal_exit(
         .blocking_send((entry.id.clone(), entry.terminal_epoch.clone()));
 }
 
-fn store_checkpoint(terminal_epoch: &str, state: &mut EntryState) {
-    let Some(recorder) = state.recorder.as_ref() else {
-        return;
+fn store_checkpoint(terminal_epoch: &str, state: &mut EntryState, terminal: &mut GhosttyTerminal) {
+    let terminal_state = match terminal.state() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[terminal-checkpoint] {error}");
+            return;
+        }
     };
-    let screen = recorder.screen();
-    let (row, column) = screen.cursor_position();
-    let mut ansi = Vec::with_capacity(state.cols as usize * state.rows as usize + 64);
+    let mut ansi = Vec::with_capacity(usize::from(state.cols) * usize::from(state.rows) + 64);
     ansi.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
-    if screen.alternate_screen() {
+    if terminal_state.alternate_screen {
         ansi.extend_from_slice(b"\x1b[?1049h");
     } else {
         ansi.extend_from_slice(b"\x1b[?1049l");
     }
-    ansi.extend_from_slice(&screen.contents_formatted());
-    ansi.extend_from_slice(format!("\x1b[{};{}H", row + 1, column + 1).as_bytes());
+    if let Err(error) = terminal.format_into(
+        FormatOptions {
+            format: Format::Vt,
+            ..FormatOptions::default()
+        },
+        MAX_REPLAY_BYTES,
+        &mut ansi,
+    ) {
+        eprintln!("[terminal-checkpoint] {error}");
+        return;
+    }
+    ansi.extend_from_slice(
+        format!(
+            "\x1b[{};{}H",
+            terminal_state.cursor_row + 1,
+            terminal_state.cursor_column + 1
+        )
+        .as_bytes(),
+    );
     state.checkpoint = Some(TerminalCheckpoint {
         checkpoint_version: 1,
         terminal_epoch: terminal_epoch.to_owned(),
@@ -1903,68 +2070,12 @@ fn bounded_replay_tail(chunks: Vec<Base64Bytes>, max_bytes: usize) -> Vec<Base64
     chunks.into_iter().skip(start).collect()
 }
 
-const OSC7_PREFIX: &[u8] = b"\x1b]7;";
-const MAX_OSC7_PAYLOAD_BYTES: usize = 4096;
-
-#[derive(Default)]
-struct Osc7Scanner {
-    prefix_len: usize,
-    payload: Vec<u8>,
-    in_payload: bool,
-    saw_escape: bool,
-}
-
-impl Osc7Scanner {
-    fn feed(&mut self, chunk: &[u8]) -> Option<PathBuf> {
-        let mut last = None;
-        for &byte in chunk {
-            if !self.in_payload {
-                if byte == OSC7_PREFIX[self.prefix_len] {
-                    self.prefix_len += 1;
-                    if self.prefix_len == OSC7_PREFIX.len() {
-                        self.prefix_len = 0;
-                        self.in_payload = true;
-                        self.payload.clear();
-                    }
-                } else {
-                    self.prefix_len = usize::from(byte == OSC7_PREFIX[0]);
-                }
-                continue;
-            }
-            if self.saw_escape {
-                self.saw_escape = false;
-                if byte == b'\\' {
-                    last = self.finish().or(last);
-                    continue;
-                }
-                if self.payload.len() < MAX_OSC7_PAYLOAD_BYTES {
-                    self.payload.push(0x1b);
-                }
-            }
-            if byte == 0x07 {
-                last = self.finish().or(last);
-            } else if byte == 0x1b {
-                self.saw_escape = true;
-            } else if self.payload.len() < MAX_OSC7_PAYLOAD_BYTES {
-                self.payload.push(byte);
-            } else {
-                self.reset();
-            }
-        }
-        last
-    }
-
-    fn finish(&mut self) -> Option<PathBuf> {
-        let path = std::str::from_utf8(&self.payload).ok().and_then(osc7_path);
-        self.reset();
-        path
-    }
-
-    fn reset(&mut self) {
-        self.prefix_len = 0;
-        self.payload.clear();
-        self.in_payload = false;
-        self.saw_escape = false;
+fn decode_terminal_working_directory(value: &[u8]) -> Option<PathBuf> {
+    let value = std::str::from_utf8(value).ok()?.trim();
+    if value.starts_with("file://") {
+        osc7_path(value)
+    } else {
+        (!value.is_empty()).then(|| PathBuf::from(value))
     }
 }
 
@@ -1993,104 +2104,6 @@ fn signal_number(signal: &str) -> Option<i32> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalQuery {
-    PrimaryDeviceAttributes,
-    OperatingStatus,
-    CursorPosition,
-    ForegroundColor,
-    BackgroundColor,
-    CursorColor,
-    ThemeUpdatesMode,
-    ThemePreference,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalRequest {
-    Query(TerminalQuery),
-    SetThemeUpdates(bool),
-}
-
-const fn terminal_query(query: TerminalQuery) -> TerminalRequest {
-    TerminalRequest::Query(query)
-}
-
-// Neovim enables DEC mode 2031 after DECRQM reports support, then uses the
-// unsolicited 997 DSR to re-query OSC colors when the terminal palette changes.
-const TERMINAL_REQUEST_SEQUENCES: [(&[u8], TerminalRequest); 14] = [
-    (
-        b"\x1b[?2031$p",
-        terminal_query(TerminalQuery::ThemeUpdatesMode),
-    ),
-    (
-        b"\x1b[?996n",
-        terminal_query(TerminalQuery::ThemePreference),
-    ),
-    (b"\x1b[?2031h", TerminalRequest::SetThemeUpdates(true)),
-    (b"\x1b[?2031l", TerminalRequest::SetThemeUpdates(false)),
-    (
-        b"\x1b[0c",
-        terminal_query(TerminalQuery::PrimaryDeviceAttributes),
-    ),
-    (
-        b"\x1b[c",
-        terminal_query(TerminalQuery::PrimaryDeviceAttributes),
-    ),
-    (b"\x1b[5n", terminal_query(TerminalQuery::OperatingStatus)),
-    (b"\x1b[6n", terminal_query(TerminalQuery::CursorPosition)),
-    (
-        b"\x1b]10;?\x07",
-        terminal_query(TerminalQuery::ForegroundColor),
-    ),
-    (
-        b"\x1b]10;?\x1b\\",
-        terminal_query(TerminalQuery::ForegroundColor),
-    ),
-    (
-        b"\x1b]11;?\x07",
-        terminal_query(TerminalQuery::BackgroundColor),
-    ),
-    (
-        b"\x1b]11;?\x1b\\",
-        terminal_query(TerminalQuery::BackgroundColor),
-    ),
-    (b"\x1b]12;?\x07", terminal_query(TerminalQuery::CursorColor)),
-    (
-        b"\x1b]12;?\x1b\\",
-        terminal_query(TerminalQuery::CursorColor),
-    ),
-];
-
-fn feed_terminal_requests(leftover: &mut Vec<u8>, chunk: &[u8]) -> Vec<TerminalRequest> {
-    let mut requests = Vec::new();
-    for &byte in chunk {
-        if leftover.is_empty() {
-            if byte == 0x1b {
-                leftover.push(byte);
-            }
-            continue;
-        }
-        leftover.push(byte);
-        if let Some((_, request)) = TERMINAL_REQUEST_SEQUENCES
-            .iter()
-            .find(|(sequence, _)| *sequence == leftover.as_slice())
-        {
-            requests.push(*request);
-            leftover.clear();
-        } else if !TERMINAL_REQUEST_SEQUENCES
-            .iter()
-            .any(|(sequence, _)| sequence.starts_with(leftover))
-        {
-            let restart = byte == 0x1b;
-            leftover.clear();
-            if restart {
-                leftover.push(byte);
-            }
-        }
-    }
-    requests
-}
-
 fn terminal_theme_preference(theme: TerminalTheme) -> u8 {
     let background = theme.background;
     let luma = u32::from(background.r) * 299
@@ -2104,51 +2117,6 @@ fn write_terminal_theme_preference<W: Write + ?Sized>(
     theme: TerminalTheme,
 ) -> std::io::Result<()> {
     write!(writer, "\x1b[?997;{}n", terminal_theme_preference(theme))
-}
-
-fn write_terminal_query_response<W: Write + ?Sized>(
-    writer: &mut W,
-    query: TerminalQuery,
-    theme: TerminalTheme,
-    theme_updates_enabled: bool,
-) -> std::io::Result<()> {
-    match query {
-        TerminalQuery::PrimaryDeviceAttributes => {
-            writer.write_all(b"\x1b[?64;1;2;6;9;15;18;21;22c")
-        }
-        TerminalQuery::OperatingStatus => writer.write_all(b"\x1b[0n"),
-        // The host is authoritative for terminal query responses but does not retain a
-        // render grid. New shells issue CPR while still at the origin, so report the
-        // conservative VT default instead of leaving the process blocked indefinitely.
-        TerminalQuery::CursorPosition => writer.write_all(b"\x1b[1;1R"),
-        TerminalQuery::ThemeUpdatesMode => write!(
-            writer,
-            "\x1b[?2031;{}$y",
-            if theme_updates_enabled { 1 } else { 2 },
-        ),
-        TerminalQuery::ThemePreference => write_terminal_theme_preference(writer, theme),
-        TerminalQuery::ForegroundColor
-        | TerminalQuery::BackgroundColor
-        | TerminalQuery::CursorColor => {
-            let (selector, color) = match query {
-                TerminalQuery::ForegroundColor => (10, theme.foreground),
-                TerminalQuery::BackgroundColor => (11, theme.background),
-                TerminalQuery::CursorColor => (12, theme.cursor),
-                TerminalQuery::PrimaryDeviceAttributes
-                | TerminalQuery::OperatingStatus
-                | TerminalQuery::CursorPosition
-                | TerminalQuery::ThemeUpdatesMode
-                | TerminalQuery::ThemePreference => unreachable!(),
-            };
-            write!(
-                writer,
-                "\x1b]{selector};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
-                u16::from(color.r) * 0x101,
-                u16::from(color.g) * 0x101,
-                u16::from(color.b) * 0x101,
-            )
-        }
-    }
 }
 
 fn command_output(command: &str, args: &[&str]) -> Option<String> {
@@ -2399,116 +2367,69 @@ mod tests {
     }
 
     #[test]
-    fn terminal_query_scanner_handles_da1_queries_split_across_chunks() {
-        let mut leftover = Vec::new();
-        assert!(feed_terminal_requests(&mut leftover, b"before\x1b[").is_empty());
-        assert_eq!(leftover, b"\x1b[");
-        assert_eq!(
-            feed_terminal_requests(&mut leftover, b"0cafter\x1b[c"),
-            vec![
-                terminal_query(TerminalQuery::PrimaryDeviceAttributes),
-                terminal_query(TerminalQuery::PrimaryDeviceAttributes),
-            ]
-        );
-        assert!(leftover.is_empty());
-    }
-
-    #[test]
-    fn terminal_query_scanner_handles_cursor_position_queries_split_across_chunks() {
-        let mut leftover = Vec::new();
-        assert!(feed_terminal_requests(&mut leftover, b"before\x1b[6").is_empty());
-        assert_eq!(leftover, b"\x1b[6");
-        assert_eq!(
-            feed_terminal_requests(&mut leftover, b"nafter"),
-            vec![terminal_query(TerminalQuery::CursorPosition)]
-        );
-        assert!(leftover.is_empty());
-
-        let mut response = Vec::new();
-        write_terminal_query_response(
-            &mut response,
-            TerminalQuery::CursorPosition,
-            TerminalTheme {
-                foreground: TerminalColor { r: 0, g: 0, b: 0 },
-                background: TerminalColor { r: 0, g: 0, b: 0 },
-                cursor: TerminalColor { r: 0, g: 0, b: 0 },
+    fn native_terminal_handles_split_queries_and_cwd_effects() {
+        let mut terminal = GhosttyTerminal::new(GhosttyTerminalOptions {
+            cols: 80,
+            rows: 24,
+            scrollback: 128,
+            effects: EffectOptions {
+                size: Some(TerminalSize {
+                    rows: 24,
+                    columns: 80,
+                    cell_width: 1,
+                    cell_height: 1,
+                }),
+                color_scheme: Some(ColorScheme::Dark),
+                device_attributes: Some(DeviceAttributes::default()),
+                ..EffectOptions::default()
             },
-            false,
-        )
-        .expect("cursor position response");
-        assert_eq!(response, b"\x1b[1;1R");
-    }
-
-    #[test]
-    fn terminal_query_scanner_handles_color_and_status_queries() {
-        let mut leftover = Vec::new();
-        assert!(feed_terminal_requests(&mut leftover, b"before\x1b]11;").is_empty());
-        assert_eq!(leftover, b"\x1b]11;");
+        })
+        .expect("terminal");
+        terminal
+            .set_default_colors(
+                Some(Rgb { r: 1, g: 2, b: 3 }),
+                Some(Rgb {
+                    r: 16,
+                    g: 32,
+                    b: 48,
+                }),
+                None,
+            )
+            .expect("colors");
         assert_eq!(
-            feed_terminal_requests(&mut leftover, b"?\x07\x1b[5"),
-            vec![terminal_query(TerminalQuery::BackgroundColor)]
+            terminal
+                .write(b"before\x1b]11;")
+                .expect("partial query")
+                .pty_responses()
+                .count(),
+            0
         );
-        assert_eq!(leftover, b"\x1b[5");
-        assert_eq!(
-            feed_terminal_requests(&mut leftover, b"n\x1b]10;?\x1b"),
-            vec![terminal_query(TerminalQuery::OperatingStatus)]
-        );
-        assert_eq!(leftover, b"\x1b]10;?\x1b");
-        assert_eq!(
-            feed_terminal_requests(&mut leftover, b"\\\x1b]12;?\x07"),
-            vec![
-                terminal_query(TerminalQuery::ForegroundColor),
-                terminal_query(TerminalQuery::CursorColor),
-            ]
-        );
-        assert!(leftover.is_empty());
-    }
-
-    #[test]
-    fn terminal_query_scanner_handles_theme_update_negotiation() {
-        let mut leftover = Vec::new();
-        assert!(feed_terminal_requests(&mut leftover, b"\x1b[?2031").is_empty());
-        assert_eq!(leftover, b"\x1b[?2031");
-        assert_eq!(
-            feed_terminal_requests(&mut leftover, b"$p\x1b[?2031h\x1b[?996n\x1b[?2031l"),
-            vec![
-                terminal_query(TerminalQuery::ThemeUpdatesMode),
-                TerminalRequest::SetThemeUpdates(true),
-                terminal_query(TerminalQuery::ThemePreference),
-                TerminalRequest::SetThemeUpdates(false),
-            ]
-        );
-        assert!(leftover.is_empty());
-    }
-
-    #[test]
-    fn terminal_query_responses_report_the_configured_theme() {
-        let theme = TerminalTheme {
-            foreground: TerminalColor { r: 1, g: 2, b: 3 },
-            background: TerminalColor {
-                r: 16,
-                g: 32,
-                b: 48,
-            },
-            cursor: TerminalColor {
-                r: 254,
-                g: 253,
-                b: 252,
-            },
-        };
-        let mut response = Vec::new();
-        write_terminal_query_response(&mut response, TerminalQuery::BackgroundColor, theme, false)
-            .expect("background response");
-        write_terminal_query_response(&mut response, TerminalQuery::OperatingStatus, theme, false)
-            .expect("status response");
-        write_terminal_query_response(&mut response, TerminalQuery::ThemeUpdatesMode, theme, false)
-            .expect("theme mode response");
-        write_terminal_query_response(&mut response, TerminalQuery::ThemePreference, theme, false)
-            .expect("theme preference response");
+        let effects = terminal
+            .write(b"?\x07\x1b[5n\x1b[?2031$p\x1b[?996n")
+            .expect("completed queries");
+        let response = effects
+            .pty_responses()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
         assert_eq!(
             response,
             b"\x1b]11;rgb:1010/2020/3030\x1b\\\x1b[0n\x1b[?2031;2$y\x1b[?997;1n"
         );
+
+        assert!(
+            terminal
+                .write(b"\x1b]7;file:///tmp/last%20")
+                .expect("partial cwd")
+                .working_directory()
+                .is_none()
+        );
+        let cwd = terminal
+            .write(b"dir\x1b\\")
+            .expect("completed cwd")
+            .working_directory()
+            .and_then(decode_terminal_working_directory);
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/last dir")));
     }
 
     #[test]
@@ -2517,16 +2438,5 @@ mod tests {
         let second = Bytes::copy_from_slice(b"\x94\x80");
         assert_eq!(first.as_ref(), b"ok\xffdone\xe2");
         assert_eq!(second.as_ref(), b"\x94\x80");
-    }
-
-    #[test]
-    fn osc7_scanner_uses_the_last_report_and_decodes_only_completed_payloads() {
-        let value = b"\x1b]7;file://host/tmp/first\x07\x1b]7;file:///tmp/last%20dir\x1b\\";
-        let mut scanner = Osc7Scanner::default();
-        let mut last = None;
-        for byte in value {
-            last = scanner.feed(std::slice::from_ref(byte)).or(last);
-        }
-        assert_eq!(last, Some(PathBuf::from("/tmp/last dir")));
     }
 }

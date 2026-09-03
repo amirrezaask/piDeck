@@ -20,6 +20,7 @@ crossbeam-channel = "0.5"
 flate2 = "1.1"
 futures-util = "0.3"
 getrandom = "0.3"
+ghostty-vt = { path = "../../crates/ghostty-vt" }
 hostname = "0.4"
 include_dir = { version = "0.7", optional = true }
 indexmap = "2.12"
@@ -38,7 +39,6 @@ tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "proce
 tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "fs", "limit", "trace"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["v4", "serde"] }
-vt100 = "0.16"
 
 [dev-dependencies]
 pretty_assertions = "1.4"
