@@ -59,8 +59,12 @@ pub enum FrameType {
     Error = 15,
     /// Liveness probe.
     Ping = 16,
-    /// Liveness response.
+    /// Liveness response or per-stream delivery acknowledgement.
     Pong = 17,
+    /// Detach a connection-local stream without terminating its session.
+    Detach = 18,
+    /// Successful low-frequency control operation acknowledgement.
+    ControlAck = 19,
 }
 
 impl TryFrom<u8> for FrameType {
@@ -85,6 +89,8 @@ impl TryFrom<u8> for FrameType {
             15 => Self::Error,
             16 => Self::Ping,
             17 => Self::Pong,
+            18 => Self::Detach,
+            19 => Self::ControlAck,
             other => return Err(ProtocolError::UnknownType(other)),
         })
     }

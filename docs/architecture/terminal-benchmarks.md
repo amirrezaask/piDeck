@@ -1,5 +1,34 @@
 # Terminal runtime benchmark evidence
 
+## 2026-09-04 protocol-v4 verification
+
+Command:
+
+```sh
+/usr/bin/time -l cargo test --release \
+  --manifest-path packages/yaade-server/Cargo.toml \
+  --lib benchmark_one_thousand_parkable_sessions -- --ignored --nocapture
+```
+
+Observed runtime output on the Apple M4/macOS reference host:
+
+```text
+requested=1000 admitted=509
+create_ms=3549
+rss_base_kib=3184
+rss_active_kib=41584
+rss_warm_kib=41600
+rss_parked_kib=41616
+rss_delta_kib=38400
+shards=8
+p50_wake_us=16106
+p95_wake_us=22520
+p99_wake_us=22761
+shutdown_ms=5540
+```
+
+The release test passed byte delivery, fixed owner count, parking, wake, and shutdown assertions. Admission stopped at 509 because this host reached its macOS PTY ceiling (`openpty` returned `ENXIO`); the runtime still requested 1,000. The timed command completed in 51.92 seconds including an 11.80-second incremental release build (`57.26s` user CPU, `5.23s` system CPU). Its process-tree maximum RSS was 1,378,385,920 bytes because `/usr/bin/time` included Cargo and rustc; the probe's in-process active-to-parked runtime delta was 38,400 KiB. The burst also exercised explicit bounded-history degradation without blocking live PTY delivery.
+
 ## 2026-08-19 fixed-reactor scale probe
 
 Command:

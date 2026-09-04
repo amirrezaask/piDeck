@@ -3,11 +3,15 @@ import {
   HostDisconnectedError,
   decodeHostRouteResult,
   decodeTerminalDataFrame,
+  encodeTerminalAckFrame,
+  encodeTerminalAttachFrame,
+  encodeTerminalDetachFrame,
   encodeTerminalInputFrame,
+  encodeTerminalPingFrame,
+  encodeTerminalReadyFrame,
   encodeTerminalResizeFrame,
+  encodeTerminalResyncRequest,
   encodeTerminalScrollbackRequest,
-  encodeTerminalWsAck,
-  encodeTerminalWsCommand,
   isTerminalWsHotOp,
   tryDecodeRealtimeHostEvent,
   tryDecodeTerminalReplayRequired,
@@ -22,9 +26,7 @@ import {
 import { Duration, Effect, Fiber } from "effect";
 import { invokeHostRpcUnchecked } from "./effect-host-client.js";
 
-async function runInvokePromise<T>(
-  effect: Effect.Effect<T, HostRpcError>,
-): Promise<T> {
+async function runInvokePromise<T>(effect: Effect.Effect<T, HostRpcError>): Promise<T> {
   const outcome = await Effect.runPromise(
     effect.pipe(
       Effect.match({
@@ -46,14 +48,13 @@ export function acceptHostEvent(
   if (message.protocolVersion === 1) return true;
   return Boolean(
     identity &&
-      message.serverId === identity.serverId &&
-      message.serverEpoch === identity.serverEpoch,
+    message.serverId === identity.serverId &&
+    message.serverEpoch === identity.serverEpoch,
   );
 }
 
 export function normalizeHostBaseUrl(baseUrl?: string): string {
-  const fallback =
-    typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  const fallback = typeof window === "undefined" ? "http://localhost" : window.location.origin;
   const url = new URL(baseUrl ?? fallback, fallback);
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("YAADE server URL must terminal http or https");
@@ -85,8 +86,9 @@ export function websocketUrl(
 
 export function readHostAuthToken(
   search = typeof window === "undefined" ? "" : window.location.search,
-  storage: Pick<Storage, "getItem" | "setItem"> | null =
-    typeof sessionStorage === "undefined" ? null : sessionStorage,
+  storage: Pick<Storage, "getItem" | "setItem"> | null = typeof sessionStorage === "undefined"
+    ? null
+    : sessionStorage,
 ): string | null {
   const query = new URLSearchParams(search).get("token")?.trim();
   if (query) {
@@ -106,14 +108,15 @@ export function readHostAuthToken(
 
 /** Copy a one-shot query token into session storage and drop it from the URL/history. */
 export function consumeHostAuthTokenFromLocation(
-  location: Pick<Location, "search" | "pathname" | "hash"> =
-    typeof window === "undefined"
-      ? { search: "", pathname: "/", hash: "" }
-      : window.location,
-  historyApi: Pick<History, "replaceState"> | null =
-    typeof history === "undefined" ? null : history,
-  storage: Pick<Storage, "getItem" | "setItem"> | null =
-    typeof sessionStorage === "undefined" ? null : sessionStorage,
+  location: Pick<Location, "search" | "pathname" | "hash"> = typeof window === "undefined"
+    ? { search: "", pathname: "/", hash: "" }
+    : window.location,
+  historyApi: Pick<History, "replaceState"> | null = typeof history === "undefined"
+    ? null
+    : history,
+  storage: Pick<Storage, "getItem" | "setItem"> | null = typeof sessionStorage === "undefined"
+    ? null
+    : sessionStorage,
 ): string | null {
   const token = readHostAuthToken(location.search, storage);
   const params = new URLSearchParams(location.search);
@@ -137,9 +140,7 @@ const REALTIME_CONNECT_TIMEOUT_MS = 15_000;
 const REALTIME_HEARTBEAT_INTERVAL_MS = 15_000;
 const REALTIME_HEARTBEAT_TIMEOUT_MS = 45_000;
 
-export function createClientId(
-  cryptoSource: Crypto | undefined = globalThis.crypto,
-): string {
+export function createClientId(cryptoSource: Crypto | undefined = globalThis.crypto): string {
   if (typeof cryptoSource?.randomUUID === "function") {
     return cryptoSource.randomUUID();
   }
@@ -223,10 +224,7 @@ export function subscribeRealtimeWake(
 export class WebHostTransport implements YaadeHostTransport {
   private readonly baseUrl: string;
   private readonly authToken: string | null | undefined;
-  private readonly listeners = new Map<
-    string,
-    Set<(...args: unknown[]) => void>
-  >();
+  private readonly listeners = new Map<string, Set<(...args: unknown[]) => void>>();
   private socket: WebSocket | null = null;
   private reconnectAttempt = 0;
   private lastSequence = 0;
@@ -234,6 +232,7 @@ export class WebHostTransport implements YaadeHostTransport {
   private serverEpoch: string | null = null;
   private synchronized = false;
   private closed = false;
+  private lastPongAt = 0;
   private readonly clientId = createClientId();
   private readonly pendingAborts = new Set<AbortController>();
   private readonly pendingRealtime = new Map<
@@ -288,9 +287,7 @@ export class WebHostTransport implements YaadeHostTransport {
             document,
             window,
           );
-    this.loopFiber = Effect.runFork(
-      this.reconnectLoop().pipe(Effect.orDie, Effect.asVoid),
-    );
+    this.loopFiber = Effect.runFork(this.reconnectLoop().pipe(Effect.orDie, Effect.asVoid));
   }
 
   async invoke<Name extends HostRouteName>(
@@ -322,16 +319,8 @@ export class WebHostTransport implements YaadeHostTransport {
     args: HostRouteArgs<Name>,
     signal: AbortSignal,
   ): Promise<HostRouteResult<Name>>;
-  async invokeWithSignal(
-    channel: string,
-    args: unknown[],
-    signal: AbortSignal,
-  ): Promise<unknown>;
-  async invokeWithSignal(
-    channel: string,
-    args: unknown[],
-    signal: AbortSignal,
-  ): Promise<unknown> {
+  async invokeWithSignal(channel: string, args: unknown[], signal: AbortSignal): Promise<unknown>;
+  async invokeWithSignal(channel: string, args: unknown[], signal: AbortSignal): Promise<unknown> {
     if (this.closed) throw new Error("host transport closed");
     if (signal.aborted) throw requestAbortError(signal);
     const ac = new AbortController();
@@ -366,7 +355,39 @@ export class WebHostTransport implements YaadeHostTransport {
     if (this.closed || !isTerminalWsHotOp(channel)) return null;
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) return null;
-    const requestId = `${this.clientId}:${++this.realtimeRequestSequence}`;
+    const requestSequence = ++this.realtimeRequestSequence;
+    const requestId = `${this.clientId}:${requestSequence}`;
+    let encoded: Uint8Array<ArrayBuffer>;
+    if (channel === "terminal:attach") {
+      const terminalId = args[0];
+      const afterSequence = args[1] ?? 0;
+      const mode = args[2] ?? "raw";
+      if (
+        typeof terminalId !== "string" ||
+        typeof afterSequence !== "number" ||
+        (mode !== "raw" && mode !== "semantic" && mode !== "both")
+      )
+        return null;
+      encoded = encodeTerminalAttachFrame(
+        requestSequence,
+        requestId,
+        terminalId,
+        afterSequence,
+        mode,
+      );
+    } else if (channel === "terminal:ready" || channel === "terminal:detach") {
+      const terminalId = args[0];
+      if (typeof terminalId !== "string") return null;
+      const streamId = this.terminalStreamIds.get(terminalId);
+      const stream = streamId === undefined ? undefined : this.terminalStreams.get(streamId);
+      if (streamId === undefined || !stream) return null;
+      encoded =
+        channel === "terminal:ready"
+          ? encodeTerminalReadyFrame(streamId, stream.epoch, stream.position, requestId)
+          : encodeTerminalDetachFrame(streamId, stream.epoch, stream.position, requestId);
+    } else {
+      return null;
+    }
     return new Promise<unknown>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingRealtime.delete(requestId);
@@ -379,9 +400,7 @@ export class WebHostTransport implements YaadeHostTransport {
         timeout,
       });
       try {
-        socket.send(
-          encodeTerminalWsCommand(requestId, channel, args),
-        );
+        socket.send(encoded);
       } catch (error) {
         clearTimeout(timeout);
         this.pendingRealtime.delete(requestId);
@@ -447,23 +466,30 @@ export class WebHostTransport implements YaadeHostTransport {
     if (this.closed || !isTerminalWsHotOp(channel)) return false;
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-    if (channel === "terminal:write") {
+    if (channel === "terminal:write" || channel === "terminal:writeBinary") {
       const terminalId = args[0];
-      const text = args[1];
-      if (typeof terminalId !== "string" || typeof text !== "string") return false;
+      const value = args[1];
+      if (typeof terminalId !== "string" || typeof value !== "string") return false;
       const streamId = this.terminalStreamIds.get(terminalId);
       const stream = streamId === undefined ? undefined : this.terminalStreams.get(streamId);
       if (streamId === undefined || !stream) return false;
-      const payload = new TextEncoder().encode(text);
+      let payload: Uint8Array;
+      if (channel === "terminal:write") {
+        payload = new TextEncoder().encode(value);
+      } else {
+        try {
+          const binary = atob(value);
+          payload = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+        } catch {
+          return false;
+        }
+      }
       if (payload.byteLength === 0) return true;
       stream.inputPosition += payload.byteLength;
       try {
-        socket.send(encodeTerminalInputFrame(
-          streamId,
-          stream.epoch,
-          stream.inputPosition,
-          payload,
-        ));
+        socket.send(
+          encodeTerminalInputFrame(streamId, stream.epoch, stream.inputPosition, payload),
+        );
         return true;
       } catch {
         stream.inputPosition -= payload.byteLength;
@@ -474,26 +500,30 @@ export class WebHostTransport implements YaadeHostTransport {
       const terminalId = args[0];
       const cols = args[1];
       const rows = args[2];
-      if (typeof terminalId !== "string" || typeof cols !== "number" || typeof rows !== "number") return false;
+      if (typeof terminalId !== "string" || typeof cols !== "number" || typeof rows !== "number")
+        return false;
       const streamId = this.terminalStreamIds.get(terminalId);
       const stream = streamId === undefined ? undefined : this.terminalStreams.get(streamId);
       if (streamId === undefined || !stream) return false;
       stream.controlPosition += 1;
       try {
-        socket.send(encodeTerminalResizeFrame(
-          streamId,
-          stream.epoch,
-          stream.controlPosition,
-          cols,
-          rows,
-        ));
+        socket.send(
+          encodeTerminalResizeFrame(streamId, stream.epoch, stream.controlPosition, cols, rows),
+        );
         return true;
       } catch {
         stream.controlPosition -= 1;
         return false;
       }
     }
-    const requestId = `${this.clientId}:unobserved:${++this.realtimeRequestSequence}`;
+    if (channel !== "terminal:detach" && channel !== "terminal:ready") return false;
+    const terminalId = args[0];
+    if (typeof terminalId !== "string") return false;
+    const streamId = this.terminalStreamIds.get(terminalId);
+    const stream = streamId === undefined ? undefined : this.terminalStreams.get(streamId);
+    if (streamId === undefined || !stream) return false;
+    const requestSequence = ++this.realtimeRequestSequence;
+    const requestId = `${this.clientId}:unobserved:${requestSequence}`;
     this.unobservedRealtime.set(requestId, channel);
     // A healthy server answers these immediately. Bound defensive bookkeeping
     // so a peer that violates the result contract cannot leak browser memory.
@@ -502,9 +532,11 @@ export class WebHostTransport implements YaadeHostTransport {
       if (oldest) this.unobservedRealtime.delete(oldest);
     }
     try {
-      socket.send(
-        encodeTerminalWsCommand(requestId, channel as TerminalWsHotOp, args),
-      );
+      if (channel === "terminal:detach") {
+        socket.send(encodeTerminalDetachFrame(streamId, stream.epoch, stream.position, requestId));
+      } else {
+        socket.send(encodeTerminalReadyFrame(streamId, stream.epoch, stream.position, requestId));
+      }
       return true;
     } catch {
       this.unobservedRealtime.delete(requestId);
@@ -530,9 +562,7 @@ export class WebHostTransport implements YaadeHostTransport {
     this.disposeRealtimeWake?.();
     this.reconnectWake?.();
     this.reconnectWake = null;
-    this.rejectPending(
-      new HostDisconnectedError({ message: "host transport closed" }),
-    );
+    this.rejectPending(new HostDisconnectedError({ message: "host transport closed" }));
     this.rejectRealtime(new Error("host transport closed"));
     this.rejectHistory(new Error("host transport closed"));
     const fiber = this.loopFiber;
@@ -607,8 +637,7 @@ export class WebHostTransport implements YaadeHostTransport {
     if (
       replaceOpenSocket &&
       socket &&
-      (socket.readyState === WebSocket.OPEN ||
-        socket.readyState === WebSocket.CONNECTING)
+      (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
     ) {
       this.preservePendingOnReconnect = true;
       socket.close(4000, "page returned to foreground");
@@ -626,9 +655,7 @@ export class WebHostTransport implements YaadeHostTransport {
               window.location,
               self.lastSequence,
               self.clientId,
-              self.authToken === undefined
-                ? readHostAuthToken()
-                : self.authToken,
+              self.authToken === undefined ? readHostAuthToken() : self.authToken,
               self.baseUrl,
               2,
             ),
@@ -652,7 +679,7 @@ export class WebHostTransport implements YaadeHostTransport {
           Effect.async<void>((resume) => {
             let settled = false;
             let heartbeat: ReturnType<typeof setInterval> | null = null;
-            let lastPongAt = Date.now();
+            self.lastPongAt = Date.now();
             const connectTimeout = setTimeout(() => {
               try {
                 socket.close(4000, "realtime connection timed out");
@@ -680,22 +707,21 @@ export class WebHostTransport implements YaadeHostTransport {
               self.terminalStreams.clear();
               self.terminalStreamIds.clear();
               self.dispatch("connection:status", "synchronizing");
-              lastPongAt = Date.now();
+              self.lastPongAt = Date.now();
               heartbeat = setInterval(() => {
-                if (Date.now() - lastPongAt > REALTIME_HEARTBEAT_TIMEOUT_MS) {
+                if (Date.now() - self.lastPongAt > REALTIME_HEARTBEAT_TIMEOUT_MS) {
                   socket.close(4000, "realtime heartbeat timed out");
                   return;
                 }
                 if (socket.readyState === WebSocket.OPEN) {
                   try {
-                    socket.send("ping");
+                    socket.send(encodeTerminalPingFrame(Date.now()));
                   } catch {
                     socket.close();
                   }
                 }
               }, REALTIME_HEARTBEAT_INTERVAL_MS);
-              const token =
-                self.authToken === undefined ? readHostAuthToken() : self.authToken;
+              const token = self.authToken === undefined ? readHostAuthToken() : self.authToken;
               if (token) {
                 try {
                   socket.send(JSON.stringify({ type: "protocol:auth", token }));
@@ -710,7 +736,7 @@ export class WebHostTransport implements YaadeHostTransport {
                 return;
               }
               if (event.data === "pong") {
-                lastPongAt = Date.now();
+                self.lastPongAt = Date.now();
                 return;
               }
               let raw: unknown;
@@ -728,10 +754,7 @@ export class WebHostTransport implements YaadeHostTransport {
               }
               const message = tryDecodeRealtimeHostEvent(raw);
               if (!message) {
-                self.dispatch(
-                  "protocol:error",
-                  "Unsupported realtime protocol",
-                );
+                self.dispatch("protocol:error", "Unsupported realtime protocol");
                 return;
               }
               const identity =
@@ -749,7 +772,7 @@ export class WebHostTransport implements YaadeHostTransport {
               }
               self.dispatch(message.channel, ...message.args);
             });
-            socket.addEventListener("close", event => {
+            socket.addEventListener("close", (event) => {
               if (event.code === 4003) {
                 self.accessRevoked = true;
                 const reason = event.reason.trim() || "authentication failed";
@@ -784,11 +807,7 @@ export class WebHostTransport implements YaadeHostTransport {
   private handleProtocolControl(raw: unknown): boolean {
     const replayRequired = tryDecodeTerminalReplayRequired(raw);
     if (replayRequired) {
-      this.dispatch(
-        "terminal:replay-required",
-        replayRequired.terminalId,
-        replayRequired.sequence,
-      );
+      this.dispatch("terminal:replay-required", replayRequired.terminalId, replayRequired.sequence);
       return true;
     }
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return false;
@@ -828,8 +847,12 @@ export class WebHostTransport implements YaadeHostTransport {
     const identity = record.identity;
     const cursor = record.cursor;
     if (
-      identity === null || typeof identity !== "object" || Array.isArray(identity) ||
-      cursor === null || typeof cursor !== "object" || Array.isArray(cursor)
+      identity === null ||
+      typeof identity !== "object" ||
+      Array.isArray(identity) ||
+      cursor === null ||
+      typeof cursor !== "object" ||
+      Array.isArray(cursor)
     ) {
       this.dispatch("protocol:error", "Invalid runtime snapshot");
       return true;
@@ -869,12 +892,65 @@ export class WebHostTransport implements YaadeHostTransport {
       this.dispatch("protocol:error", "Unsupported realtime binary message");
       return;
     }
-    const stream = decoded.streamId === undefined
-      ? null
-      : this.terminalStreams.get(decoded.streamId) ?? null;
+    if (decoded.frameType === "pong") {
+      this.lastPongAt = Date.now();
+      return;
+    }
+    if (
+      decoded.frameType === "hello" ||
+      decoded.frameType === "attach-ack" ||
+      decoded.frameType === "control-ack" ||
+      decoded.frameType === "error"
+    ) {
+      let control: unknown;
+      try {
+        control = JSON.parse(new TextDecoder().decode(decoded.payload));
+      } catch {
+        this.dispatch("protocol:error", "Invalid terminal control payload");
+        return;
+      }
+      if (decoded.frameType === "hello") {
+        this.handleProtocolControl(control);
+        return;
+      }
+      const result = tryDecodeTerminalWsResult(control);
+      if (result) {
+        this.resolveRealtime(result);
+        return;
+      }
+      if (decoded.frameType === "error") {
+        const message =
+          control !== null && typeof control === "object" && "message" in control
+            ? control.message
+            : undefined;
+        this.dispatch(
+          "protocol:error",
+          typeof message === "string" ? message : "terminal operation failed",
+        );
+        return;
+      }
+      this.dispatch("protocol:error", "Invalid terminal control acknowledgement");
+      return;
+    }
+    const stream =
+      decoded.streamId === undefined ? null : (this.terminalStreams.get(decoded.streamId) ?? null);
     const terminalId = decoded.id ?? stream?.id;
     if (!terminalId) {
       this.dispatch("protocol:error", "Terminal data arrived before ATTACH_ACK");
+      return;
+    }
+    if (decoded.frameType === "session-exit") {
+      if (!stream || decoded.streamEpoch !== stream.epoch) {
+        this.dispatch("protocol:error", "Invalid terminal exit epoch");
+        return;
+      }
+      try {
+        const args: unknown = JSON.parse(new TextDecoder().decode(decoded.payload));
+        if (!Array.isArray(args)) throw new Error("invalid exit payload");
+        this.dispatch("terminal:exit", ...args);
+      } catch {
+        this.dispatch("protocol:error", "Invalid terminal exit payload");
+      }
       return;
     }
     if (
@@ -912,11 +988,13 @@ export class WebHostTransport implements YaadeHostTransport {
       if (decoded.payload.byteLength !== 1 || decoded.payload[0]! > 1) {
         clearTimeout(pending.timeout);
         this.pendingHistory.delete(decoded.streamId!);
-        pending.reject(new Error(
-          decoded.payload[0] === 2
-            ? "terminal scrollback queue is full"
-            : "invalid terminal scrollback completion",
-        ));
+        pending.reject(
+          new Error(
+            decoded.payload[0] === 2
+              ? "terminal scrollback queue is full"
+              : "invalid terminal scrollback completion",
+          ),
+        );
         return;
       }
       clearTimeout(pending.timeout);
@@ -940,7 +1018,11 @@ export class WebHostTransport implements YaadeHostTransport {
       return;
     }
     if (decoded.frameType === "snapshot") {
-      if (!stream || decoded.streamEpoch !== stream.epoch || decoded.terminalSequence !== stream.position) {
+      if (
+        !stream ||
+        decoded.streamEpoch !== stream.epoch ||
+        decoded.terminalSequence !== stream.position
+      ) {
         this.dispatch("terminal:replay-required", terminalId, stream?.position ?? 0);
         return;
       }
@@ -953,7 +1035,11 @@ export class WebHostTransport implements YaadeHostTransport {
       return;
     }
     if (decoded.frameType === "ready") {
-      if (!stream || decoded.streamEpoch !== stream.epoch || decoded.terminalSequence !== stream.position) {
+      if (
+        !stream ||
+        decoded.streamEpoch !== stream.epoch ||
+        decoded.terminalSequence !== stream.position
+      ) {
         this.dispatch("terminal:replay-required", terminalId, stream?.position ?? 0);
         return;
       }
@@ -963,26 +1049,33 @@ export class WebHostTransport implements YaadeHostTransport {
     if (stream) {
       const firstByte = decoded.terminalSequence - decoded.payload.byteLength + 1;
       if (decoded.streamEpoch !== stream.epoch || firstByte !== stream.position + 1) {
+        const socket = this.socket;
+        if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(
+            encodeTerminalResyncRequest(decoded.streamId!, stream.epoch, stream.position),
+          );
+        }
         this.dispatch("terminal:replay-required", terminalId, stream.position);
         return;
       }
       stream.position = decoded.terminalSequence;
     }
-    const message: HostEvent = this.serverId && this.serverEpoch
-      ? {
-          protocolVersion: 2,
-          serverId: this.serverId,
-          serverEpoch: this.serverEpoch,
-          sequence: decoded.eventSequence,
-          channel: "terminal:data",
-          args: [terminalId, decoded.payload, decoded.terminalSequence],
-        }
-      : {
-          protocolVersion: 1,
-          sequence: decoded.eventSequence,
-          channel: "terminal:data",
-          args: [terminalId, decoded.payload, decoded.terminalSequence],
-        };
+    const message: HostEvent =
+      this.serverId && this.serverEpoch
+        ? {
+            protocolVersion: 2,
+            serverId: this.serverId,
+            serverEpoch: this.serverEpoch,
+            sequence: decoded.eventSequence,
+            channel: "terminal:data",
+            args: [terminalId, decoded.payload, decoded.terminalSequence],
+          }
+        : {
+            protocolVersion: 1,
+            sequence: decoded.eventSequence,
+            channel: "terminal:data",
+            args: [terminalId, decoded.payload, decoded.terminalSequence],
+          };
     const identity =
       this.serverId && this.serverEpoch
         ? { serverId: this.serverId, serverEpoch: this.serverEpoch }
@@ -996,15 +1089,17 @@ export class WebHostTransport implements YaadeHostTransport {
     const acknowledge = () => {
       if (acknowledged) return;
       acknowledged = true;
-      if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(encodeTerminalWsAck(terminalId, decoded.terminalSequence));
+      if (
+        socket?.readyState === WebSocket.OPEN &&
+        decoded.streamId !== undefined &&
+        decoded.streamEpoch !== undefined
+      ) {
+        socket.send(
+          encodeTerminalAckFrame(decoded.streamId, decoded.streamEpoch, decoded.terminalSequence),
+        );
       }
     };
-    const delivered = this.dispatch(
-      message.channel,
-      ...message.args,
-      acknowledge,
-    );
+    const delivered = this.dispatch(message.channel, ...message.args, acknowledge);
     // A transport without an API projection still must not strand server-side
     // flow credit forever.
     if (delivered === 0) acknowledge();
@@ -1035,16 +1130,23 @@ export class WebHostTransport implements YaadeHostTransport {
     if (result.ok) {
       try {
         const decoded = decodeHostRouteResult(pending.channel, result.value);
-        if (pending.channel === "terminal:attach" && decoded !== null && typeof decoded === "object") {
+        if (
+          pending.channel === "terminal:attach" &&
+          decoded !== null &&
+          typeof decoded === "object"
+        ) {
           const streamId = "streamId" in decoded ? decoded.streamId : undefined;
           const streamEpoch = "streamEpoch" in decoded ? decoded.streamEpoch : undefined;
           const terminalId = "id" in decoded ? decoded.id : undefined;
           const position = "lastSequence" in decoded ? decoded.lastSequence : undefined;
           if (
-            typeof streamId === "number" && Number.isSafeInteger(streamId) &&
-            typeof streamEpoch === "number" && Number.isSafeInteger(streamEpoch) &&
+            typeof streamId === "number" &&
+            Number.isSafeInteger(streamId) &&
+            typeof streamEpoch === "number" &&
+            Number.isSafeInteger(streamEpoch) &&
             typeof terminalId === "string" &&
-            typeof position === "number" && Number.isSafeInteger(position)
+            typeof position === "number" &&
+            Number.isSafeInteger(position)
           ) {
             this.terminalStreams.set(streamId, {
               id: terminalId,
@@ -1062,9 +1164,7 @@ export class WebHostTransport implements YaadeHostTransport {
       }
       return;
     }
-    pending.reject(
-      new Error(result.error?.message ?? "terminal command failed"),
-    );
+    pending.reject(new Error(result.error?.message ?? "terminal command failed"));
   }
 
   private rejectHistory(error: Error): void {
@@ -1101,11 +1201,8 @@ export class WebHostTransport implements YaadeHostTransport {
         listener(...args);
       } catch (error) {
         if (channel === "protocol:error") continue;
-        const message =
-          error instanceof Error ? error.message : String(error);
-        for (const onProtocolError of [
-          ...(this.listeners.get("protocol:error") ?? []),
-        ]) {
+        const message = error instanceof Error ? error.message : String(error);
+        for (const onProtocolError of [...(this.listeners.get("protocol:error") ?? [])]) {
           try {
             onProtocolError(`Realtime listener failed: ${message}`);
           } catch {
@@ -1123,9 +1220,7 @@ function requestAbortError(signal: AbortSignal): Error {
     return signal.reason;
   }
   const error = new Error(
-    signal.reason instanceof Error
-      ? signal.reason.message
-      : "host invoke aborted",
+    signal.reason instanceof Error ? signal.reason.message : "host invoke aborted",
   );
   error.name = "AbortError";
   return error;

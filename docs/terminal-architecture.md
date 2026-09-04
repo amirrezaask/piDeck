@@ -165,10 +165,13 @@ SNAPSHOT           READY              PTY_DATA
 INPUT              RESIZE             SCROLLBACK_BEGIN
 SCROLLBACK_CHUNK   SCROLLBACK_END     RESYNC_REQUEST
 RESYNC_BEGIN       SESSION_EXIT       ERROR
-PING               PONG
+PING               PONG               DETACH
+CONTROL_ACK
 ```
 
-Control messages may use compact structured payloads inside binary frames. `PTY_DATA`, `INPUT`, snapshot bytes, and scrollback bytes remain opaque binary payloads. JSON and base64 are forbidden in this protocol.
+Control messages use compact structured payloads inside binary frames. `ATTACH` and its acknowledgements carry bounded JSON metadata inside the binary envelope; snapshot bytes travel in the following `SNAPSHOT` frame. `PTY_DATA`, `INPUT`, snapshot bytes, and scrollback bytes remain opaque binary payloads. JSON text frames and base64 are forbidden on the capable-client terminal path.
+
+`ATTACH`, `READY`, and `DETACH` control payloads carry a request ID. The server answers a successful attach with `ATTACH_ACK`; it answers other successful control requests with `CONTROL_ACK`. `ERROR` carries the same request ID when a request fails. A stream-scoped `PONG @ N` acknowledges delivery through PTY byte offset `N`; a stream-zero `PING`/`PONG` pair handles connection liveness.
 
 ## Atomic attach and resync
 
@@ -264,21 +267,21 @@ Benchmarks record RSS, heap, allocations, syscalls, context switches, CPU, throu
 
 ## Current-to-target migration map
 
-| Implemented module | Target property | Status |
-| --- | --- | --- |
-| fixed `TerminalReactor` shards | bounded owner/readiness threads | Ghostty, PTYs, process state, sequencing, input, attachment and thermal work are shard-confined; Unix uses level-triggered epoll/kqueue with generation-safe keys. |
-| inclusive byte offsets and deterministic epoch IDs | exact `StreamPosition` | Protocol-v4 snapshot, ready, data, input, resize, scrollback and resync preserve the invariant. |
-| native/WASM Ghostty snapshot | exact fresh-replica continuation | Checkpoint v2 carries bounded opaque Ghostty bytes with revision, format, length and SHA-256 validation; continuation tests cover split parser state. |
-| `ConnectionOutbound` plus `OutboundMailbox` | bounded independent lanes | Reliable/control, live raw data and low-priority binary history have separate bounds; stale terminal deltas can be discarded without affecting other streams. |
-| owner attach transaction plus connection attach fence | `SNAPSHOT @ N`, `READY @ N`, then `N+1` | Implemented; interaction is rejected until READY and overflow enters explicit resynchronization. |
-| binary `SCROLLBACK_*` WebSocket path | asynchronous history | Capable web clients use raw binary chunks on a 2 MiB low-priority lane; the JSON/base64 route remains only as compatibility fallback. |
-| JSON attach/result and ready control envelope | binary `ATTACH`, `ATTACH_ACK`, `ERROR`, `PING`, `PONG` | Snapshot and output payloads no longer enter JSON/base64, but the small structured control envelope still requires binary cutover before full protocol conformance can be claimed. |
-| asynchronous binary history owner | nonblocking archive | PTY fanout precedes nonblocking ingest; checksummed active segments, atomic block/manifest replacement, recovery and bounded degradation are tested. |
-| hot/warm/parked authority states | thermal compaction | Owner-scheduled incremental/full Ghostty compression, replay trimming, descriptor parking and wake promotion are implemented and measured. |
-| client application tier | client-owned layout and viewport | Pane geometry, tabs, selection, search and viewport remain outside terminal runtime state. |
-| terminal diagnostics | content-free observability | Sessions, parking, owners, PTY bytes, snapshot/compression/wake timings, client queue bytes, desyncs and resyncs are exposed under diagnostics. |
-| protocol-1 and semantic-v3 adapters | compatibility only | Neither is connected to the capable-client authority/replica path. |
-| scale probe | measured session budget | The release probe is checked in. This machine admitted 507 PTYs, its kernel limit, so 1,000 physical PTYs require a host whose PTY limit permits it; see `architecture/terminal-benchmarks.md`. |
+| Implemented module                                    | Target property                                                                                   | Status                                                                                                                                                                                          |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| fixed `TerminalReactor` shards                        | bounded owner/readiness threads                                                                   | Ghostty, PTYs, process state, sequencing, input, attachment and thermal work are shard-confined; Unix uses level-triggered epoll/kqueue with generation-safe keys.                              |
+| inclusive byte offsets and deterministic epoch IDs    | exact `StreamPosition`                                                                            | Protocol-v4 snapshot, ready, data, input, resize, scrollback and resync preserve the invariant.                                                                                                 |
+| native/WASM Ghostty snapshot                          | exact fresh-replica continuation                                                                  | Checkpoint v2 carries bounded opaque Ghostty bytes with revision, format, length and SHA-256 validation; continuation tests cover split parser state.                                           |
+| `ConnectionOutbound` plus `OutboundMailbox`           | bounded independent lanes                                                                         | Reliable/control, live raw data and low-priority binary history have separate bounds; stale terminal deltas can be discarded without affecting other streams.                                   |
+| owner attach transaction plus connection attach fence | `SNAPSHOT @ N`, `READY @ N`, then `N+1`                                                           | Implemented; interaction is rejected until READY and overflow enters explicit resynchronization.                                                                                                |
+| binary `SCROLLBACK_*` WebSocket path                  | asynchronous history                                                                              | Capable web clients use raw binary chunks on a 2 MiB low-priority lane; the JSON/base64 route remains only as compatibility fallback.                                                           |
+| protocol-v4 terminal control envelope                 | binary `HELLO`, `ATTACH`, `ATTACH_ACK`, `READY`, `DETACH`, `CONTROL_ACK`, `ERROR`, `PING`, `PONG` | Capable clients use binary framing for all terminal control. Bounded JSON appears only inside structured control payloads; PTY, snapshot, input, and history bytes never enter it.              |
+| asynchronous binary history owner                     | nonblocking archive                                                                               | PTY fanout precedes nonblocking ingest; checksummed active segments, atomic block/manifest replacement, recovery and bounded degradation are tested.                                            |
+| hot/warm/parked authority states                      | thermal compaction                                                                                | Owner-scheduled incremental/full Ghostty compression, replay trimming, descriptor parking and wake promotion are implemented and measured.                                                      |
+| client application tier                               | client-owned layout and viewport                                                                  | Pane geometry, tabs, selection, search and viewport remain outside terminal runtime state.                                                                                                      |
+| terminal diagnostics                                  | content-free observability                                                                        | Sessions, parking, owners, PTY bytes, snapshot/compression/wake timings, client queue bytes, desyncs and resyncs are exposed under diagnostics.                                                 |
+| protocol-1 and semantic-v3 adapters                   | compatibility only                                                                                | Neither is connected to the capable-client authority/replica path.                                                                                                                              |
+| scale probe                                           | measured session budget                                                                           | The release probe is checked in. This machine admitted 507 PTYs, its kernel limit, so 1,000 physical PTYs require a host whose PTY limit permits it; see `architecture/terminal-benchmarks.md`. |
 
 ## Cutover rules
 

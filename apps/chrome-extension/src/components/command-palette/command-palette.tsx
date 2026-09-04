@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AnimatePresence, MotionConfig, motion, useReducedMotion } from 'motion/react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { LoaderCircleIcon, XIcon } from 'lucide-react';
 
 import type { PaletteClient } from '/src/app/palette-client';
@@ -38,14 +37,18 @@ export function CommandPalette({
   client,
   onClose,
 }: CommandPaletteProps) {
-  const reduceMotion = useReducedMotion();
   const inputRef = useRef<HTMLInputElement>(null);
+  const hasLoadedRef = useRef(false);
   const [query, setQuery] = useState('');
   const [items, setItems] = useState<readonly SwitcherItem[]>([]);
   const [snapshot, setSnapshot] = useState<BootstrapSnapshot | undefined>();
   const [selectedId, setSelectedId] = useState('');
   const [error, setError] = useState<string | undefined>();
   const [loading, setLoading] = useState(true);
+
+  const focusInput = useCallback(() => {
+    inputRef.current?.focus({ preventScroll: true });
+  }, []);
 
   const ranked = useMemo(() => rankItems(items, query), [items, query]);
   const visibleItems = useMemo(() => ranked.map(({ item }) => item), [ranked]);
@@ -64,10 +67,11 @@ export function CommandPalette({
   );
 
   const bootstrap = useCallback(async () => {
-    setLoading(true);
+    setLoading(!hasLoadedRef.current);
     setError(undefined);
     try {
       await applySnapshot(await client.bootstrap());
+      hasLoadedRef.current = true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Switcher could not load browser tabs.');
     } finally {
@@ -84,12 +88,37 @@ export function CommandPalette({
   }, [applySnapshot, client]);
 
   useEffect(() => {
-    if (!open) return;
-    setQuery('');
+    if (!open) {
+      setQuery('');
+      return;
+    }
     void bootstrap();
-    const frame = requestAnimationFrame(() => inputRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
   }, [bootstrap, open]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    if (standalone) window.focus();
+    focusInput();
+    const frame = requestAnimationFrame(focusInput);
+    const handleWindowFocus = () => focusInput();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') focusInput();
+    };
+    window.addEventListener('focus', handleWindowFocus);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('focus', handleWindowFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [focusInput, open, standalone]);
+
+  useLayoutEffect(() => {
+    if (!open || loading) return;
+    focusInput();
+    const frame = requestAnimationFrame(focusInput);
+    return () => cancelAnimationFrame(frame);
+  }, [focusInput, loading, open]);
 
   useEffect(() => {
     if (visibleItems.length === 0) setSelectedId('');
@@ -261,9 +290,6 @@ export function CommandPalette({
     theme === 'dark' ||
     (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
   const hasQuery = query.trim().length > 0;
-  const showContent = hasQuery || snapshot?.fallback === true || error !== undefined;
-  const duration = reduceMotion ? 0 : 0.15;
-  const ready = standalone || snapshot !== undefined || error !== undefined;
   const pageZoom = standalone ? 1 : (snapshot?.pageZoom ?? 1);
   const compensatedWidth = window.innerWidth * pageZoom;
   const compensatedHeight = window.innerHeight * pageZoom;
@@ -281,144 +307,124 @@ export function CommandPalette({
         transformOrigin: 'top left',
       };
 
+  if (!open) return null;
+
   return (
-    <AnimatePresence>
-      {open && ready ? (
-        <MotionConfig transition={{ duration, ease: [0.16, 1, 0.3, 1] }} reducedMotion="user">
-          <motion.div
-            className={`switcher-root ${resolvedDark ? 'dark' : 'light'}`}
-            dir="ltr"
-            data-theme={theme}
-            data-host={standalone ? 'fallback' : 'overlay'}
-            data-layout={compact ? 'compact' : 'default'}
-            data-testid="switcher-overlay"
-            style={rootStyle}
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onKeyDownCapture={handleKeyDown}
-          >
-            <motion.button
-              type="button"
-              className="switcher-backdrop"
-              aria-label="Dismiss Switcher"
-              onClick={onClose}
-            />
-            <motion.dialog
-              open
-              aria-modal="true"
-              aria-label="Switcher"
-              className="switcher-panel"
-              initial={{ opacity: 0, y: reduceMotion ? 0 : -8, scale: reduceMotion ? 1 : 0.99 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: reduceMotion ? 0 : -4, scale: reduceMotion ? 1 : 0.995 }}
+    <div
+      className={`switcher-root ${resolvedDark ? 'dark' : 'light'}`}
+      dir="ltr"
+      data-theme={theme}
+      data-host={standalone ? 'fallback' : 'overlay'}
+      data-layout={compact ? 'compact' : 'default'}
+      data-testid="switcher-overlay"
+      style={rootStyle}
+      onKeyDownCapture={handleKeyDown}
+    >
+      <button
+        type="button"
+        className="switcher-backdrop"
+        aria-label="Dismiss Switcher"
+        onClick={onClose}
+      />
+      <dialog open aria-modal="true" aria-label="Switcher" className="switcher-panel">
+        <PaletteErrorBoundary>
+          <TooltipProvider>
+            <Command
+              shouldFilter={false}
+              value={selected?.id ?? ''}
+              onValueChange={setSelectedId}
+              loop
+              label="Search tabs"
             >
-              <PaletteErrorBoundary>
-                <TooltipProvider>
-                  <Command
-                    shouldFilter={false}
-                    value={selected?.id ?? ''}
-                    onValueChange={setSelectedId}
-                    loop
-                    label="Search tabs"
-                  >
-                    <div className="relative flex items-center">
-                      <CommandInput
-                        ref={inputRef}
-                        value={query}
-                        onValueChange={setQuery}
-                        aria-label="Search tabs"
-                        placeholder="Search tabs…"
-                        className="pr-8 text-sm"
+              <div className="relative flex items-center">
+                <CommandInput
+                  ref={inputRef}
+                  value={query}
+                  onValueChange={setQuery}
+                  aria-label="Search tabs"
+                  placeholder="Search tabs…"
+                  className="pr-8 text-sm"
+                />
+                <span className="absolute right-3 flex items-center gap-1.5">
+                  {query.length > 0 ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Clear search"
+                      onClick={() => {
+                        setQuery('');
+                        inputRef.current?.focus();
+                      }}
+                    >
+                      <XIcon />
+                    </Button>
+                  ) : null}
+                </span>
+              </div>
+              <Separator />
+              {snapshot?.fallback ? (
+                <output className="mx-3 mt-2 rounded-xl bg-muted/55 px-4 py-2.5 text-sm text-muted-foreground">
+                  Switcher opened in a separate window to stay centered.
+                </output>
+              ) : null}
+              {error !== undefined ? (
+                <div
+                  role="alert"
+                  className="mx-3 mt-2 rounded-xl bg-destructive/10 px-4 py-2.5 text-sm text-destructive"
+                >
+                  {error}
+                </div>
+              ) : null}
+              <CommandList className="scroll-py-1">
+                {loading ? (
+                  <div className="flex min-h-28 items-center justify-center gap-2 text-sm text-muted-foreground">
+                    <LoaderCircleIcon className="animate-spin" /> Loading tabs…
+                  </div>
+                ) : null}
+                {!loading && visibleItems.length === 0 ? (
+                  <CommandEmpty>{hasQuery ? 'No matching tabs.' : 'No open tabs.'}</CommandEmpty>
+                ) : null}
+                {!loading && visibleItems.length > 0 ? (
+                  <CommandGroup>
+                    {visibleItems.map((item) => (
+                      <TabResult
+                        key={item.id}
+                        item={item}
+                        selected={selected?.id === item.id}
+                        portalContainer={portalContainer}
+                        onActivate={() => {
+                          void activate(item);
+                        }}
+                        onClose={() => {
+                          void closeTab(item);
+                        }}
+                        onPin={() => {
+                          void updateTab(item, 'pinned');
+                        }}
+                        onMute={() => {
+                          void updateTab(item, 'muted');
+                        }}
                       />
-                      <span className="absolute right-3 flex items-center gap-1.5">
-                        {query.length > 0 ? (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-xs"
-                            aria-label="Clear search"
-                            onClick={() => {
-                              setQuery('');
-                              inputRef.current?.focus();
-                            }}
-                          >
-                            <XIcon />
-                          </Button>
-                        ) : null}
-                      </span>
-                    </div>
-                    {showContent ? <Separator /> : null}
-                    {snapshot?.fallback ? (
-                      <output className="mx-3 mt-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
-                        This page does not allow extension overlays. Opened Switcher in a separate
-                        window.
-                      </output>
-                    ) : null}
-                    {error !== undefined ? (
-                      <div
-                        role="alert"
-                        className="mx-3 mt-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive"
-                      >
-                        {error}
-                      </div>
-                    ) : null}
-                    {hasQuery ? (
-                      <>
-                        <CommandList className="scroll-py-1">
-                          {loading ? (
-                            <div className="flex min-h-28 items-center justify-center gap-2 text-sm text-muted-foreground">
-                              <LoaderCircleIcon className="animate-spin" /> Searching tabs…
-                            </div>
-                          ) : null}
-                          {!loading && visibleItems.length === 0 ? (
-                            <CommandEmpty>No matching tabs.</CommandEmpty>
-                          ) : null}
-                          {!loading && visibleItems.length > 0 ? (
-                            <CommandGroup>
-                              {visibleItems.map((item) => (
-                                <TabResult
-                                  key={item.id}
-                                  item={item}
-                                  selected={selected?.id === item.id}
-                                  portalContainer={portalContainer}
-                                  onActivate={() => {
-                                    void activate(item);
-                                  }}
-                                  onClose={() => {
-                                    void closeTab(item);
-                                  }}
-                                  onPin={() => {
-                                    void updateTab(item, 'pinned');
-                                  }}
-                                  onMute={() => {
-                                    void updateTab(item, 'muted');
-                                  }}
-                                />
-                              ))}
-                            </CommandGroup>
-                          ) : null}
-                        </CommandList>
-                        <Separator />
-                        <CommandFooter
-                          shortcut={snapshot?.shortcut}
-                          theme={theme}
-                          onConfigureShortcut={() => {
-                            void configureShortcut();
-                          }}
-                          onTheme={(next) => {
-                            void setTheme(next);
-                          }}
-                        />
-                      </>
-                    ) : null}
-                  </Command>
-                </TooltipProvider>
-              </PaletteErrorBoundary>
-            </motion.dialog>
-          </motion.div>
-        </MotionConfig>
-      ) : null}
-    </AnimatePresence>
+                    ))}
+                  </CommandGroup>
+                ) : null}
+              </CommandList>
+              <Separator />
+              <CommandFooter
+                shortcut={snapshot?.shortcut}
+                theme={theme}
+                onConfigureShortcut={() => {
+                  void configureShortcut();
+                }}
+                onTheme={(next) => {
+                  void setTheme(next);
+                }}
+              />
+            </Command>
+          </TooltipProvider>
+        </PaletteErrorBoundary>
+      </dialog>
+    </div>
   );
 }

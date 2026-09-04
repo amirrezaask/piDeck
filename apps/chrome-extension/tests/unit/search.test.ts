@@ -95,10 +95,13 @@ describe('fuzzy scoring and ranking', () => {
     const plain = tab(6, 'Same', 'https://b.example.com', { lastAccessed: now - 10_000 });
     expect(rankItems([plain, pinned], 'same', now)[0]?.item.id).toBe(pinned.id);
   });
-  it('returns nothing for an empty query and keeps result ordering stable and bounded', () => {
+  it('shows useful tabs for an empty query and keeps result ordering stable and bounded', () => {
     const recent = tab(2, 'Zulu', 'https://z.example.com', { lastAccessed: now });
     const stale = tab(1, 'Alpha', 'https://a.example.com', { lastAccessed: now - 300 * 3_600_000 });
-    expect(rankItems([stale, recent], '', now)).toEqual([]);
+    expect(rankItems([stale, recent], '', now).map(({ item }) => item.id)).toEqual([
+      recent.id,
+      stale.id,
+    ]);
     expect(
       rankItems(
         [tab(2, 'Same', 'https://b.test'), tab(1, 'Same', 'https://a.test')],

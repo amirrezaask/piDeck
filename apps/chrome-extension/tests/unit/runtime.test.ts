@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { decodeRequest, decodeResponse } from '/src/protocol/decode';
 import { isInjectableUrl } from '/src/runtime/restricted-url';
 import { ChromeApiError, TabNotFoundError, errorMessage } from '/src/services/errors';
+import { centeredFallbackBounds, isTabInSplitView } from '/src/services/live-layer';
 
 describe('restricted URL detection', () => {
   it.each([
@@ -15,6 +16,32 @@ describe('restricted URL detection', () => {
     ['https://chromewebstore.google.com/detail/test', false],
     [undefined, false],
   ])('classifies %s', (url, expected) => expect(isInjectableUrl(url)).toBe(expected));
+});
+
+describe('split view fallback', () => {
+  it('detects Chrome split view tabs while remaining compatible with older Chrome versions', () => {
+    expect(isTabInSplitView({ splitViewId: 4 })).toBe(true);
+    expect(isTabInSplitView({ splitViewId: -1 })).toBe(false);
+    expect(isTabInSplitView({})).toBe(false);
+  });
+
+  it('centers the fallback over the invoking browser window', () => {
+    expect(centeredFallbackBounds({ left: 100, top: 40, width: 1400, height: 900 })).toEqual({
+      left: 340,
+      top: 150,
+      width: 920,
+      height: 680,
+    });
+  });
+
+  it('fits the fallback inside a smaller invoking window', () => {
+    expect(centeredFallbackBounds({ left: 20, top: 30, width: 600, height: 500 })).toEqual({
+      left: 20,
+      top: 30,
+      width: 600,
+      height: 500,
+    });
+  });
 });
 
 describe('runtime schemas and error mapping', () => {

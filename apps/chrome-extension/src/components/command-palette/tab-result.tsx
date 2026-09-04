@@ -65,7 +65,7 @@ export function TabResult({
       onSelect={onActivate}
       aria-label={`${item.title}, ${item.hostname}${item.currentWindow ? '' : ', another window'}`}
       aria-selected={selected}
-      className="group/result min-h-12 gap-3 rounded-lg px-3 py-2 text-sm"
+      className="group/result gap-3.5 rounded-xl px-4 py-2.5 text-base"
     >
       <Favicon src={item.favIconUrl} label={item.hostname || item.title} />
       <span className="flex min-w-0 flex-1 flex-col">
@@ -80,9 +80,9 @@ export function TabResult({
             <Volume2Icon className="size-3 text-muted-foreground" aria-label="Playing audio" />
           ) : null}
         </span>
-        <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+        <span className="flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground">
           {!item.currentWindow ? (
-            <span className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/80">
+            <span className="shrink-0 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/80">
               Other window
             </span>
           ) : null}

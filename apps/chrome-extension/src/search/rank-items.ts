@@ -45,7 +45,11 @@ export const rankItems = (
   limit = 50,
 ): readonly RankedItem[] => {
   const normalizedQuery = normalizeSearchText(rawQuery);
-  if (normalizedQuery.length === 0) return [];
+  if (normalizedQuery.length === 0)
+    return items
+      .map((item) => ({ item, score: tabUtilityScore(item, now) }))
+      .toSorted(deterministicCompare)
+      .slice(0, Math.max(0, limit));
 
   const tokens = normalizedQuery.split(' ');
   const ranked: RankedItem[] = [];

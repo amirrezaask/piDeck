@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "vite-plus/test";
 import {
   decodeTerminalDataFrame,
+  encodeTerminalAckFrame,
+  encodeTerminalAttachFrame,
   encodeTerminalDataFrame,
+  encodeTerminalDetachFrame,
   encodeTerminalInputFrame,
+  encodeTerminalPingFrame,
+  encodeTerminalReadyFrame,
   encodeTerminalResizeFrame,
   encodeTerminalScrollbackRequest,
   encodeTerminalWsCommand,
@@ -24,15 +29,9 @@ test("round-trips binary terminal:data frames", () => {
 });
 
 test("rejects truncated or wrong-type binary frames", () => {
-  assert.equal(
-    decodeTerminalDataFrame(new Uint8Array([0x02, 0, 0, 0, 1])),
-    null,
-  );
+  assert.equal(decodeTerminalDataFrame(new Uint8Array([0x02, 0, 0, 0, 1])), null);
   assert.equal(decodeTerminalDataFrame(new Uint8Array([0x01, 0, 0])), null);
-  assert.equal(
-    decodeTerminalDataFrame(new Uint8Array([0x03, 0, 0, 0, 1, 0, 0, 0, 1])),
-    null,
-  );
+  assert.equal(decodeTerminalDataFrame(new Uint8Array([0x03, 0, 0, 0, 1, 0, 0, 0, 1])), null);
 });
 
 test("round-trips v2 frames with sequences above 2^32", () => {
@@ -51,6 +50,27 @@ test("round-trips v2 frames with sequences above 2^32", () => {
     id: "term-u64",
     payload: new Uint8Array([1, 2, 3]),
   });
+});
+
+test("encodes protocol-v4 attach, readiness, detach, ack, and heartbeat controls", () => {
+  const attach = encodeTerminalAttachFrame(7, "request-7", "term-1", 42, "raw");
+  const attachView = new DataView(attach.buffer);
+  assert.equal(attach[3], 2);
+  assert.equal(attachView.getBigUint64(8), 0n);
+  assert.equal(attachView.getBigUint64(24), 7n);
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(attach.subarray(36))), {
+    requestId: "request-7",
+    op: "terminal:attach",
+    args: ["term-1", 42, "raw"],
+  });
+  const ready = encodeTerminalReadyFrame(17, 9, 42, "request-ready");
+  const detach = encodeTerminalDetachFrame(17, 9, 42, "request-detach");
+  const ack = encodeTerminalAckFrame(17, 9, 42);
+  const ping = encodeTerminalPingFrame(8);
+  assert.equal(ready[3], 5);
+  assert.equal(detach[3], 18);
+  assert.equal(ack[3], 17);
+  assert.equal(ping[3], 16);
 });
 
 test("encodes binary INPUT with stream epoch and byte position", () => {
@@ -127,9 +147,7 @@ test("decodes protocol-v4 PTY_DATA without copying its opaque payload", () => {
 });
 
 test("encodes and decodes terminal WS control commands", () => {
-  const raw = JSON.parse(
-    encodeTerminalWsCommand("request-1", "terminal:write", ["id", "x"]),
-  );
+  const raw = JSON.parse(encodeTerminalWsCommand("request-1", "terminal:write", ["id", "x"]));
   assert.deepEqual(tryDecodeTerminalWsCommand(raw), {
     requestId: "request-1",
     op: "terminal:write",
@@ -143,10 +161,7 @@ test("encodes and decodes terminal WS control commands", () => {
     }),
     { requestId: "request-2", op: "terminal:ready", args: ["id"] },
   );
-  assert.equal(
-    tryDecodeTerminalWsCommand({ op: "mux:listSessions", args: [] }),
-    null,
-  );
+  assert.equal(tryDecodeTerminalWsCommand({ op: "mux:listSessions", args: [] }), null);
 });
 
 test("decodes observable terminal WS results", () => {

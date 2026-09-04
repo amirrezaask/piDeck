@@ -665,8 +665,12 @@ async fn handle_socket(
     let mut events = runtime.events.subscribe();
     let mut snapshot_sequence = 0;
     if protocol == 2 {
-        if send_json(
+        if send_terminal_frame(
             &mut sender,
+            terminal_protocol::FrameType::Hello,
+            0,
+            0,
+            0,
             &json!({
                 "type": "protocol:hello",
                 "identity": runtime.identity,
@@ -729,9 +733,13 @@ async fn handle_socket(
                 let Some(Ok(message)) = message else { break; };
                 match message {
                     Message::Text(text) if text.as_str() == "ping" => {
-                        if !outbound.enqueue_text("pong") { break; }
+                        if protocol == 1 && !outbound.enqueue_text("pong") { break; }
                     }
                     Message::Text(text) => {
+                        if protocol == 2 {
+                            outbound.close(1002, "capable terminal control must use binary protocol-v4 frames");
+                            break;
+                        }
                         let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { continue; };
                         if let Ok(ack) = serde_json::from_value::<TerminalWsAck>(value.clone())
                             && ack.kind == "terminal:ack"
@@ -872,6 +880,29 @@ async fn handle_socket(
                             outbound.close(1002, "multiple terminal frames in one websocket message");
                             break;
                         }
+                        if frame.kind == terminal_protocol::FrameType::Ping {
+                            if !outbound.enqueue_protocol_frame(
+                                terminal_protocol::FrameType::Pong,
+                                frame.stream_id,
+                                frame.position.epoch,
+                                frame.position.sequence,
+                                bytes::Bytes::new(),
+                            ) { break; }
+                            continue;
+                        }
+                        if frame.kind == terminal_protocol::FrameType::Attach {
+                            if !handle_binary_attach(
+                                &runtime,
+                                &principal,
+                                &outbound,
+                                &terminal_subscriber,
+                                &mut attached,
+                                &mut raw,
+                                &mut terminal_streams,
+                                frame,
+                            ) { break; }
+                            continue;
+                        }
                         let Some((terminal_id, epoch, input_position, control_position)) = terminal_streams.get_mut(&frame.stream_id) else {
                             outbound.close(1002, "unknown terminal stream");
                             break;
@@ -879,6 +910,83 @@ async fn handle_socket(
                         if frame.position.epoch != *epoch {
                             outbound.close(1002, "stale terminal stream epoch");
                             break;
+                        }
+                        if frame.kind == terminal_protocol::FrameType::Pong {
+                            outbound.acknowledge(terminal_id, frame.position.sequence);
+                            continue;
+                        }
+                        if frame.kind == terminal_protocol::FrameType::ResyncRequest {
+                            if !outbound.enqueue_protocol_frame(
+                                terminal_protocol::FrameType::ResyncBegin,
+                                frame.stream_id,
+                                frame.position.epoch,
+                                frame.position.sequence,
+                                bytes::Bytes::new(),
+                            ) { break; }
+                            continue;
+                        }
+                        if matches!(frame.kind, terminal_protocol::FrameType::Ready | terminal_protocol::FrameType::Detach) {
+                            let Ok(command) = serde_json::from_slice::<TerminalWsCommand>(&frame.payload) else {
+                                outbound.close(1002, "invalid terminal control payload");
+                                break;
+                            };
+                            let expected_op = if frame.kind == terminal_protocol::FrameType::Ready {
+                                "terminal:ready"
+                            } else {
+                                "terminal:detach"
+                            };
+                            if command.request_id.is_empty() || command.op != expected_op {
+                                outbound.close(1002, "mismatched terminal control operation");
+                                break;
+                            }
+                            let result = runtime.dispatch(
+                                &principal,
+                                expected_op,
+                                &[json!(terminal_id)],
+                            );
+                            if frame.kind == terminal_protocol::FrameType::Detach {
+                                attached.remove(terminal_id);
+                                raw.remove(terminal_id);
+                                runtime.events.detach_terminal(terminal_id, &principal.connection_id);
+                            }
+                            let response = match result {
+                                Ok(value) => json!({
+                                    "type": "terminal:result",
+                                    "requestId": command.request_id,
+                                    "ok": true,
+                                    "value": value,
+                                }),
+                                Err(error) => json!({
+                                    "type": "terminal:result",
+                                    "requestId": command.request_id,
+                                    "ok": false,
+                                    "error": { "code": error.wire_code(), "message": error.to_string() },
+                                }),
+                            };
+                            let payload = match serde_json::to_vec(&response) {
+                                Ok(payload) => bytes::Bytes::from(payload),
+                                Err(_) => {
+                                    outbound.close(1011, "terminal control response serialization failed");
+                                    break;
+                                }
+                            };
+                            let response_kind = if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                                terminal_protocol::FrameType::ControlAck
+                            } else {
+                                terminal_protocol::FrameType::Error
+                            };
+                            if !outbound.enqueue_protocol_frame(
+                                response_kind,
+                                frame.stream_id,
+                                frame.position.epoch,
+                                frame.position.sequence,
+                                payload,
+                            ) { break; }
+                            if frame.kind == terminal_protocol::FrameType::Detach {
+                                outbound.detach(terminal_id);
+                                terminal_streams.remove(&frame.stream_id);
+                            }
+                            continue;
                         }
                         let result = match frame.kind {
                             terminal_protocol::FrameType::Input => {
@@ -1055,15 +1163,24 @@ async fn handle_socket(
                                 break;
                             }
                         };
-                        if let Err(error) = result
-                            && !outbound.enqueue_reliable(&json!({
+                        if let Err(error) = result {
+                            let payload = serde_json::to_vec(&json!({
                                 "type": "terminal:error",
                                 "terminalId": terminal_id,
                                 "code": error.wire_code(),
                                 "message": error.to_string(),
-                            }))
-                        {
-                            break;
+                            }));
+                            let Ok(payload) = payload else {
+                                outbound.close(1011, "terminal error serialization failed");
+                                break;
+                            };
+                            if !outbound.enqueue_protocol_frame(
+                                terminal_protocol::FrameType::Error,
+                                frame.stream_id,
+                                frame.position.epoch,
+                                frame.position.sequence,
+                                bytes::Bytes::from(payload),
+                            ) { break; }
                         }
                     }
                     Message::Close(_) => break,
@@ -1094,6 +1211,35 @@ async fn handle_socket(
                             continue;
                         }
                         if event.channel.as_ref() == "terminal:semantic" { continue; }
+                        if protocol == 2 && event.channel.as_ref() == "terminal:exit" {
+                            let Some(terminal_id) = event.args.first().and_then(Value::as_str) else {
+                                continue;
+                            };
+                            let Some((stream_id, (_, epoch, _, _))) = terminal_streams
+                                .iter()
+                                .find(|(_, (id, _, _, _))| id == terminal_id)
+                            else {
+                                continue;
+                            };
+                            let sequence = runtime
+                                .terminal
+                                .inspect(terminal_id)
+                                .map_or(0, |terminal| terminal.output_position);
+                            let payload = serde_json::to_vec(event.args.as_ref())
+                                .map(bytes::Bytes::from);
+                            let Ok(payload) = payload else {
+                                outbound.close(1011, "SESSION_EXIT serialization failed");
+                                break;
+                            };
+                            if !outbound.enqueue_protocol_frame(
+                                terminal_protocol::FrameType::SessionExit,
+                                *stream_id,
+                                *epoch,
+                                sequence,
+                                payload,
+                            ) { break; }
+                            continue;
+                        }
                         let outgoing = if protocol == 1 { event.legacy() } else { (**event).clone() };
                         if !outbound.enqueue_reliable(&outgoing) { break; }
                     }
@@ -1107,6 +1253,106 @@ async fn handle_socket(
     runtime
         .terminal
         .release_connection(&principal.connection_id);
+}
+
+fn handle_binary_attach(
+    runtime: &HostRuntime,
+    principal: &Principal,
+    outbound: &ConnectionOutbound,
+    terminal_subscriber: &Arc<dyn TerminalSubscriber>,
+    attached: &mut HashSet<String>,
+    raw: &mut HashSet<String>,
+    terminal_streams: &mut HashMap<u64, (String, u64, u64, u64)>,
+    frame: terminal_protocol::Frame,
+) -> bool {
+    if frame.stream_id != 0 || frame.position.epoch != 0 || frame.position.sequence == 0 {
+        outbound.close(1002, "invalid ATTACH frame header");
+        return false;
+    }
+    let Ok(command) = serde_json::from_slice::<TerminalWsCommand>(&frame.payload) else {
+        outbound.close(1002, "invalid ATTACH payload");
+        return false;
+    };
+    if command.request_id.is_empty() || command.op != "terminal:attach" {
+        outbound.close(1002, "mismatched ATTACH operation");
+        return false;
+    }
+    let Some(id) = command.args.first().and_then(Value::as_str) else {
+        outbound.close(1002, "ATTACH terminal ID is required");
+        return false;
+    };
+    let id = id.to_owned();
+    let acknowledged = command.args.get(1).and_then(Value::as_u64).unwrap_or(0);
+    let mode = command.args.get(2).and_then(Value::as_str).unwrap_or("raw");
+    attached.insert(id.clone());
+    if matches!(mode, "raw" | "both") {
+        raw.insert(id.clone());
+    }
+    outbound.attach(&id, acknowledged);
+    if raw.contains(&id) {
+        runtime
+            .events
+            .attach_terminal(&id, &principal.connection_id, terminal_subscriber);
+    }
+
+    let mut snapshot_payload = None;
+    let result = runtime
+        .attach_terminal_binary(principal, &command.args)
+        .and_then(|mut attach| {
+            snapshot_payload = attach
+                .checkpoint
+                .as_mut()
+                .map(|checkpoint| std::mem::take(&mut checkpoint.snapshot_bytes.0));
+            let mut value = serde_json::to_value(attach)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("ownerId".to_owned(), json!(runtime.identity.server_id));
+                object.insert(
+                    "ownerEpoch".to_owned(),
+                    json!(runtime.identity.server_epoch),
+                );
+            }
+            Ok(value)
+        });
+
+    let mut snapshot_sequence = None;
+    let mut stream = None;
+    let response = match result {
+        Ok(value) => {
+            let sequence = value
+                .get("lastSequence")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            snapshot_sequence = Some(sequence);
+            stream = value
+                .get("streamId")
+                .and_then(Value::as_u64)
+                .zip(value.get("streamEpoch").and_then(Value::as_u64));
+            if let Some((stream_id, epoch)) = stream {
+                terminal_streams.insert(stream_id, (id.clone(), epoch, 0, 0));
+            }
+            json!({
+                "type": "terminal:result",
+                "requestId": command.request_id,
+                "ok": true,
+                "value": value,
+            })
+        }
+        Err(error) => {
+            attached.remove(&id);
+            raw.remove(&id);
+            outbound.detach(&id);
+            runtime
+                .events
+                .detach_terminal(&id, &principal.connection_id);
+            json!({
+                "type": "terminal:result",
+                "requestId": command.request_id,
+                "ok": false,
+                "error": { "code": error.wire_code(), "message": error.to_string() },
+            })
+        }
+    };
+    outbound.enqueue_attach_result(&id, snapshot_sequence, stream, snapshot_payload, &response)
 }
 
 async fn socket_writer(
@@ -1568,6 +1814,28 @@ async fn send_json<T: serde::Serialize>(
 ) -> Result<(), axum::Error> {
     let encoded = serde_json::to_string(value).map_err(axum::Error::new)?;
     sender.send(Message::Text(encoded.into())).await
+}
+
+async fn send_terminal_frame<T: serde::Serialize>(
+    sender: &mut SplitSink<WebSocket, Message>,
+    kind: terminal_protocol::FrameType,
+    stream_id: u64,
+    epoch: u64,
+    sequence: u64,
+    value: &T,
+) -> Result<(), axum::Error> {
+    let payload = serde_json::to_vec(value).map_err(axum::Error::new)?;
+    let frame = terminal_protocol::Frame::new(
+        kind,
+        0,
+        stream_id,
+        terminal_protocol::StreamPosition { epoch, sequence },
+        bytes::Bytes::from(payload),
+    )
+    .and_then(|frame| terminal_protocol::Codec::default().encode(frame))
+    .map(terminal_protocol::EncodedFrame::coalesce)
+    .map_err(axum::Error::new)?;
+    sender.send(Message::Binary(frame)).await
 }
 
 async fn close_socket(

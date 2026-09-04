@@ -55,6 +55,47 @@ const getTab = (tabId: number): Effect.Effect<chrome.tabs.Tab, SwitcherError> =>
     Effect.catchAll(() => Effect.fail(new TabNotFoundError({ tabId }))),
   );
 
+export const isTabInSplitView = (tab: object): boolean => {
+  if (!('splitViewId' in tab)) return false;
+  return typeof tab.splitViewId === 'number' && tab.splitViewId !== -1;
+};
+
+const FALLBACK_WIDTH = 920;
+const FALLBACK_HEIGHT = 680;
+
+interface WindowBounds {
+  readonly left?: number;
+  readonly top?: number;
+  readonly width?: number;
+  readonly height?: number;
+}
+
+export const centeredFallbackBounds = (
+  source: WindowBounds | undefined,
+): {
+  readonly left?: number;
+  readonly top?: number;
+  readonly width: number;
+  readonly height: number;
+} => {
+  const sourceWidth = source?.width;
+  const sourceHeight = source?.height;
+  const width = sourceWidth === undefined ? FALLBACK_WIDTH : Math.min(FALLBACK_WIDTH, sourceWidth);
+  const height =
+    sourceHeight === undefined ? FALLBACK_HEIGHT : Math.min(FALLBACK_HEIGHT, sourceHeight);
+
+  return {
+    ...(source?.left === undefined || sourceWidth === undefined
+      ? {}
+      : { left: source.left + Math.floor((sourceWidth - width) / 2) }),
+    ...(source?.top === undefined || sourceHeight === undefined
+      ? {}
+      : { top: source.top + Math.floor((sourceHeight - height) / 2) }),
+    width,
+    height,
+  };
+};
+
 const makeStorage = () => ({
   getTheme: (): Effect.Effect<ThemePreference, ChromeApiError> =>
     fromPromise('storage.local.get', () => browser.storage.local.get('theme')).pipe(
@@ -132,7 +173,6 @@ const makeTabs = (
       ],
       { concurrency: 'unbounded' },
     ).pipe(
-      Effect.tap(() => commands.updateBadge()),
       Effect.map(([tabs, shortcut, theme, zoom]) => ({
         ok: true as const,
         type: 'snapshot' as const,
@@ -193,15 +233,27 @@ const makeTabs = (
 
 const openFallback = (context: InvocationContext): Effect.Effect<void, ChromeApiError> => {
   const url = browser.runtime.getURL('/switcher.html');
-  return fromPromise('tabs.query.fallback', () => browser.tabs.query({ url })).pipe(
-    Effect.flatMap((tabs) => {
+  const sourceWindowId = context.windowId;
+  const sourceWindow =
+    sourceWindowId === undefined
+      ? Effect.succeed(undefined)
+      : fromPromise('windows.get.invocation', () => browser.windows.get(sourceWindowId), {
+          windowId: sourceWindowId,
+        }).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
+
+  return Effect.all(
+    [fromPromise('tabs.query.fallback', () => browser.tabs.query({ url })), sourceWindow],
+    { concurrency: 'unbounded' },
+  ).pipe(
+    Effect.flatMap(([tabs, source]) => {
       const existing = tabs[0];
+      const bounds = centeredFallbackBounds(source);
       if (existing?.windowId !== undefined)
         return fromPromise('windows.update.fallback', () =>
-          browser.windows.update(existing.windowId, { focused: true }),
+          browser.windows.update(existing.windowId, { focused: true, ...bounds }),
         ).pipe(Effect.asVoid);
       return fromPromise('windows.create.fallback', () =>
-        browser.windows.create({ url, type: 'popup', focused: true, width: 760, height: 620 }),
+        browser.windows.create({ url, type: 'popup', focused: true, ...bounds }),
       ).pipe(Effect.asVoid);
     }),
     Effect.tap(() => makeStorage().setInvocation(context)),
@@ -212,9 +264,10 @@ const openPalette = (
   tabId: number,
   windowId: number,
   url: string | undefined,
+  inSplitView = false,
 ): Effect.Effect<void, SwitcherError> => {
   const context = { tabId, windowId };
-  if (!isInjectableUrl(url)) return openFallback(context);
+  if (inSplitView || !isInjectableUrl(url)) return openFallback(context);
   return fromPromise(
     'tabs.sendMessage.toggle',
     () => browser.tabs.sendMessage(tabId, { type: 'palette/toggle' }),
@@ -246,7 +299,7 @@ const makeInjection = () => ({
         const tab = tabs[0];
         if (tab?.id === undefined || tab.windowId === undefined)
           return Effect.fail(new TabNotFoundError({ tabId: -1 }));
-        return openPalette(tab.id, tab.windowId, tab.url);
+        return openPalette(tab.id, tab.windowId, tab.url, isTabInSplitView(tab));
       }),
     ),
 });

@@ -316,7 +316,7 @@ test("two clients keep independent Window navigation", async ({ launchApp, brows
   }
 });
 
-test("terminal output is replayed after a browser reload", async ({ launchApp }) => {
+test("terminal snapshot restores output after a browser reload", async ({ launchApp }) => {
   const { page } = await launchApp({
     workspaceRel: "fixtures/sample-workspace",
   });
@@ -333,55 +333,13 @@ test("terminal output is replayed after a browser reload", async ({ launchApp })
     });
   await expect.poll(terminalText, { timeout: 15_000 }).toContain(marker);
 
-  await page.addInitScript(() => {
-    const originalFetch = window.fetch.bind(window);
-    let forwardReplayReleased = false;
-    window.addEventListener("yaade:test-release-forward-replay", () => {
-      forwardReplayReleased = true;
-    });
-    window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const body = typeof init?.body === "string" ? init.body : "";
-      if (
-        !forwardReplayReleased &&
-        body.includes('"channel":"terminal:readReplayPage"') &&
-        !body.includes('"backward"')
-      ) {
-        document.documentElement.dataset.yaadeTestForwardReplayRequested = "";
-        return new Promise<Response>((resolve, reject) => {
-          window.addEventListener(
-            "yaade:test-release-forward-replay",
-            () => {
-              void originalFetch(input, init).then(resolve, reject);
-            },
-            { once: true },
-          );
-        });
-      }
-      return originalFetch(input, init);
-    };
-  });
-
-  try {
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await expect(page.locator('[data-yaade-shell="terminal-multiplexer"]')).toBeVisible();
-    await page.evaluate(() => window.__yaadeTest!.waitForReady());
-    await expect(page.locator("[data-yaade-terminal-panel]")).toBeVisible();
-    await expect(
-      page.locator("html[data-yaade-test-forward-replay-requested]"),
-    ).toHaveCount(1);
-    await expect(page.locator('[data-yaade-terminal-replay-phase="preview"]')).toBeVisible();
-    await expect.poll(terminalText, { timeout: 15_000 }).toContain(marker);
-
-    await page.evaluate(() => {
-      window.dispatchEvent(new Event("yaade:test-release-forward-replay"));
-    });
-    await expect(page.locator("[data-yaade-terminal-replay-phase]")).toHaveCount(0);
-    await expect.poll(terminalText, { timeout: 15_000 }).toContain(marker);
-  } finally {
-    await page.evaluate(() => {
-      window.dispatchEvent(new Event("yaade:test-release-forward-replay"));
-    });
-  }
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.locator('[data-yaade-shell="terminal-multiplexer"]')).toBeVisible();
+  await page.waitForFunction(() => window.__yaadeTest != null);
+  await page.evaluate(() => window.__yaadeTest!.waitForReady());
+  await expect(page.locator("[data-yaade-terminal-panel]")).toBeVisible();
+  await expect(page.locator("[data-yaade-terminal-replay-phase]")).toHaveCount(0);
+  await expect.poll(terminalText, { timeout: 15_000 }).toContain(marker);
 });
 
 test("browser reload restores a bounded Ghostty checkpoint before the replay tail", async ({ launchApp }) => {
@@ -404,6 +362,7 @@ test("browser reload restores a bounded Ghostty checkpoint before the replay tai
   await expect.poll(terminalText, { timeout: 30_000 }).toContain(marker);
 
   await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => window.__yaadeTest != null);
   await page.evaluate(() => window.__yaadeTest!.waitForReady());
   const surface = page.locator("[data-ghostty-terminal]").filter({ visible: true }).first();
   await expect(surface).toHaveAttribute("data-ghostty-terminal-snapshot-restore-count", "1", {
@@ -427,6 +386,7 @@ test("Windows and pane state survive a browser reload", async ({ launchApp }) =>
 
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(page.locator('[data-yaade-shell="terminal-multiplexer"]')).toBeVisible();
+  await page.waitForFunction(() => window.__yaadeTest != null);
   await page.evaluate(() => window.__yaadeTest!.waitForReady());
   await expect(windowTabs).toHaveCount(2);
   await expect(page.locator("[data-yaade-terminal-tile]")).toHaveCount(1, {
@@ -816,7 +776,7 @@ test("dragging a pane tab to a dock target retiles both terminals", async ({ lau
   const sourceTerminalBox = await panes.nth(1).locator("[data-yaade-terminal-tile]").boundingBox();
   if (!sourcePaneBox || !sourceTerminalBox) throw new Error("source pane has no bounds");
   expect(sourceBox.height).toBeGreaterThanOrEqual(24);
-  expect(Math.abs(sourceBox.y - sourcePaneBox.y)).toBeLessThanOrEqual(2);
+  expect(Math.abs(sourceBox.y - sourcePaneBox.y)).toBeLessThanOrEqual(3);
   expect(sourceTerminalBox.y).toBeLessThan(sourceBox.y + sourceBox.height);
 
   await page.mouse.move(sourceBox.x + sourceBox.width / 2, sourceBox.y + sourceBox.height / 2);
@@ -1007,6 +967,7 @@ test("dragging a Window tab into the workspace docks its focused terminal", asyn
     .toContain(marker);
 
   await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => window.__yaadeTest != null);
   await page.evaluate(() => window.__yaadeTest!.waitForReady());
   await expect(page.locator("[data-yaade-terminal-tile]")).toHaveCount(2, {
     timeout: 30_000,

@@ -93,7 +93,7 @@ describe('CommandPalette', () => {
     renderPalette(client);
     const input = await screen.findByRole('combobox', { name: 'Search tabs' });
     await waitFor(() => expect(input).toHaveFocus());
-    expect(screen.queryByRole('option')).not.toBeInTheDocument();
+    expect(screen.getAllByRole('option')).toHaveLength(2);
     await userEvent.type(input, 'graf');
     expect(screen.getAllByText('G').length).toBeGreaterThan(0);
     expect(screen.queryByRole('option', { name: /Dispatch/ })).not.toBeInTheDocument();

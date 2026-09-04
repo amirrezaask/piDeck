@@ -29,8 +29,14 @@ test("bench incremental WebGL cursor submission counters", async () => {
       window.__yaadeTest?.getTerminalLifecycle?.()?.rendererSubmission?.cumulative
         .currentUsedSceneBytes ?? 0,
     ), { timeout: 5_000 }).toBeGreaterThan(0)
-    // Start only after a warm cursor/focus-only frame. Initial shell geometry and
-    // row topology are correctness setup, not incremental cursor submission.
+    // Produce a deterministic cursor-only frame. Waiting for a blink makes the
+    // benchmark depend on shell cursor policy and timer throttling.
+    await page.keyboard.type("x")
+    await expect.poll(
+      () => page.evaluate(() => window.__yaadeTest?.getTerminalText?.() ?? ""),
+      { timeout: 5_000 },
+    ).toContain("x")
+    await page.keyboard.press("ArrowLeft")
     await expect.poll(() => page.evaluate(() => {
       const submission = window.__yaadeTest?.getTerminalLifecycle?.()?.rendererSubmission
       return submission?.lastFrame.sceneUploadBytes ?? -1
@@ -40,10 +46,14 @@ test("bench incremental WebGL cursor submission counters", async () => {
     )
     expect(baseline).not.toBeNull()
     if (baseline === null) return
-    await expect.poll(() => page.evaluate(
+    const submittedFrames = () => page.evaluate(
       frames => (window.__yaadeTest?.getTerminalLifecycle?.()?.rendererSubmission?.cumulative.frames ?? 0) - frames,
       baseline.frames,
-    ), { timeout: 5_000 }).toBeGreaterThanOrEqual(2)
+    )
+    await page.keyboard.press("ArrowRight")
+    await expect.poll(submittedFrames, { timeout: 5_000 }).toBeGreaterThanOrEqual(1)
+    await page.keyboard.press("ArrowLeft")
+    await expect.poll(submittedFrames, { timeout: 5_000 }).toBeGreaterThanOrEqual(2)
     const lifecycle = await page.evaluate(() => window.__yaadeTest?.getTerminalLifecycle?.() ?? null)
     const final = lifecycle?.rendererSubmission?.cumulative
     expect(final).toBeDefined()

@@ -1,12 +1,12 @@
 /**
  * Hot-path terminal WebSocket framing.
  *
- * Outbound `terminal:data` uses a compact binary frame so flood paths avoid
- * JSON.stringify of multi-KiB PTY payloads. Client→host control (write/resize/
- * ready) stays JSON — payloads are tiny.
+ * Capable clients use the transport-independent protocol-v4 binary envelope
+ * for terminal control and data. Structured control payloads may contain UTF-8
+ * JSON, but PTY, snapshot, and history payloads always remain opaque bytes.
  */
 
-import { getHostRoute, HOST_ROUTE_CHANNELS, type HostRouteName } from "./routes.js"
+import { getHostRoute, HOST_ROUTE_CHANNELS, type HostRouteName } from "./routes.js";
 
 /** Host → client: binary `terminal:data` frame type bytes. */
 export const TERMINAL_DATA_FRAME_TYPE_V1 = 0x01 as const;
@@ -15,27 +15,37 @@ export const TERMINAL_PROTOCOL_VERSION = 4 as const;
 export const TERMINAL_PROTOCOL_HEADER_BYTES = 36 as const;
 const TERMINAL_PROTOCOL_MAGIC_0 = 0x50;
 const TERMINAL_PROTOCOL_MAGIC_1 = 0x44;
+const TERMINAL_PROTOCOL_HELLO = 1;
+const TERMINAL_PROTOCOL_ATTACH = 2;
+const TERMINAL_PROTOCOL_ATTACH_ACK = 3;
 const TERMINAL_PROTOCOL_SNAPSHOT = 4;
+const TERMINAL_PROTOCOL_READY = 5;
 const TERMINAL_PROTOCOL_PTY_DATA = 6;
 const TERMINAL_PROTOCOL_INPUT = 7;
 const TERMINAL_PROTOCOL_RESIZE = 8;
 const TERMINAL_PROTOCOL_SCROLLBACK_BEGIN = 9;
 const TERMINAL_PROTOCOL_SCROLLBACK_CHUNK = 10;
 const TERMINAL_PROTOCOL_SCROLLBACK_END = 11;
+const TERMINAL_PROTOCOL_RESYNC_REQUEST = 12;
+const TERMINAL_PROTOCOL_RESYNC_BEGIN = 13;
+const TERMINAL_PROTOCOL_SESSION_EXIT = 14;
+const TERMINAL_PROTOCOL_ERROR = 15;
+const TERMINAL_PROTOCOL_PING = 16;
+const TERMINAL_PROTOCOL_PONG = 17;
+const TERMINAL_PROTOCOL_DETACH = 18;
+const TERMINAL_PROTOCOL_CONTROL_ACK = 19;
 
 type Utf8Encoder = { encode(input: string): Uint8Array };
 type Utf8Decoder = { decode(input: Uint8Array): string };
 
 function utf8Encode(text: string): Uint8Array {
-  const Encoder = (globalThis as { TextEncoder?: new () => Utf8Encoder })
-    .TextEncoder;
+  const Encoder = (globalThis as { TextEncoder?: new () => Utf8Encoder }).TextEncoder;
   if (!Encoder) throw new Error("TextEncoder unavailable");
   return new Encoder().encode(text);
 }
 
 function utf8Decode(bytes: Uint8Array): string {
-  const Decoder = (globalThis as { TextDecoder?: new () => Utf8Decoder })
-    .TextDecoder;
+  const Decoder = (globalThis as { TextDecoder?: new () => Utf8Decoder }).TextDecoder;
   if (!Decoder) throw new Error("TextDecoder unavailable");
   return new Decoder().decode(bytes);
 }
@@ -73,8 +83,112 @@ export function encodeTerminalDataFrame(
 }
 
 function toU64(value: number): bigint {
-  if (!Number.isFinite(value) || value <= 0) return 0n;
-  return BigInt(Math.trunc(value));
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error("terminal protocol position must be a non-negative safe integer");
+  }
+  return BigInt(value);
+}
+
+function encodeProtocolFrame(
+  type: number,
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+  payload: Uint8Array<ArrayBufferLike> = new Uint8Array(),
+): Uint8Array<ArrayBuffer> {
+  const output = new Uint8Array(
+    new ArrayBuffer(TERMINAL_PROTOCOL_HEADER_BYTES + payload.byteLength),
+  );
+  const view = new DataView(output.buffer);
+  output.set([
+    TERMINAL_PROTOCOL_MAGIC_0,
+    TERMINAL_PROTOCOL_MAGIC_1,
+    TERMINAL_PROTOCOL_VERSION,
+    type,
+  ]);
+  view.setUint16(6, TERMINAL_PROTOCOL_HEADER_BYTES);
+  view.setBigUint64(8, toU64(streamId));
+  view.setBigUint64(16, toU64(streamEpoch));
+  view.setBigUint64(24, toU64(sequence));
+  view.setUint32(32, payload.byteLength);
+  output.set(payload, TERMINAL_PROTOCOL_HEADER_BYTES);
+  return output;
+}
+
+function encodeStructuredControl(
+  type: number,
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+  value: unknown,
+): Uint8Array<ArrayBuffer> {
+  return encodeProtocolFrame(
+    type,
+    streamId,
+    streamEpoch,
+    sequence,
+    utf8Encode(JSON.stringify(value)),
+  );
+}
+
+export function encodeTerminalAttachFrame(
+  sequence: number,
+  requestId: string,
+  terminalId: string,
+  afterSequence: number,
+  mode: "raw" | "semantic" | "both" = "raw",
+): Uint8Array<ArrayBuffer> {
+  return encodeStructuredControl(TERMINAL_PROTOCOL_ATTACH, 0, 0, sequence, {
+    requestId,
+    op: "terminal:attach",
+    args: [terminalId, afterSequence, mode],
+  });
+}
+
+export function encodeTerminalReadyFrame(
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+  requestId: string,
+): Uint8Array<ArrayBuffer> {
+  return encodeStructuredControl(TERMINAL_PROTOCOL_READY, streamId, streamEpoch, sequence, {
+    requestId,
+    op: "terminal:ready",
+    args: [],
+  });
+}
+
+export function encodeTerminalDetachFrame(
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+  requestId: string,
+): Uint8Array<ArrayBuffer> {
+  return encodeStructuredControl(TERMINAL_PROTOCOL_DETACH, streamId, streamEpoch, sequence, {
+    requestId,
+    op: "terminal:detach",
+    args: [],
+  });
+}
+
+export function encodeTerminalAckFrame(
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+): Uint8Array<ArrayBuffer> {
+  return encodeProtocolFrame(TERMINAL_PROTOCOL_PONG, streamId, streamEpoch, sequence);
+}
+
+export function encodeTerminalPingFrame(sequence: number): Uint8Array<ArrayBuffer> {
+  return encodeProtocolFrame(TERMINAL_PROTOCOL_PING, 0, 0, sequence);
+}
+
+export function encodeTerminalResyncRequest(
+  streamId: number,
+  streamEpoch: number,
+  sequence: number,
+): Uint8Array<ArrayBuffer> {
+  return encodeProtocolFrame(TERMINAL_PROTOCOL_RESYNC_REQUEST, streamId, streamEpoch, sequence);
 }
 
 export function encodeTerminalInputFrame(
@@ -84,7 +198,9 @@ export function encodeTerminalInputFrame(
   payload: Uint8Array,
 ): Uint8Array<ArrayBuffer> {
   if (payload.byteLength === 0) throw new Error("terminal input cannot be empty");
-  const output = new Uint8Array(new ArrayBuffer(TERMINAL_PROTOCOL_HEADER_BYTES + payload.byteLength));
+  const output = new Uint8Array(
+    new ArrayBuffer(TERMINAL_PROTOCOL_HEADER_BYTES + payload.byteLength),
+  );
   const view = new DataView(output.buffer);
   output[0] = TERMINAL_PROTOCOL_MAGIC_0;
   output[1] = TERMINAL_PROTOCOL_MAGIC_1;
@@ -114,7 +230,12 @@ export function encodeTerminalScrollbackRequest(
   }
   const output = new Uint8Array(new ArrayBuffer(TERMINAL_PROTOCOL_HEADER_BYTES + 13));
   const view = new DataView(output.buffer);
-  output.set([TERMINAL_PROTOCOL_MAGIC_0, TERMINAL_PROTOCOL_MAGIC_1, TERMINAL_PROTOCOL_VERSION, TERMINAL_PROTOCOL_SCROLLBACK_BEGIN]);
+  output.set([
+    TERMINAL_PROTOCOL_MAGIC_0,
+    TERMINAL_PROTOCOL_MAGIC_1,
+    TERMINAL_PROTOCOL_VERSION,
+    TERMINAL_PROTOCOL_SCROLLBACK_BEGIN,
+  ]);
   view.setUint16(6, TERMINAL_PROTOCOL_HEADER_BYTES);
   view.setBigUint64(8, toU64(streamId));
   view.setBigUint64(16, toU64(streamEpoch));
@@ -133,12 +254,24 @@ export function encodeTerminalResizeFrame(
   cols: number,
   rows: number,
 ): Uint8Array<ArrayBuffer> {
-  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1 || cols > 0xffff || rows > 0xffff) {
+  if (
+    !Number.isInteger(cols) ||
+    !Number.isInteger(rows) ||
+    cols < 1 ||
+    rows < 1 ||
+    cols > 0xffff ||
+    rows > 0xffff
+  ) {
     throw new Error("invalid terminal resize dimensions");
   }
   const output = new Uint8Array(new ArrayBuffer(TERMINAL_PROTOCOL_HEADER_BYTES + 4));
   const view = new DataView(output.buffer);
-  output.set([TERMINAL_PROTOCOL_MAGIC_0, TERMINAL_PROTOCOL_MAGIC_1, TERMINAL_PROTOCOL_VERSION, TERMINAL_PROTOCOL_RESIZE]);
+  output.set([
+    TERMINAL_PROTOCOL_MAGIC_0,
+    TERMINAL_PROTOCOL_MAGIC_1,
+    TERMINAL_PROTOCOL_VERSION,
+    TERMINAL_PROTOCOL_RESIZE,
+  ]);
   view.setUint16(6, TERMINAL_PROTOCOL_HEADER_BYTES);
   view.setBigUint64(8, toU64(streamId));
   view.setBigUint64(16, toU64(streamEpoch));
@@ -149,8 +282,8 @@ export function encodeTerminalResizeFrame(
   return output;
 }
 
-function fromU64(value: bigint): number {
-  if (value > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
+function fromU64(value: bigint): number | null {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) return null;
   return Number(value);
 }
 
@@ -161,13 +294,19 @@ export type DecodedTerminalDataFrame = {
   streamId?: number;
   streamEpoch?: number;
   frameType?:
+    | "hello"
+    | "attach-ack"
     | "snapshot"
     | "ready"
     | "pty-data"
     | "scrollback-begin"
     | "scrollback-chunk"
     | "scrollback-end"
-    | "resync-begin";
+    | "resync-begin"
+    | "session-exit"
+    | "error"
+    | "pong"
+    | "control-ack";
   payload: Uint8Array;
 };
 
@@ -185,32 +324,48 @@ export function decodeTerminalDataFrame(
     buf[0] === TERMINAL_PROTOCOL_MAGIC_0 &&
     buf[1] === TERMINAL_PROTOCOL_MAGIC_1
   ) {
-    const frameType = buf[3] === TERMINAL_PROTOCOL_SNAPSHOT
-      ? "snapshot" as const
-      : buf[3] === 5
-        ? "ready" as const
-        : buf[3] === TERMINAL_PROTOCOL_PTY_DATA
-          ? "pty-data" as const
-          : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_BEGIN
-            ? "scrollback-begin" as const
-            : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_CHUNK
-              ? "scrollback-chunk" as const
-              : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_END
-                ? "scrollback-end" as const
-                : buf[3] === 13
-                  ? "resync-begin" as const
-                  : null;
+    const frameType =
+      buf[3] === TERMINAL_PROTOCOL_HELLO
+        ? ("hello" as const)
+        : buf[3] === TERMINAL_PROTOCOL_ATTACH_ACK
+          ? ("attach-ack" as const)
+          : buf[3] === TERMINAL_PROTOCOL_SNAPSHOT
+            ? ("snapshot" as const)
+            : buf[3] === TERMINAL_PROTOCOL_READY
+              ? ("ready" as const)
+              : buf[3] === TERMINAL_PROTOCOL_PTY_DATA
+                ? ("pty-data" as const)
+                : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_BEGIN
+                  ? ("scrollback-begin" as const)
+                  : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_CHUNK
+                    ? ("scrollback-chunk" as const)
+                    : buf[3] === TERMINAL_PROTOCOL_SCROLLBACK_END
+                      ? ("scrollback-end" as const)
+                      : buf[3] === TERMINAL_PROTOCOL_RESYNC_BEGIN
+                        ? ("resync-begin" as const)
+                        : buf[3] === TERMINAL_PROTOCOL_SESSION_EXIT
+                          ? ("session-exit" as const)
+                          : buf[3] === TERMINAL_PROTOCOL_ERROR
+                            ? ("error" as const)
+                            : buf[3] === TERMINAL_PROTOCOL_PONG
+                              ? ("pong" as const)
+                              : buf[3] === TERMINAL_PROTOCOL_CONTROL_ACK
+                                ? ("control-ack" as const)
+                                : null;
     if (buf[2] !== TERMINAL_PROTOCOL_VERSION || frameType === null) return null;
-    if (view.getUint16(4) !== 0 || view.getUint16(6) !== TERMINAL_PROTOCOL_HEADER_BYTES) return null;
+    if (view.getUint16(4) !== 0 || view.getUint16(6) !== TERMINAL_PROTOCOL_HEADER_BYTES)
+      return null;
     const payloadLength = view.getUint32(32);
     if (
       (frameType === "snapshot" || frameType === "pty-data" || frameType === "scrollback-chunk") &&
       payloadLength === 0
-    ) return null;
+    )
+      return null;
     if (buf.length !== TERMINAL_PROTOCOL_HEADER_BYTES + payloadLength) return null;
     const streamId = fromU64(view.getBigUint64(8));
     const streamEpoch = fromU64(view.getBigUint64(16));
     const terminalSequence = fromU64(view.getBigUint64(24));
+    if (streamId === null || streamEpoch === null || terminalSequence === null) return null;
     if (frameType === "pty-data" && terminalSequence < payloadLength) return null;
     return {
       eventSequence: 0,
@@ -225,6 +380,7 @@ export function decodeTerminalDataFrame(
     if (buf.length < 19) return null;
     const eventSequence = fromU64(view.getBigUint64(1));
     const terminalSequence = fromU64(view.getBigUint64(9));
+    if (eventSequence === null || terminalSequence === null) return null;
     const idLen = view.getUint16(17);
     if (19 + idLen > buf.length) return null;
     const id = utf8Decode(buf.subarray(19, 19 + idLen));
@@ -267,7 +423,8 @@ export function tryDecodeTerminalWsAck(raw: unknown): TerminalWsAck | null {
     typeof record.sequence !== "number" ||
     !Number.isSafeInteger(record.sequence) ||
     record.sequence < 0
-  ) return null;
+  )
+    return null;
   return {
     type: "terminal:ack",
     terminalId: record.terminalId,
@@ -275,9 +432,7 @@ export function tryDecodeTerminalWsAck(raw: unknown): TerminalWsAck | null {
   };
 }
 
-export function tryDecodeTerminalReplayRequired(
-  raw: unknown,
-): TerminalReplayRequired | null {
+export function tryDecodeTerminalReplayRequired(raw: unknown): TerminalReplayRequired | null {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
   if (
@@ -287,7 +442,8 @@ export function tryDecodeTerminalReplayRequired(
     typeof record.sequence !== "number" ||
     !Number.isSafeInteger(record.sequence) ||
     record.sequence < 0
-  ) return null;
+  )
+    return null;
   return {
     type: "terminal:replay-required",
     terminalId: record.terminalId,
@@ -295,7 +451,7 @@ export function tryDecodeTerminalReplayRequired(
   };
 }
 
-/** Client → host control ops over the event WebSocket (JSON text frames). */
+/** Terminal operations eligible for the realtime protocol. JSON helpers below serve protocol-1 adapters. */
 export type TerminalWsHotOp = Extract<
   HostRouteName,
   | "terminal:write"
@@ -304,13 +460,13 @@ export type TerminalWsHotOp = Extract<
   | "terminal:ready"
   | "terminal:detach"
   | "terminal:attach"
->
+>;
 
 /** Hot operations are selected from the canonical route registry. */
 export const TERMINAL_WS_HOT_OPS = HOST_ROUTE_CHANNELS.filter(
   (channel): channel is TerminalWsHotOp =>
     channel.startsWith("terminal:") && getHostRoute(channel)?.realtime === true,
-)
+);
 
 export type TerminalWsCommand = {
   requestId: string;
@@ -331,7 +487,7 @@ export function isTerminalWsHotOp(value: unknown): value is TerminalWsHotOp {
     typeof value === "string" &&
     value.startsWith("terminal:") &&
     getHostRoute(value)?.realtime === true
-  )
+  );
 }
 
 export function encodeTerminalWsCommand(
@@ -343,9 +499,7 @@ export function encodeTerminalWsCommand(
   return JSON.stringify(cmd);
 }
 
-export function tryDecodeTerminalWsCommand(
-  raw: unknown,
-): TerminalWsCommand | null {
+export function tryDecodeTerminalWsCommand(raw: unknown): TerminalWsCommand | null {
   if (raw === null || typeof raw !== "object") return null;
   const obj = raw as Record<string, unknown>;
   if (
@@ -358,9 +512,7 @@ export function tryDecodeTerminalWsCommand(
   return { requestId: obj.requestId, op: obj.op, args: obj.args };
 }
 
-export function tryDecodeTerminalWsResult(
-  raw: unknown,
-): TerminalWsResult | null {
+export function tryDecodeTerminalWsResult(raw: unknown): TerminalWsResult | null {
   if (raw === null || typeof raw !== "object") return null;
   const obj = raw as Record<string, unknown>;
   if (

@@ -91,11 +91,12 @@ the stream ID, epoch, and contiguous byte range and does not restore or send
 input before the snapshot/READY barrier. Input and resize use binary frames with
 independent monotonic positions. A per-client overflow emits binary
 `RESYNC_BEGIN`, drops stale deltas, and starts the same attach transaction.
-Protocol 1 remains a network-edge compatibility adapter only. Protocol 2 keeps
-its small attach/result, READY acknowledgement, error, and liveness control
-envelope in JSON today; snapshots, PTY bytes, input, resize, resync, and history
-are binary. Binary control-envelope cutover is therefore still a conformance
-gap. Each admitted WebSocket has one writer task as the sole sink owner. The reader
+Protocol 1 remains a network-edge compatibility adapter only. Capable protocol-2
+connections carry terminal `HELLO`, `ATTACH`, `ATTACH_ACK`, `READY`, `DETACH`,
+`CONTROL_ACK`, `ERROR`, `PING`, and `PONG` in protocol-v4 binary frames. Bounded
+JSON metadata may appear inside a control payload. Snapshot, PTY, input, and
+history bytes never enter JSON or base64. Each admitted WebSocket has one writer
+task as the sole sink owner. The reader
 handles commands and ACKs without awaiting network output; every producer uses
 a non-awaiting `ConnectionOutbound` backed by bounded reliable and ordered raw
 lanes. Semantic snapshot/patch frames are not connected to the capable-client

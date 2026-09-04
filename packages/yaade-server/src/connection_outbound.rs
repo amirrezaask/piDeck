@@ -152,6 +152,32 @@ impl ConnectionOutbound {
         self.enqueue_reliable_frame(OutboundFrame::binary(data))
     }
 
+    pub fn enqueue_protocol_frame(
+        &self,
+        kind: terminal_protocol::FrameType,
+        stream_id: u64,
+        epoch: u64,
+        sequence: u64,
+        payload: bytes::Bytes,
+    ) -> bool {
+        let encoded = terminal_protocol::Frame::new(
+            kind,
+            0,
+            stream_id,
+            terminal_protocol::StreamPosition { epoch, sequence },
+            payload,
+        )
+        .and_then(|frame| terminal_protocol::Codec::default().encode(frame))
+        .map(terminal_protocol::EncodedFrame::coalesce);
+        match encoded {
+            Ok(frame) => self.enqueue_binary_reliable(frame),
+            Err(_) => {
+                self.close(1011, "terminal protocol frame serialization failed");
+                false
+            }
+        }
+    }
+
     pub fn enqueue_history(&self, frames: Vec<bytes::Bytes>) -> bool {
         let mut state = self
             .state
@@ -231,13 +257,42 @@ impl ConnectionOutbound {
             self.close(1011, "attach result serialization failed");
             return false;
         };
+        let result_frame = if self.protocol == 2 {
+            let (stream_id, epoch) = stream.unwrap_or((0, 0));
+            let sequence = snapshot_sequence.unwrap_or(0);
+            let kind = if serde_json::from_slice::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|value| value.get("ok").and_then(serde_json::Value::as_bool))
+                == Some(false)
+            {
+                terminal_protocol::FrameType::Error
+            } else {
+                terminal_protocol::FrameType::AttachAck
+            };
+            let encoded = terminal_protocol::Frame::new(
+                kind,
+                0,
+                stream_id,
+                terminal_protocol::StreamPosition { epoch, sequence },
+                bytes::Bytes::from(data),
+            )
+            .and_then(|frame| terminal_protocol::Codec::default().encode(frame))
+            .map(terminal_protocol::EncodedFrame::coalesce);
+            let Ok(encoded) = encoded else {
+                self.close(1011, "ATTACH_ACK frame serialization failed");
+                return false;
+            };
+            OutboundFrame::binary(encoded)
+        } else {
+            OutboundFrame::text(data)
+        };
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !state
             .mailbox
-            .enqueue_reliable_priority(OutboundFrame::text(data))
+            .enqueue_reliable_priority(result_frame)
             .accepted
         {
             state.close = Some((1013, "attach result mailbox overflow"));
@@ -643,8 +698,14 @@ mod tests {
         };
         assert_eq!(
             result.kind,
-            crate::outbound_mailbox::OutboundFrameKind::Text
+            crate::outbound_mailbox::OutboundFrameKind::Binary
         );
+        let mut bytes = bytes::BytesMut::from(result.data.as_ref());
+        let result = terminal_protocol::Codec::default()
+            .decode(&mut bytes)
+            .expect("decode")
+            .expect("frame");
+        assert_eq!(result.kind, terminal_protocol::FrameType::AttachAck);
         let Some(NextOutbound::Frame(snapshot)) = outbound.next().await else {
             panic!("snapshot")
         };

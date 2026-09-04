@@ -40,6 +40,7 @@ test('loads Switcher, uses one isolated overlay, manages tabs, and opens the res
       if (tabId === undefined) throw new Error('Dispatch tab was not found.');
       await chrome.tabs.setZoom(tabId, 1.5);
     });
+    const coldStart = performance.now();
     await invoke();
     const search = first.getByRole('combobox', { name: 'Search tabs' });
     const overlay = first.getByTestId('switcher-overlay');
@@ -49,8 +50,10 @@ test('loads Switcher, uses one isolated overlay, manages tabs, and opens the res
       .poll(() => overlay.evaluate((element) => Number.parseFloat(element.style.width)))
       .toBeCloseTo(compensatedWidth, 0);
     await expect(search).toBeVisible();
+    await expect(search).toBeFocused();
+    expect(performance.now() - coldStart).toBeLessThan(400);
     await expect(first.locator('.switcher-root')).toHaveAttribute('dir', 'ltr');
-    await expect(first.getByRole('option')).toHaveCount(0);
+    await expect.poll(() => first.getByRole('option').count()).toBeGreaterThan(0);
     await first.screenshot({ path: '../../.impeccable/review/switcher-desktop.png' });
     await search.fill('dispatch');
     await first.getByRole('button', { name: 'System theme. Switch theme' }).click();
@@ -63,10 +66,13 @@ test('loads Switcher, uses one isolated overlay, manages tabs, and opens the res
     await expect.poll(() => second.evaluate(() => document.visibilityState)).toBe('visible');
 
     await invoke();
+    await expect(search).toBeFocused();
     await first.keyboard.press('Escape');
     await invoke();
+    await expect(search).toBeFocused();
     await first.keyboard.press('Escape');
     await invoke();
+    await expect(search).toBeFocused();
     await expect(first.getByTestId('switcher-overlay')).toHaveCount(1);
 
     const grafanaRow = first.getByRole('option', { name: /grafana/i });
@@ -114,6 +120,35 @@ test('loads Switcher, uses one isolated overlay, manages tabs, and opens the res
     await invoker.evaluate(() => chrome.runtime.sendMessage({ type: 'test/invoke' }));
     const fallback = await fallbackPromise;
     await expect(fallback.getByRole('dialog', { name: 'Switcher' })).toBeVisible();
+    const windowCenters = await invoker.evaluate(async (fallbackUrl) => {
+      const windows = await chrome.windows.getAll({ populate: true });
+      const source = windows.find((window) => window.type === 'normal');
+      const popup = windows.find((window) => window.tabs?.some((tab) => tab.url === fallbackUrl));
+      if (
+        source?.left === undefined ||
+        source.top === undefined ||
+        source.width === undefined ||
+        source.height === undefined ||
+        popup?.left === undefined ||
+        popup.top === undefined ||
+        popup.width === undefined ||
+        popup.height === undefined
+      )
+        throw new Error('Chrome did not report complete window bounds.');
+      return {
+        source: {
+          x: source.left + source.width / 2,
+          y: source.top + source.height / 2,
+        },
+        popup: {
+          x: popup.left + popup.width / 2,
+          y: popup.top + popup.height / 2,
+        },
+      };
+    }, `chrome-extension://${extensionId}/switcher.html`);
+    // Window managers may clamp popup bounds to the available work area.
+    expect(Math.abs(windowCenters.popup.x - windowCenters.source.x)).toBeLessThanOrEqual(32);
+    expect(Math.abs(windowCenters.popup.y - windowCenters.source.y)).toBeLessThanOrEqual(32);
     await expect(fallback.locator('.switcher-root')).toHaveClass(/dark/);
     await fallback.screenshot({ path: '../../.impeccable/review/switcher-fallback.png' });
     await fallback.getByRole('combobox', { name: 'Search tabs' }).fill('dispatch');
