@@ -7,6 +7,7 @@ import {
   ChromeTabs,
   type InvocationContext,
   PaletteInjection,
+  WorkbenchNavigation,
 } from '/src/services/chrome-services';
 import { errorMessage, type SwitcherError } from '/src/services/errors';
 
@@ -34,17 +35,22 @@ export const handleRequest = (
 ): Effect.Effect<
   RuntimeResponse,
   never,
-  ChromeTabs | ChromeStorage | ChromeCommands | PaletteInjection
+  ChromeTabs | ChromeStorage | ChromeCommands | PaletteInjection | WorkbenchNavigation
 > =>
   Effect.gen(function* () {
     const tabs = yield* ChromeTabs;
     const storage = yield* ChromeStorage;
     const commands = yield* ChromeCommands;
     const injection = yield* PaletteInjection;
+    const workbench = yield* WorkbenchNavigation;
 
     if (request.type === 'test/invoke' || request.type === 'palette/toggle') {
       yield* injection.openActive();
       return { ok: true as const, type: 'done' as const, closePalette: false };
+    }
+    if (request.type === 'workbench/open') {
+      yield* workbench.openSurface(request.surface);
+      return { ok: true as const, type: 'done' as const, closePalette: true };
     }
     const context = yield* invocationFrom(sender);
     if (request.type === 'palette/bootstrap' || request.type === 'palette/refresh') {

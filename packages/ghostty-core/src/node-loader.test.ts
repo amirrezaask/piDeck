@@ -20,12 +20,28 @@ test("Node loader instantiates the pinned Ghostty core without browser globals",
     source,
   )
   try {
-    core.write("hello\n世界")
+    core.write("\u001b[?2027hhello\n世界🧑🏽‍💻")
     assert.equal(core.selectionText(), "")
     const snapshot = core.snapshot(false)
     assert.equal(snapshot.cols, 20)
     assert.equal(snapshot.rows, 3)
     assert.match(snapshot.rowData.map(row => row.text).join("\n"), /hello/)
+
+    const wideRow = snapshot.rowData.find(row => row.cells.some(cell => cell.text === "世"))
+    for (const text of ["世", "界", "🧑🏽‍💻"]) {
+      const column = wideRow?.cells.findIndex(cell => cell.text === text) ?? -1
+      assert.ok(column >= 0, JSON.stringify(wideRow?.cells.map(cell => cell.text)))
+      assert.equal(wideRow?.cells[column]?.wide, 1)
+      assert.equal(wideRow?.cells[column + 1]?.wide, 2)
+    }
+    const packedModel = new GhosttyViewportModel()
+    const packed = core.renderUpdate()
+    packedModel.apply(packed)
+    const packedWideRow = packedModel.snapshot().rowData.find(row => row.cells.some(cell => cell.text === "世"))
+    assert.equal(packedWideRow?.cells.find(cell => cell.text === "世")?.wide, 1)
+    assert.equal(packedWideRow?.cells.find(cell => cell.text === "🧑🏽‍💻")?.wide, 1)
+    assert.ok(packedModel.bufferText().includes("世界🧑🏽‍💻"))
+    core.releaseRenderUpdate(packed)
 
     const firstCell = snapshot.rowData[0]?.cells[0]
     core.write("\u001b[HH")

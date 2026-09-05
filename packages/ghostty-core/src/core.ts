@@ -1371,7 +1371,15 @@ export class GhosttyTerminalCore {
         cell.foreground.b = blendFaintChannel(cell.foreground.b, cell.background.b);
       }
       let wide = 0;
-      if (text.length === 0 && column > 0 && cells[column - 1]!.text.length > 0) {
+      // ASCII graphic cells are narrow. All other graphemes need the
+      // authoritative width, not just their empty trailing spacer: otherwise
+      // WebGL clips CJK/emoji to one cell and copy inserts spacer spaces.
+      const ascii = text.length === 1 && text.charCodeAt(0) >= 0x20 && text.charCodeAt(0) <= 0x7e;
+      if (
+        (text.length > 0 && !ascii) ||
+        (text.length === 0 && (column === cells.length - 1 ||
+          (column > 0 && cells[column - 1]!.text.length > 0)))
+      ) {
         this.assertSuccess(
           "ghostty_render_state_row_cells_get(raw)",
           this.runtime.call(

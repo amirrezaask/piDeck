@@ -2,6 +2,7 @@ import { Context, type Effect } from 'effect';
 
 import type { ThemePreference } from '/src/domain/theme';
 import type { RuntimeResponse } from '/src/protocol/responses';
+import type { WorkbenchSurface } from '/src/runtime/workbench-navigation';
 import type { SwitcherError } from './errors';
 
 export interface InvocationContext {
@@ -49,6 +50,14 @@ export interface ChromeStorageShape {
 export class ChromeStorage extends Context.Tag('Switcher/ChromeStorage')<
   ChromeStorage,
   ChromeStorageShape
+>() {}
+
+export interface WorkbenchNavigationShape {
+  readonly openSurface: (surface: WorkbenchSurface) => Effect.Effect<void, SwitcherError>;
+}
+export class WorkbenchNavigation extends Context.Tag('Switcher/WorkbenchNavigation')<
+  WorkbenchNavigation,
+  WorkbenchNavigationShape
 >() {}
 
 export interface PaletteInjectionShape {

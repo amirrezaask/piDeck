@@ -1,5 +1,5 @@
 {
   "version": 1,
   "movedTo": "tests/bench/slos.json",
-  "note": "Release objectives are validated and enforced from the SLO registry."
+  "note": "SLO registry v2 distinguishes enforced benchmarks from specified, uncalibrated objectives. See docs/operations/terminal-performance-budgets.md."
 }

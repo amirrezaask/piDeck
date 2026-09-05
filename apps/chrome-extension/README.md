@@ -1,6 +1,6 @@
-# Switcher
+# ChromePlus
 
-Switcher is a keyboard-first Chrome palette for finding and managing open tabs across every normal browser window. It opens as a search field, searches locally after you type, and supports tab actions without requiring permanent site access.
+ChromePlus is the browser shell for piDeck. It opens terminal and agent surfaces as Chrome tabs and includes Switcher, a keyboard-first palette for finding and managing open tabs across every normal browser window.
 
 ## Screenshot
 
@@ -36,7 +36,7 @@ pnpm --filter @pideck/switcher build
 The unpacked production extension is written to:
 
 ```text
-apps/switcher/build/chrome-mv3
+apps/chrome-extension/build/chrome-mv3
 ```
 
 To load it:
@@ -44,7 +44,7 @@ To load it:
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**.
 3. Choose **Load unpacked**.
-4. Select `apps/switcher/build/chrome-mv3`.
+4. Select `apps/chrome-extension/build/chrome-mv3`.
 
 Create a release archive with:
 
@@ -56,12 +56,19 @@ Before release, run `pnpm --filter @pideck/switcher check`, inspect the generate
 
 ## Using Switcher
 
-Open it with the toolbar action or:
+Use these shortcuts:
 
-- macOS: **Command+Shift+K**
-- Windows/Linux: **Ctrl+Shift+K**
+| Action        | macOS               | Windows/Linux    |
+| ------------- | ------------------- | ---------------- |
+| Open Switcher | **Command+Shift+K** | **Ctrl+Shift+K** |
+| Open terminal | **Command+Shift+J** | **Ctrl+Shift+J** |
+| Open agent    | **Command+Shift+A** | **Ctrl+Shift+A** |
 
-Chrome can decline a suggested command or another extension may claim it. Select the shortcut in Switcher’s footer to open Chrome’s shortcut settings, where you can assign or change it. Switcher shows a footer warning and an `!` toolbar badge while it is unassigned.
+Chrome can decline a suggested command or another extension may claim it. Open `chrome://extensions/shortcuts` to assign or change a shortcut. Switcher shows a footer warning and an `!` toolbar badge when its shortcut is unassigned.
+
+### Native Split View
+
+Create a native Chrome Split View from the tab context menu. When you invoke a terminal or agent from one side, ChromePlus loads it in the companion tab. Outside Split View, ChromePlus creates an adjacent tab; place that tab into a split with Chrome’s context menu. Chrome’s extension interface reports Split View membership but cannot create or resize a split.
 
 Search matches tab titles, hostnames, paths, and full URLs. Switcher keeps the result area hidden until you type.
 
@@ -87,6 +94,8 @@ Chrome blocks scripting on browser-owned or protected pages such as `chrome://` 
 ```mermaid
 flowchart LR
   I[Toolbar or command] --> B[MV3 background worker]
+  B -->|terminal or agent| W[Native split companion or adjacent tab]
+  W --> H[Local piDeck host]
   B -->|toggle existing| O[Shadow DOM overlay]
   B -->|activeTab injection| O
   B -->|restricted URL| F[Extension fallback window]
@@ -162,4 +171,4 @@ Switcher makes no network requests, includes no analytics or telemetry, and read
 - Browser-protected pages always use the compact fallback window.
 - Favicons are displayed only when Chrome provides a usable URL; deterministic letter fallbacks are otherwise shown.
 
-Pi and local agents are intentionally absent from the browser-only MVP. A future `AgentSessionsProvider` can add them after a separately reviewed trust and transport design.
+Terminal and agent commands open the local piDeck host at `http://ide.local:7774`. The host remains the authority for PTYs, agent runs, persistence, and authentication. The extension only chooses a Chrome tab and navigates it to the requested surface.

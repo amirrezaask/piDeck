@@ -41,15 +41,6 @@ function workerLimit(): number {
   return Math.max(1, Math.min(MAX_TERMINAL_WORKERS, Math.floor(hardware / 2)));
 }
 
-function hash(value: string): number {
-  let result = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    result ^= value.charCodeAt(index);
-    result = Math.imul(result, 16777619);
-  }
-  return result >>> 0;
-}
-
 export class TerminalWorkerPool {
   private readonly slots: Slot[] = [];
   private disposed = false;
@@ -69,7 +60,11 @@ export class TerminalWorkerPool {
     while (this.slots.length < limit && this.slots.length <= this.terminalCount) {
       this.slots.push(this.createSlot());
     }
-    const slot = this.slots[hash(terminalId) % this.slots.length];
+    // Existing assignments stay fixed. Hashing against a growing pool left
+    // three of the first six terminals on worker zero despite idle workers.
+    const slot = this.slots.reduce<Slot | undefined>((least, candidate) =>
+      !least || candidate.terminals.size < least.terminals.size ? candidate : least,
+    undefined);
     if (!slot) throw new Error("Terminal worker pool has no available worker");
     slot.terminals.set(terminalId, { message: onMessage, error: onError });
     let released = false;

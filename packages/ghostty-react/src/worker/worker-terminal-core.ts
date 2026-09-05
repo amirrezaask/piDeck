@@ -277,6 +277,9 @@ export class WorkerTerminalCore implements TerminalCoreRuntime {
         }
         this.options.onUpdate();
         return;
+      case "completed":
+        if (value.diagnostics) this.diagnostics = value.diagnostics;
+        return;
       case "encodedInput": if (value.data.length > 0) this.options.onData(value.data); return;
       case "parsed":
         this.diagnostics = value.diagnostics;

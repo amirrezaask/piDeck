@@ -10,8 +10,16 @@ export interface WebGlGlyphAtlasEntry {
 }
 
 const PADDING = 2;
-const COLOR_GLYPH = /\p{Extended_Pictographic}/u;
+const COLOR_GLYPH = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u;
+
+export function isColorGlyphCluster(text: string): boolean {
+  // VS15 explicitly requests text presentation. Flags and keycaps are emoji
+  // too, even though their base codepoints are not Extended_Pictographic.
+  return !text.includes("\ufe0e") && COLOR_GLYPH.test(text);
+}
 const DEFAULT_ATLAS_SIZE = 1024;
+// RGBA8 atlas budget per surface (six panes: at most 96 MiB of atlas storage).
+const MAX_ATLAS_BYTES = 16 * 1024 * 1024;
 const MAX_SCRATCH_CANVASES = 4;
 
 type GlyphScratchCanvas = {
@@ -22,12 +30,14 @@ type GlyphScratchCanvas = {
 /**
  * A bounded stable-cluster atlas. Normal entries are complete graphemes rather
  * than volatile row strings. Capacity pressure resets the cache at a frame
- * boundary and is reported to the scene as ordinary repaint work, never as a
- * renderer failure.
+ * boundary. Growth is capped by a per-surface GPU budget; scenes that still
+ * cannot fit are handled by the controller's bounded Canvas fallback.
  */
 export class WebGlGlyphAtlas {
   readonly texture: WebGLTexture;
-  readonly size: number;
+  private sizeValue: number;
+  private readonly maximumSize: number;
+  get size(): number { return this.sizeValue; }
   private readonly entries = new Map<string, WebGlGlyphAtlasEntry>();
   private readonly scratch = new Map<number, GlyphScratchCanvas>();
   private nextX = 0;
@@ -38,8 +48,9 @@ export class WebGlGlyphAtlas {
   private resetsValue = 0;
   private allocatedBytesValue = 0;
 
-  constructor(private readonly gl: WebGL2RenderingContext, maximumSize = DEFAULT_ATLAS_SIZE) {
-    this.size = Math.max(256, Math.min(maximumSize, gl.getParameter(gl.MAX_TEXTURE_SIZE)));
+  constructor(private readonly gl: WebGL2RenderingContext, maximumSize = Math.sqrt(MAX_ATLAS_BYTES / 4)) {
+    this.maximumSize = Math.max(1, Math.floor(Math.min(maximumSize, gl.getParameter(gl.MAX_TEXTURE_SIZE), Math.sqrt(MAX_ATLAS_BYTES / 4))));
+    this.sizeValue = Math.min(DEFAULT_ATLAS_SIZE, this.maximumSize);
     const texture = gl.createTexture();
     if (texture === null) throw new Error("WebGL glyph atlas initialization failed");
     this.texture = texture;
@@ -71,7 +82,7 @@ export class WebGlGlyphAtlas {
     readonly italic: boolean;
     readonly pixelRatio: number;
   }): WebGlGlyphAtlasEntry {
-    const colorGlyph = COLOR_GLYPH.test(options.text);
+    const colorGlyph = isColorGlyphCluster(options.text);
     const key = [
       options.font.family,
       options.font.size,
@@ -95,9 +106,10 @@ export class WebGlGlyphAtlas {
     const height = Math.max(1, Math.ceil(options.metrics.height * ratio));
     const atlasWidth = width + PADDING * 2;
     const atlasHeight = height + PADDING * 2;
-    if (atlasWidth > this.size || atlasHeight > this.size) {
+    if (atlasWidth > this.maximumSize || atlasHeight > this.maximumSize) {
       throw new Error("Glyph exceeds the bounded WebGL atlas");
     }
+    while (atlasWidth > this.size || atlasHeight > this.size) this.resetForPressure();
     const scratch = this.scratchFor(atlasWidth, atlasHeight);
     const canvas = scratch.canvas;
     const context = scratch.context;
@@ -125,7 +137,9 @@ export class WebGlGlyphAtlas {
     const x = this.nextX;
     const y = this.nextY;
     this.gl.bindTexture(this.gl.TEXTURE_2D, this.texture);
-    this.gl.pixelStorei(this.gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    // The renderer blends with SRC_ALPHA. Upload straight-alpha texels so
+    // colored glyph edges are not multiplied by their coverage a second time.
+    this.gl.pixelStorei(this.gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     this.gl.texSubImage2D(
       this.gl.TEXTURE_2D,
       0,
@@ -173,6 +187,7 @@ export class WebGlGlyphAtlas {
 
   private resetForPressure(): void {
     this.resetsValue += 1;
+    this.sizeValue = Math.min(this.maximumSize, this.size * 2);
     this.clear();
   }
 

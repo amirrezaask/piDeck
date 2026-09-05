@@ -38,4 +38,4 @@ The generated directory is mode `0700`; files are mode `0600`. Nothing uploads a
 
 ## Quality reports
 
-`tests/bench/slos.json` is the reviewed objective registry. Threshold changes require a reason and review; correctness remains zero-tolerance. Generate component reports with `test:compatibility`, `test:chaos`, and `test:soak`, then run `release:quality`. Missing dimensions fail the report rather than becoming zero.
+`tests/bench/slos.json` is the reviewed objective registry. See [terminal performance budgets](./terminal-performance-budgets.md) for refresh-aware proxy targets, paced workloads, overload recovery, and the distinction between enforced and specified objectives. Threshold changes require a reason and review; correctness remains zero-tolerance. Generate component reports with `test:compatibility`, `test:chaos`, and `test:soak`, then run `release:quality`. Missing dimensions fail the report rather than becoming zero.

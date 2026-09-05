@@ -29,14 +29,24 @@ const slos = JSON.parse(readFileSync(resolve(root, "tests/bench/slos.json"), "ut
 const conformance = JSON.parse(
   readFileSync(resolve(root, "tests/conformance/manifest.json"), "utf8"),
 );
+const unsupportedMetrics = [
+  ...new Set(
+    slos.objectives
+      .filter((objective) => objective.status === "specified")
+      .map((objective) => objective.metric),
+  ),
+];
 const report = {
   version: 1,
   registrySha256: createHash("sha256").update(JSON.stringify(slos)).digest("hex"),
   conformanceSha256: createHash("sha256").update(JSON.stringify(conformance)).digest("hex"),
   dimensions,
   zeroTolerance: slos.zeroTolerance,
-  unsupportedMetrics: [],
-  status: dimensions.every((value) => value.status === "pass") ? "pass" : "fail",
+  unsupportedMetrics,
+  status:
+    unsupportedMetrics.length === 0 && dimensions.every((value) => value.status === "pass")
+      ? "pass"
+      : "fail",
 };
 const canonical = JSON.stringify(report);
 const signed = { ...report, reportSha256: createHash("sha256").update(canonical).digest("hex") };

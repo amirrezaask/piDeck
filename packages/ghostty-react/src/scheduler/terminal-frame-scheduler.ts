@@ -30,12 +30,14 @@ export interface TerminalPresentationSample {
   readonly modelAppliedAt: number;
   readonly renderStartedAt: number;
   readonly submittedAt: number;
+  readonly parsedBytesAtSubmission?: number;
   readonly nextPaintObservedAt: number;
 }
 
 type PipelineRecord = {
   sequence: number;
   bytes: number;
+  endOffset: number;
   postedBytes: number;
   receivedAt: number;
   postedAt: number;
@@ -51,14 +53,20 @@ type PipelineRecord = {
   geometryGeneration: number;
 };
 
-export type TerminalSchedulerSnapshot = {
-  readonly retainedSamples: number;
+export type TerminalSchedulerCounters = {
   readonly receivedBytes: number;
   readonly postedBytes: number;
   readonly parsedBytes: number;
+  readonly discardedBytes: number;
+  /** Parsed bytes covered by an observed submission; not physical display bytes. */
   readonly presentedBytes: number;
   readonly pendingBytes: number;
   readonly maxPendingBytes: number;
+};
+
+export type TerminalSchedulerSnapshot = TerminalSchedulerCounters & {
+  readonly retainedSamples: number;
+  /** Sampled lower bound: evicted timing samples are not retained for this gauge. */
   readonly oldestPendingAgeMs: number;
   readonly receivedToParsedP50: number;
   readonly receivedToParsedP95: number;
@@ -78,8 +86,7 @@ export type TerminalSchedulerSnapshot = {
 
 function percentile(values: readonly number[], fraction: number): number {
   if (values.length === 0) return 0;
-  const sorted = [...values].sort((left, right) => left - right);
-  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)] ?? 0;
+  return values[Math.min(values.length - 1, Math.ceil(values.length * fraction) - 1)] ?? 0;
 }
 
 /**
@@ -88,11 +95,18 @@ function percentile(values: readonly number[], fraction: number): number {
  */
 export class TerminalFrameScheduler {
   private readonly records: PipelineRecord[] = [];
+  // Tokens are owned by parser callbacks, not the timing ring. Evicting a
+  // sample must never evict its outstanding accounting obligation.
+  private tokens = new WeakMap<TerminalPipelineToken, PipelineRecord>();
   private sequence = 0;
   private receivedBytes = 0;
   private postedBytes = 0;
+  private postedThrough = 0;
   private parsedBytes = 0;
+  private discardedBytes = 0;
   private presentedBytes = 0;
+  private submittedParsedBytes = 0;
+  private lastPresentedParsedBytes = 0;
   private pendingBytes = 0;
   private maxPendingBytes = 0;
   private lastSubmittedModelFrame = 0;
@@ -101,13 +115,17 @@ export class TerminalFrameScheduler {
   constructor(
     private readonly now: () => number = () => performance.now(),
     private readonly capacity = TERMINAL_SCHEDULER_BUDGETS.metricsCapacity,
-  ) {}
+  ) {
+    if (!Number.isSafeInteger(capacity) || capacity < 0)
+      throw new Error("Terminal timing capacity must be a non-negative safe integer");
+  }
 
   received(bytes: number): TerminalPipelineToken {
     const size = Math.max(0, Math.trunc(bytes));
     const record: PipelineRecord = {
       sequence: ++this.sequence,
       bytes: size,
+      endOffset: this.receivedBytes + size,
       postedBytes: 0,
       receivedAt: this.now(),
       postedAt: -1,
@@ -127,30 +145,36 @@ export class TerminalFrameScheduler {
     this.pendingBytes += size;
     this.maxPendingBytes = Math.max(this.maxPendingBytes, this.pendingBytes);
     this.trim();
-    return { sequence: record.sequence };
+    const token = { sequence: record.sequence };
+    this.tokens.set(token, record);
+    return token;
   }
 
   posted(bytes: number): void {
-    let remaining = Math.max(0, Math.trunc(bytes));
+    const amount = Math.min(Math.max(0, Math.trunc(bytes)), this.receivedBytes - this.postedThrough);
+    this.postedBytes += amount;
+    this.postedThrough += amount;
     const timestamp = this.now();
     for (const record of this.records) {
-      if (remaining === 0) break;
-      const available = record.bytes - record.postedBytes;
-      if (available <= 0) continue;
-      const amount = Math.min(available, remaining);
-      record.postedBytes += amount;
+      const posted = Math.max(0, Math.min(record.bytes, this.postedThrough - (record.endOffset - record.bytes)));
+      if (posted <= record.postedBytes) continue;
+      record.postedBytes = posted;
       if (record.postedAt < 0) record.postedAt = Math.max(record.receivedAt, timestamp);
-      this.postedBytes += amount;
-      remaining -= amount;
     }
   }
 
   parsed(token: TerminalPipelineToken): void {
-    const record = this.records.find(candidate => candidate.sequence === token.sequence);
-    if (record === undefined || record.parsedAt >= 0) return;
+    const record = this.tokens.get(token);
+    if (record === undefined) return;
+    this.tokens.delete(token);
     record.parsedAt = Math.max(record.receivedAt, this.now());
     this.parsedBytes += record.bytes;
     this.pendingBytes = Math.max(0, this.pendingBytes - record.bytes);
+  }
+
+  submitted(): number {
+    this.submittedParsedBytes = this.parsedBytes;
+    return this.submittedParsedBytes;
   }
 
   presented(sample?: TerminalPresentationSample): void {
@@ -158,6 +182,7 @@ export class TerminalFrameScheduler {
     const observedAt = sample?.nextPaintObservedAt ?? fallback;
     for (const record of this.records) {
       if (record.parsedAt < 0 || record.nextPaintObservedAt >= 0) continue;
+      if (sample !== undefined && record.parsedAt > sample.modelAppliedAt) continue;
       // A recovered/new runtime may not present records parsed by a stale
       // generation. They remain bounded diagnostics and are dropped on reset.
       if (
@@ -174,8 +199,13 @@ export class TerminalFrameScheduler {
       record.renderStartedAt = Math.max(record.modelAppliedAt, sample?.renderStartedAt ?? fallback);
       record.submittedAt = Math.max(record.renderStartedAt, sample?.submittedAt ?? fallback);
       record.nextPaintObservedAt = Math.max(record.submittedAt, observedAt);
-      this.presentedBytes += record.bytes;
     }
+    // This is a cumulative parse-to-next-rAF proxy, not physical display
+    // accounting. Timing-sample eviction cannot change the byte counter.
+    const through = Math.max(this.lastPresentedParsedBytes,
+      sample === undefined ? this.parsedBytes : sample.parsedBytesAtSubmission ?? this.submittedParsedBytes);
+    this.presentedBytes += through - this.lastPresentedParsedBytes;
+    this.lastPresentedParsedBytes = through;
     if (sample !== undefined) {
       this.lastSubmittedModelFrame = Math.max(this.lastSubmittedModelFrame, sample.modelFrameId);
       this.lastNextPaintObservedFrame = Math.max(
@@ -187,7 +217,25 @@ export class TerminalFrameScheduler {
 
   resetGeneration(): void {
     this.records.length = 0;
+    this.tokens = new WeakMap();
+    this.postedThrough = this.receivedBytes;
+    this.submittedParsedBytes = this.parsedBytes;
+    this.lastPresentedParsedBytes = this.parsedBytes;
+    this.discardedBytes += this.pendingBytes;
     this.pendingBytes = 0;
+  }
+
+  /** Constant-time accounting; percentile sorting is never needed for an ACK. */
+  counters(): TerminalSchedulerCounters {
+    return {
+      receivedBytes: this.receivedBytes,
+      postedBytes: this.postedBytes,
+      parsedBytes: this.parsedBytes,
+      discardedBytes: this.discardedBytes,
+      presentedBytes: this.presentedBytes,
+      pendingBytes: this.pendingBytes,
+      maxPendingBytes: this.maxPendingBytes,
+    };
   }
 
   snapshot(): TerminalSchedulerSnapshot {
@@ -206,14 +254,13 @@ export class TerminalFrameScheduler {
         frameDelay.push(record.nextPaintObservedAt - record.submittedAt);
       }
     }
+    // Each population is sorted once, not copied/sorted again per quantile.
+    for (const values of [parsed, parsedToSubmitted, presented, frameDelay]) {
+      values.sort((left, right) => left - right);
+    }
     return {
+      ...this.counters(),
       retainedSamples: this.records.length,
-      receivedBytes: this.receivedBytes,
-      postedBytes: this.postedBytes,
-      parsedBytes: this.parsedBytes,
-      presentedBytes: this.presentedBytes,
-      pendingBytes: this.pendingBytes,
-      maxPendingBytes: this.maxPendingBytes,
       oldestPendingAgeMs: oldest ? Math.max(0, now - oldest.receivedAt) : 0,
       receivedToParsedP50: percentile(parsed, 0.5),
       receivedToParsedP95: percentile(parsed, 0.95),

@@ -5,6 +5,11 @@ import type { ThemePreference } from '/src/domain/theme';
 import type { TabSnapshot } from '/src/protocol/responses';
 import { isInjectableUrl } from '/src/runtime/restricted-url';
 import {
+  planSurfacePlacement,
+  surfaceUrl,
+  type WorkbenchSurface,
+} from '/src/runtime/workbench-navigation';
+import {
   ChromeApiError,
   TabNotFoundError,
   type SwitcherError,
@@ -16,6 +21,7 @@ import {
   ChromeTabs,
   type InvocationContext,
   PaletteInjection,
+  WorkbenchNavigation,
 } from './chrome-services';
 
 const errorText = (cause: unknown): string =>
@@ -289,6 +295,48 @@ const openPalette = (
   );
 };
 
+const makeWorkbenchNavigation = () => ({
+  openSurface: (surface: WorkbenchSurface): Effect.Effect<void, SwitcherError> =>
+    Effect.gen(function* () {
+      const activeTabs = yield* fromPromise('tabs.query.active-workbench', () =>
+        browser.tabs.query({ active: true, lastFocusedWindow: true }),
+      );
+      const active = activeTabs[0];
+      if (active?.id === undefined || active.windowId === undefined)
+        return yield* Effect.fail(new TabNotFoundError({ tabId: -1 }));
+
+      const splitTabs = isTabInSplitView(active)
+        ? yield* fromPromise('tabs.query.split-view', () =>
+            browser.tabs.query({ windowId: active.windowId, splitViewId: active.splitViewId }),
+          )
+        : [];
+      const placement = planSurfacePlacement(active, splitTabs);
+      if (placement === undefined) return yield* Effect.fail(new TabNotFoundError({ tabId: -1 }));
+      const url = surfaceUrl(surface);
+
+      if (placement.kind === 'replace') {
+        yield* fromPromise(
+          'tabs.update.workbench-split',
+          () => browser.tabs.update(placement.tabId, { url, active: true }),
+          { tabId: placement.tabId, windowId: active.windowId },
+        );
+        return;
+      }
+      yield* fromPromise(
+        'tabs.create.workbench',
+        () =>
+          browser.tabs.create({
+            windowId: placement.windowId,
+            index: placement.index,
+            openerTabId: placement.openerTabId,
+            url,
+            active: true,
+          }),
+        { tabId: placement.openerTabId, windowId: placement.windowId },
+      );
+    }),
+});
+
 const makeInjection = () => ({
   open: openPalette,
   openActive: () =>
@@ -311,6 +359,7 @@ export const makeLiveLayer = () => {
     Layer.succeed(ChromeStorage, storage),
     Layer.succeed(ChromeCommands, commands),
     Layer.succeed(ChromeTabs, makeTabs(storage, commands)),
+    Layer.succeed(WorkbenchNavigation, makeWorkbenchNavigation()),
     Layer.succeed(PaletteInjection, makeInjection()),
   );
 };

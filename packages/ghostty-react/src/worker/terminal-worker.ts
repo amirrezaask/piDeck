@@ -80,6 +80,9 @@ function diagnostics(entry: RuntimeEntry): TerminalWorkerDiagnostics {
   };
 }
 
+// Publish the parse fence before building/transferring a render update. The
+// receiver may apply that model immediately; ACK receipt must precede it, and
+// projection cost or exhausted render slots must not delay transport credit.
 function parsed(command: TerminalWorkerCommand, entry: RuntimeEntry): void {
   post({ ...envelope(command), type: "parsed", diagnostics: diagnostics(entry) });
 }
@@ -275,14 +278,14 @@ function process(command: TerminalWorkerCommand, entry: RuntimeEntry): void {
   switch (command.type) {
     case "writeBytes":
       entry.diagnostics.writes += 1; entry.diagnostics.bytesParsed += command.data.byteLength;
-      core.write(command.data); requestPresentation(command, entry); parsed(command, entry); return;
+      core.write(command.data); parsed(command, entry); requestPresentation(command, entry); return;
     case "writeReplayBytes":
       entry.diagnostics.writes += 1;
       entry.diagnostics.bytesParsed += command.chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-      core.writeReplay(command.chunks); requestPresentation(command, entry); parsed(command, entry); return;
+      core.writeReplay(command.chunks); parsed(command, entry); requestPresentation(command, entry); return;
     case "resetAndWriteBytes":
       entry.diagnostics.writes += 1; entry.diagnostics.bytesParsed += command.data.byteLength;
-      core.resetAndWrite(command.data); requestPresentation(command, entry, true); parsed(command, entry); return;
+      core.resetAndWrite(command.data); parsed(command, entry); requestPresentation(command, entry, true); return;
     case "restoreSnapshot":
       try {
         cancelPendingUpdate(command.terminalId)
@@ -380,7 +383,7 @@ globalThis.addEventListener("message", (message: MessageEvent<unknown>) => {
   if (!entry || entry.generation !== command.generation) return;
   try {
     process(command, entry);
-    post({ ...envelope(command), type: "completed" });
+    post({ ...envelope(command), type: "completed", diagnostics: diagnostics(entry) });
   } catch (error) {
     post({
       ...envelope(command), type: "recoverableError",

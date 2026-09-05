@@ -5,7 +5,9 @@ import { appendFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs"
 import { resolve } from "node:path"
 import { expect } from "@playwright/test"
 import { Schema } from "effect"
+import { budgetCeiling } from "./slo-policy.mjs"
 import type { ShellDriver } from "../shell/driver.js"
+import { serverArtifactPath } from "../shell/server-artifact.js"
 
 export type BenchResult = {
   name: string
@@ -19,6 +21,8 @@ export type BenchContext = {
   readonly commit: string
   readonly ghosttyRevision: string
   readonly releaseArtifactSha256: string
+  readonly serverProfile: "release"
+  readonly serverArtifactSha256: string
   readonly browser: string
   readonly renderer: string
   readonly runtime: string
@@ -47,17 +51,14 @@ export function coefficientOfVariation(values: readonly number[]): number {
   if (values.length === 0) return 0
   const mean = values.reduce((total, value) => total + value, 0) / values.length
   if (mean === 0) return 0
-  const variance = values.reduce(
-    (total, value) => total + (value - mean) ** 2,
-    0,
-  ) / values.length
+  const variance = values.reduce((total, value) => total + (value - mean) ** 2, 0) / values.length
   return Math.sqrt(variance) / mean
 }
 
 function releaseArtifactSha256(): string {
   const assets = resolve(process.cwd(), "apps/web/dist/assets")
   const names = readdirSync(assets)
-    .filter(name => name.startsWith("terminal-worker-") || name.startsWith("ghostty-vt-"))
+    .filter((name) => name.startsWith("terminal-worker-") || name.startsWith("ghostty-vt-"))
     .sort()
   const hash = createHash("sha256")
   for (const name of names) {
@@ -91,6 +92,10 @@ export async function benchContext(page: ShellDriver): Promise<BenchContext> {
       "utf8",
     ).trim(),
     releaseArtifactSha256: releaseArtifactSha256(),
+    serverProfile: "release",
+    serverArtifactSha256: createHash("sha256")
+      .update(readFileSync(serverArtifactPath("release")))
+      .digest("hex"),
     browser,
     renderer: terminal.renderer,
     runtime: terminal.runtime,
@@ -133,6 +138,9 @@ export async function runBench(opts: RunBenchOptions): Promise<BenchResult> {
 const sloRegistryPath = resolve(process.cwd(), "tests/bench/slos.json")
 const SloObjective = Schema.Struct({
   metric: Schema.String,
+  status: Schema.Literal("enforced", "specified"),
+  frameAllowance: Schema.optional(Schema.Number),
+  processingAllowanceMs: Schema.optional(Schema.Number),
   unit: Schema.Literal("ms"),
   percentile: Schema.Literal("median", "p95", "p99", "max"),
   ceiling: Schema.Number,
@@ -143,38 +151,50 @@ const SloObjective = Schema.Struct({
   iterations: Schema.Number,
   owner: Schema.String,
 })
-const sloRegistry = Schema.decodeUnknownSync(Schema.Struct({
-  version: Schema.Literal(1),
-  profile: Schema.Struct({
-    id: Schema.String,
-    hardware: Schema.String,
-    browser: Schema.String,
-    network: Schema.String,
+const sloRegistry = Schema.decodeUnknownSync(
+  Schema.Struct({
+    version: Schema.Literal(2),
+    profile: Schema.Struct({
+      id: Schema.String,
+      hardware: Schema.String,
+      browser: Schema.String,
+      network: Schema.String,
+    }),
+    objectives: Schema.Array(SloObjective),
+    zeroTolerance: Schema.Array(Schema.String),
   }),
-  objectives: Schema.Array(SloObjective),
-  zeroTolerance: Schema.Array(Schema.String),
-}))(JSON.parse(readFileSync(sloRegistryPath, "utf8")))
+)(JSON.parse(readFileSync(sloRegistryPath, "utf8")))
 
-export function assertBudget(result: BenchResult): void {
-  const observations = sloRegistry.objectives.flatMap(objective => {
+export function assertBudget(result: BenchResult, refreshHz?: number): void {
+  const observations = sloRegistry.objectives.flatMap((objective) => {
     if (objective.metric !== result.name || objective.percentile === "max") return []
-    const observed = objective.percentile === "median"
-      ? result.median
-      : objective.percentile === "p95"
-        ? result.p95
-        : result.p99
-    return [{ objective, observed, passed: observed <= objective.ceiling }]
+    const observed =
+      objective.percentile === "median"
+        ? result.median
+        : objective.percentile === "p95"
+          ? result.p95
+          : result.p99
+    expect(result.samples.length, `${result.name}: insufficient samples`).toBeGreaterThanOrEqual(
+      objective.iterations,
+    )
+    expect(objective.status, `${result.name}: objective is not yet enforced`).toBe("enforced")
+    if (objective.frameAllowance !== undefined)
+      expect(refreshHz, `${result.name}: explicit refresh profile required`).toBeDefined()
+    const selectedHz = refreshHz ?? 60
+    const ceiling = budgetCeiling(objective, selectedHz)
+    return [{ objective, observed, ceiling, refreshHz: selectedHz, passed: observed <= ceiling }]
   })
+  expect(observations.length, `No SLO registered for ${result.name}`).toBeGreaterThan(0)
   const reportPath = process.env.YAADE_BENCH_REPORT
   if (reportPath) {
     mkdirSync(resolve(reportPath, ".."), { recursive: true })
     appendFileSync(reportPath, `${JSON.stringify({ result, observations })}\n`)
   }
-  for (const { objective, observed } of observations) {
+  for (const { objective, observed, ceiling, refreshHz } of observations) {
     expect(
       observed,
-      `${result.name} ${objective.percentile} ${observed}ms > ${objective.ceiling}ms (${sloRegistry.profile.id})`,
-    ).toBeLessThanOrEqual(objective.ceiling)
+      `${result.name} ${objective.percentile} ${observed}ms > ${ceiling}ms (${sloRegistry.profile.id}, ${refreshHz} Hz)`,
+    ).toBeLessThanOrEqual(ceiling)
   }
 }
 
@@ -183,6 +203,6 @@ export function logBenchResult(result: BenchResult): void {
     `[bench] ${result.name} median=${result.median.toFixed(1)}ms ` +
       `p95=${result.p95.toFixed(1)}ms p99=${result.p99.toFixed(1)}ms ` +
       `cv=${coefficientOfVariation(result.samples).toFixed(3)} ` +
-      `samples=${JSON.stringify(result.samples.map(sample => Number(sample.toFixed(1))))}`,
+      `samples=${JSON.stringify(result.samples.map((sample) => Number(sample.toFixed(1))))}`,
   )
 }

@@ -108,6 +108,7 @@ export type YaadeTestAPI = {
     width: number
     height: number
     nonBackgroundPixels: number
+    background: { r: number; g: number; b: number }
   } | null>
   getTerminalCursor(tabId?: string): { x: number; y: number; hidden: boolean } | null
   getTerminalViewportY(tabId?: string): number | null

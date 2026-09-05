@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { budgetCeiling, validateRefreshProfile } from "../tests/bench/slo-policy.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const taxonomy = JSON.parse(readFileSync(resolve(root, "tests/diagnostics/taxonomy.json"), "utf8"));
@@ -22,13 +23,44 @@ for (const field of taxonomy.fields) {
   for (const prohibited of taxonomy.prohibited)
     if (lower.includes(prohibited)) throw new Error(`sensitive diagnostic field: ${field.name}`);
 }
-if (slos.version !== 1 || !Array.isArray(slos.objectives) || slos.objectives.length === 0)
-  throw new Error("SLO registry v1 is required");
+if (slos.version !== 2 || !Array.isArray(slos.objectives) || slos.objectives.length === 0)
+  throw new Error("SLO registry v2 is required");
+for (const hz of slos.profile.refreshRates)
+  validateRefreshProfile(hz, hz, slos.profile.refreshToleranceFraction);
+const workloadIds = new Set(slos.workloads.map((workload) => workload.id));
+if (workloadIds.size !== slos.workloads.length) throw new Error("Duplicate workload ID");
+for (const workload of slos.workloads) {
+  if (
+    ![1, 6].includes(workload.panes) ||
+    !Number.isInteger(workload.bytesPerSecondPerPane) ||
+    workload.bytesPerSecondPerPane < 0 ||
+    !Number.isInteger(workload.maxBurstBytes) ||
+    workload.maxBurstBytes < 0 ||
+    workload.maxBurstBytes > 65536 ||
+    !(workload.maximumDurationSeconds > 0) ||
+    workload.minimumRateFraction < 0 ||
+    workload.minimumRateFraction > 1
+  )
+    throw new Error(`Invalid workload: ${workload.id}`);
+}
 const objectiveKeys = new Set();
 for (const objective of slos.objectives) {
   const key = `${objective.metric}:${objective.percentile}:${slos.profile.id}`;
   if (objectiveKeys.has(key)) throw new Error(`duplicate SLO: ${key}`);
   objectiveKeys.add(key);
+  if (!["enforced", "specified"].includes(objective.status))
+    throw new Error(`Missing objective status: ${key}`);
+  if (objective.frameAllowance !== undefined || objective.processingAllowanceMs !== undefined) {
+    if (budgetCeiling(objective, slos.profile.defaultRefreshHz) !== objective.ceiling)
+      throw new Error(`Reference ceiling disagrees with frame formula: ${key}`);
+    if (
+      !workloadIds.has(objective.corpus) ||
+      objective.iterations < 100 ||
+      objective.startFence !== "keydown-captured" ||
+      objective.endFence !== "next-raf-after-matching-model-submission"
+    )
+      throw new Error(`Invalid per-key proxy contract: ${key}`);
+  }
   if (objective.unit !== "ms" || !(objective.ceiling > 0))
     throw new Error(`invalid SLO unit/ceiling: ${key}`);
   if (

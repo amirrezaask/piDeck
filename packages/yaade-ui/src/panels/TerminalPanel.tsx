@@ -613,8 +613,15 @@ export function TerminalPanel({
           const pipelineToken = frameScheduler.received(data.byteLength)
           const parsedAndAcknowledge = () => {
             frameScheduler.parsed(pipelineToken)
-            updateSchedulerDiagnostics()
             acknowledgeConsumed?.()
+            // ACK and queue gauges must not sort the timing ring on every
+            // transport chunk. Histograms update on presentation instead.
+            const panel = containerRef.current?.closest<HTMLElement>("[data-yaade-terminal-panel]")
+            if (panel) {
+              const counters = frameScheduler.counters()
+              panel.dataset.yaadeTerminalPipelinePendingBytes = String(counters.pendingBytes)
+              panel.dataset.yaadeTerminalPipelineMaxPendingBytes = String(counters.maxPendingBytes)
+            }
           }
           if (replay && replayTruncated) {
             // A reconnect gap means the ring starts after the current parser
@@ -802,6 +809,29 @@ export function TerminalPanel({
       onExitRef.current?.(tabId, code)
     })
 
+    const requestSnapshotRecovery = () => {
+      const id = session?.ptyId
+      if (!id || !surface || !outputWriter) return
+      outputWriter.suspend()
+      frameScheduler.resetGeneration()
+      surface.resetAndWrite("")
+      void attachToNewSurface(id).then(attached => {
+        if (!attached || cancelled || !outputWriter) return
+        applyAttachReplay(
+          attached,
+          tabId,
+          onOutputRef.current,
+          outputWriter,
+          !readOnly && attached.replayNeedsQueryResponses === true,
+        )
+      }).catch(error => {
+        if (cancelled) return
+        setTerminalError(error instanceof Error ? error.message : String(error))
+        setDisplayStatus("failed")
+        onFailedRef.current?.()
+      })
+    }
+
     const setup = async () => {
       try {
         surface = await GhosttyTerminalSurface.create(surfaceMount, {
@@ -841,6 +871,7 @@ export function TerminalPanel({
             return false
           },
           onLinkActivate: handleLink,
+          onSubmitted: () => frameScheduler.submitted(),
           onPresented: sample => {
             frameScheduler.presented(sample)
             updateSchedulerDiagnostics()
@@ -853,23 +884,7 @@ export function TerminalPanel({
               waiter.resolve()
             }
           },
-          onRuntimeRecoveryRequired: () => {
-            const id = session?.ptyId
-            if (!id || !surface || !outputWriter) return
-            outputWriter.discardPending()
-            frameScheduler.resetGeneration()
-            surface.resetAndWrite("")
-            void attachToNewSurface(id).then(attached => {
-              if (!attached || cancelled || !outputWriter) return
-              applyAttachReplay(
-                attached,
-                tabId,
-                onOutputRef.current,
-                outputWriter,
-                !readOnly && attached.replayNeedsQueryResponses === true,
-              )
-            })
-          },
+          onRuntimeRecoveryRequired: requestSnapshotRecovery,
           onTitleChange: title => {
             onTitleChangeRef.current?.(
               tabId,
@@ -939,9 +954,9 @@ export function TerminalPanel({
           // the same quantum keeps forced-main fallback tasks finite.
           maxBytesPerFlush: TERMINAL_SCHEDULER_BUDGETS.workerSliceBytes,
           // The server allows at most 8 MiB of unacknowledged output per PTY.
-          // Keep the local queue above that ceiling so server-side resync wins
-          // before the writer's last-resort shedding path can drop a frame.
+          // Local overload also requests a snapshot; never parse a byte gap.
           maxPendingBytes: TERMINAL_SCHEDULER_BUDGETS.livePendingBytes,
+          onOverflow: requestSnapshotRecovery,
           onPosted: bytes => frameScheduler.posted(bytes),
           write: (data, onParsed) => {
             surface?.write(data, onParsed)

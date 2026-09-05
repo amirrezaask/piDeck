@@ -84,15 +84,23 @@ export class TerminalColdRowProvider {
   private cacheBytes = 0;
   private requestGeneration = 0;
   private readonly controllers = new Set<AbortController>();
+  private readonly pendingPages = new Map<string, Promise<TerminalColdRowPage>>();
+  private disposed = false;
+  private searchKey = "";
+  private searchGeneration = 0;
+  private readonly searchControllers = new Set<AbortController>();
+  private static readonly maximumRequests = 16;
 
   constructor(options: TerminalColdRowProviderOptions) {
     if (!options.terminalEpoch) throw new Error("terminal epoch is required");
     this.source = options.source;
     this.terminalEpoch = options.terminalEpoch;
-    this.maximumPages = Math.max(1, Math.min(32, options.maximumPages ?? 8));
-    this.maximumBytes = Math.max(
+    this.maximumPages = boundedInteger(options.maximumPages ?? 8, 1, 32, "maximum pages");
+    this.maximumBytes = boundedInteger(
+      options.maximumBytes ?? 2 * 1024 * 1024,
       64 * 1024,
-      Math.min(16 * 1024 * 1024, options.maximumBytes ?? 2 * 1024 * 1024),
+      16 * 1024 * 1024,
+      "maximum bytes",
     );
   }
 
@@ -102,6 +110,8 @@ export class TerminalColdRowProvider {
       bytes: this.cacheBytes,
       maximumPages: this.maximumPages,
       maximumBytes: this.maximumBytes,
+      requests: this.controllers.size,
+      maximumRequests: TerminalColdRowProvider.maximumRequests,
     };
   }
 
@@ -121,6 +131,7 @@ export class TerminalColdRowProvider {
       readonly byteLimit?: number;
     } = {},
   ): Promise<TerminalColdRowPage> {
+    this.assertActive();
     const cursor = options.cursor ?? null;
     const direction = options.direction ?? "older";
     const rowLimit = boundedInteger(options.rowLimit ?? 256, 1, 512, "row limit");
@@ -132,35 +143,46 @@ export class TerminalColdRowProvider {
       this.pages.set(key, cached);
       return cached.page;
     }
+    const pending = this.pendingPages.get(key);
+    if (pending) return pending;
     const generation = this.requestGeneration;
-    const controller = new AbortController();
-    this.controllers.add(controller);
-    try {
-      const page = await this.source.readRows({
-        terminalEpoch: this.terminalEpoch,
-        indexGeneration: this.indexGeneration,
-        cursor,
-        direction,
-        rowLimit,
-        byteLimit,
-        signal: controller.signal,
-      });
-      this.acceptVersion(page.terminalEpoch, page.indexGeneration, generation);
-      validateRows(page.rows, rowLimit, byteLimit);
-      const bytes = page.rows.reduce(
-        (total, row) => total + new TextEncoder().encode(row.text).byteLength + 96,
-        0,
-      );
-      if (bytes <= this.maximumBytes) {
-        this.remember({
-          key: this.rowPageKey(cursor, direction, rowLimit, byteLimit),
-          page,
-          bytes,
+    const controller = this.beginRequest();
+    const request = (async () => {
+      try {
+        const page = await this.source.readRows({
+          terminalEpoch: this.terminalEpoch,
+          indexGeneration: this.indexGeneration,
+          cursor,
+          direction,
+          rowLimit,
+          byteLimit,
+          signal: controller.signal,
         });
+        validateRows(page.rows, rowLimit, byteLimit);
+        this.acceptVersion(page.terminalEpoch, page.indexGeneration, generation);
+        // Budget retained JS strings too, including stable IDs and page metadata.
+        const bytes = page.rows.reduce(
+          (total, row) =>
+            total + 2 * (row.text.length + row.rowId.length + row.logicalRowId.length) + 96,
+          2 * JSON.stringify({ ...page, rows: [] }).length,
+        );
+        if (bytes <= this.maximumBytes) {
+          this.remember({
+            key: this.rowPageKey(cursor, direction, rowLimit, byteLimit),
+            page,
+            bytes,
+          });
+        }
+        return page;
+      } finally {
+        this.controllers.delete(controller);
       }
-      return page;
+    })();
+    this.pendingPages.set(key, request);
+    try {
+      return await request;
     } finally {
-      this.controllers.delete(controller);
+      if (this.pendingPages.get(key) === request) this.pendingPages.delete(key);
     }
   }
 
@@ -171,12 +193,24 @@ export class TerminalColdRowProvider {
     readonly direction?: "previous" | "next";
     readonly resultLimit?: number;
   }): Promise<TerminalColdSearchPage> {
+    this.assertActive();
     if (options.query.length === 0 || new TextEncoder().encode(options.query).byteLength > 4096)
       throw new Error("search query must contain 1..=4096 bytes");
     const resultLimit = boundedInteger(options.resultLimit ?? 100, 1, 500, "result limit");
+    const key = `${options.caseSensitive ?? false}\u0000${options.query}`;
+    if (key !== this.searchKey) {
+      this.searchKey = key;
+      this.searchGeneration += 1;
+      for (const controller of this.searchControllers) {
+        controller.abort();
+        this.controllers.delete(controller);
+      }
+      this.searchControllers.clear();
+    }
+    const searchGeneration = this.searchGeneration;
     const generation = this.requestGeneration;
-    const controller = new AbortController();
-    this.controllers.add(controller);
+    const controller = this.beginRequest();
+    this.searchControllers.add(controller);
     try {
       const result = await this.source.search({
         terminalEpoch: this.terminalEpoch,
@@ -188,15 +222,23 @@ export class TerminalColdRowProvider {
         resultLimit,
         signal: controller.signal,
       });
-      this.acceptVersion(result.terminalEpoch, result.indexGeneration, generation);
+      if (searchGeneration !== this.searchGeneration)
+        throw new DOMException("stale terminal history search", "AbortError");
       if (result.hits.length > resultLimit)
         throw new Error("search result exceeds requested bound");
       for (const hit of result.hits)
-        if (hit.startColumn < 0 || hit.endColumn <= hit.startColumn)
+        if (
+          !Number.isSafeInteger(hit.startColumn) ||
+          !Number.isSafeInteger(hit.endColumn) ||
+          hit.startColumn < 0 ||
+          hit.endColumn <= hit.startColumn
+        )
           throw new Error("search result contains an invalid cell range");
+      this.acceptVersion(result.terminalEpoch, result.indexGeneration, generation);
       return result;
     } finally {
       this.controllers.delete(controller);
+      this.searchControllers.delete(controller);
     }
   }
 
@@ -204,7 +246,21 @@ export class TerminalColdRowProvider {
     this.invalidate(false);
   }
   dispose(): void {
+    this.disposed = true;
     this.invalidate();
+  }
+
+  private assertActive(): void {
+    if (this.disposed) throw new Error("Terminal history provider is disposed");
+  }
+
+  private beginRequest(): AbortController {
+    this.assertActive();
+    if (this.controllers.size >= TerminalColdRowProvider.maximumRequests)
+      throw new Error("Terminal history request queue is full");
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    return controller;
   }
 
   private rowPageKey(
@@ -221,13 +277,15 @@ export class TerminalColdRowProvider {
       throw new DOMException("stale terminal history request", "AbortError");
     if (epoch !== this.terminalEpoch) throw new Error("terminal history epoch changed");
     if (this.indexGeneration !== null && this.indexGeneration !== indexGeneration) {
-      this.pages.clear();
-      this.cacheBytes = 0;
+      // A newer index replaces the whole read view. Fence concurrent responses
+      // so an old page cannot later roll the provider back to its old index.
+      this.invalidate();
     }
     this.indexGeneration = indexGeneration;
   }
 
   private remember(entry: CachedPage): void {
+    this.cacheBytes -= this.pages.get(entry.key)?.bytes ?? 0;
     this.pages.set(entry.key, entry);
     this.cacheBytes += entry.bytes;
     while (this.pages.size > this.maximumPages || this.cacheBytes > this.maximumBytes) {
@@ -242,6 +300,8 @@ export class TerminalColdRowProvider {
     this.requestGeneration += 1;
     for (const controller of this.controllers) controller.abort();
     this.controllers.clear();
+    this.searchControllers.clear();
+    this.pendingPages.clear();
     if (!clear) return;
     this.pages.clear();
     this.cacheBytes = 0;

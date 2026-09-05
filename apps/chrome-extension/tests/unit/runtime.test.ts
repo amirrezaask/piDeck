@@ -53,6 +53,9 @@ describe('runtime schemas and error mapping', () => {
       Effect.runPromise(decodeRequest({ type: 'keyboard-shortcut/configure' })),
     ).resolves.toMatchObject({ type: 'keyboard-shortcut/configure' });
     await expect(
+      Effect.runPromise(decodeRequest({ type: 'workbench/open', surface: 'terminal' })),
+    ).resolves.toMatchObject({ type: 'workbench/open', surface: 'terminal' });
+    await expect(
       Effect.runPromise(
         decodeResponse({
           ok: true,

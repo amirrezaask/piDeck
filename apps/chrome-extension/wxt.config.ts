@@ -10,8 +10,8 @@ export default defineConfig({
     plugins: [tailwindcss()],
   }),
   manifest: {
-    name: 'Switcher',
-    description: 'A fast keyboard-first command palette for open Chrome tabs.',
+    name: 'ChromePlus',
+    description: 'Open terminal and agent workspaces from Chrome.',
     permissions: ['tabs', 'activeTab', 'scripting', 'storage'],
     ...(e2eBuild ? { host_permissions: ['http://*/*', 'https://*/*'] } : {}),
     action: { default_title: 'Open Switcher' },
@@ -19,6 +19,14 @@ export default defineConfig({
       'toggle-switcher': {
         description: 'Open Switcher',
         suggested_key: { default: 'Ctrl+Shift+K', mac: 'Command+Shift+K' },
+      },
+      'open-terminal': {
+        description: 'Open terminal workspace',
+        suggested_key: { default: 'Ctrl+Shift+J', mac: 'Command+Shift+J' },
+      },
+      'open-agent': {
+        description: 'Open agent workspace',
+        suggested_key: { default: 'Ctrl+Shift+A', mac: 'Command+Shift+A' },
       },
     },
   },

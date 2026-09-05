@@ -127,6 +127,8 @@ test("requires payload-free worker capacity diagnostics", () => {
     schedulerInFlight: 0,
   }
   assert.equal(validateTerminalWorkerEvent({ ...envelope, type: "parsed", diagnostics }), true)
+  assert.equal(validateTerminalWorkerEvent({ ...envelope, type: "completed", diagnostics }), true)
+  assert.equal(validateTerminalWorkerEvent({ ...envelope, type: "completed", diagnostics: {} }), false)
   assert.equal(validateTerminalWorkerEvent({ ...envelope, type: "snapshotRestored" }), true)
   assert.equal(validateTerminalWorkerEvent({ ...envelope, type: "snapshotRejected", message: "bad crc" }), true)
   const { renderBytesUsed: _, ...staleDiagnostics } = diagnostics

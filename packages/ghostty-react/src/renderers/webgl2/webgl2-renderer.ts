@@ -166,6 +166,7 @@ export class WebGl2TerminalRenderer implements TerminalRenderer {
   private viewport: TerminalRenderViewport;
   private font: TerminalRenderFont;
   private sceneGeneration = 0;
+  private clearBackground = 0;
   private hoverKey = "";
   private disposed = false;
   private debugValidation = false;
@@ -253,7 +254,8 @@ export class WebGl2TerminalRenderer implements TerminalRenderer {
 
   clear(background: GhosttyColor): void {
     if (this.disposed) return;
-    const color = colorValues(packedColor(background));
+    this.clearBackground = packedColor(background);
+    const color = colorValues(this.clearBackground);
     this.gl.clearColor(color[0], color[1], color[2], 1);
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
   }
@@ -480,7 +482,7 @@ export class WebGl2TerminalRenderer implements TerminalRenderer {
       0,
     );
     gl.viewport(0, 0, width, height);
-    const background = colorValues(this.rows.length > 0 ? 0 : 0);
+    const background = colorValues(this.clearBackground);
     gl.clearColor(background[0], background[1], background[2], 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     this.drawRects(this.backgroundBuffer, this.retainedScene.backgroundCount, false);

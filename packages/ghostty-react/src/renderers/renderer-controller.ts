@@ -44,6 +44,9 @@ export class RendererController {
   private fallbackReasonValue: string | null = null;
   private recovery: Promise<void> | null = null;
   private recoveryToken = 0;
+  private webglRecoveryAttempts = 0;
+  private canvasRecoveryAttempts = 0;
+  private forcedFallback = false;
 
   constructor(
     initial: ControlledTerminalRenderer,
@@ -124,19 +127,23 @@ export class RendererController {
     model: GhosttyViewportModel,
     update: GhosttyRenderUpdate | null,
     overlays: TerminalRenderOverlays,
-  ): void {
-    if (this.stateValue !== "ready" && this.stateValue !== "fallback") return;
-    this.run("render", (renderer) => renderer.render(model, update, overlays));
+  ): boolean {
+    if (this.stateValue !== "ready" && this.stateValue !== "fallback") return false;
+    return this.run("render", (renderer) => renderer.render(model, update, overlays));
   }
 
   requestRecovery(reason: string, error?: Error): void {
-    if (this.stateValue === "disposed" || this.recovery !== null) return;
+    if (this.stateValue === "disposed" || this.stateValue === "unavailable" || this.recovery !== null) return;
     this.lastErrorClassValue = error?.name ?? null;
     this.fallbackReasonValue = reason;
     this.stateValue = "recovering";
     this.recoveryCountValue += 1;
     const token = ++this.recoveryToken;
-    const preferred = this.active?.renderer.kind === "webgl2" ? "webgl2" : "canvas2d";
+    // Construction success does not prove that the offending content renders.
+    // Bound retries for this surface lifetime, including failures across frames.
+    const webgl = this.active?.renderer.kind === "webgl2";
+    const preferred = webgl && this.webglRecoveryAttempts === 0 ? "webgl2" : "canvas2d";
+    if (webgl && preferred === "canvas2d") this.forcedFallback = true;
     this.recovery = this.recover(token, preferred).finally(() => {
       if (token === this.recoveryToken) this.recovery = null;
     });
@@ -154,13 +161,15 @@ export class RendererController {
     }
   }
 
-  private run(operation: string, apply: (renderer: TerminalRenderer) => void): void {
+  private run(operation: string, apply: (renderer: TerminalRenderer) => void): boolean {
     const active = this.active;
-    if (active === null || this.stateValue === "disposed") return;
+    if (active === null || (this.stateValue !== "ready" && this.stateValue !== "fallback")) return false;
     try {
       apply(active.renderer);
+      return true;
     } catch (error) {
       this.handleFailure(operation, error);
+      return false;
     }
   }
 
@@ -176,6 +185,14 @@ export class RendererController {
     const attempts: readonly ("webgl2" | "canvas2d")[] =
       preferred === "webgl2" ? ["webgl2", "canvas2d"] : ["canvas2d"];
     for (const backend of attempts) {
+      if (backend === "webgl2") {
+        if (this.webglRecoveryAttempts >= 1) continue;
+        this.webglRecoveryAttempts += 1;
+      } else {
+        if (this.canvasRecoveryAttempts >= 1) continue;
+        this.canvasRecoveryAttempts += 1;
+        if (this.active?.renderer.kind === "webgl2") this.forcedFallback = true;
+      }
       try {
         const next = await this.create(backend);
         if (token !== this.recoveryToken || this.stateValue === "disposed") {
@@ -186,8 +203,8 @@ export class RendererController {
         this.removeContextListeners(previous);
         this.active = next;
         this.generationValue += 1;
-        this.stateValue = backend === preferred ? "ready" : "fallback";
-        this.fallbackReasonValue = backend === preferred ? null : this.fallbackReasonValue;
+        this.stateValue = this.forcedFallback ? "fallback" : "ready";
+        if (!this.forcedFallback) this.fallbackReasonValue = null;
         this.installContextListeners(next);
         this.onActivate(next, previous);
         previous?.renderer.dispose();

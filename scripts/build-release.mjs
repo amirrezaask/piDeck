@@ -27,7 +27,7 @@ function run(command, args) {
 }
 
 run(vpBin, ["run", "@pideck/client-web#build"])
-run("pnpm", ["build:agents-switcher"])
+run("pnpm", ["build:extension"])
 run("cargo", [
   "build",
   "--release",

@@ -89,7 +89,7 @@ export type TerminalRuntimeState = {
 
 export type TerminalWorkerEvent = Envelope & (
   | { readonly type: "ready" }
-  | { readonly type: "completed" }
+  | { readonly type: "completed"; readonly diagnostics?: TerminalWorkerDiagnostics }
   | { readonly type: "packedUpdate"; readonly slotId: number; readonly leaseToken: number; readonly update: GhosttyRenderUpdate; readonly state: TerminalRuntimeState; readonly diagnostics: TerminalWorkerDiagnostics }
   | { readonly type: "encodedInput"; readonly data: string }
   | { readonly type: "parsed"; readonly diagnostics: TerminalWorkerDiagnostics }
@@ -177,7 +177,8 @@ function validateState(value: unknown): value is TerminalRuntimeState {
 export function validateTerminalWorkerEvent(value: unknown): value is TerminalWorkerEvent {
   if (!isRecord(value) || !validEnvelope(value) || typeof value.type !== "string") return false;
   switch (value.type) {
-    case "ready": case "completed": case "snapshotRestored": case "disposed": return true;
+    case "ready": case "snapshotRestored": case "disposed": return true;
+    case "completed": return value.diagnostics === undefined || validateDiagnostics(value.diagnostics);
     case "parsed": return validateDiagnostics(value.diagnostics);
     case "encodedInput": return typeof value.data === "string";
     case "packedUpdate": return Number.isSafeInteger(value.slotId) && Number(value.slotId) >= 0 &&

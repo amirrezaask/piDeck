@@ -4,7 +4,12 @@ import { browser } from 'wxt/browser';
 import { decodeRequest } from '/src/protocol/decode';
 import type { RuntimeResponse } from '/src/protocol/responses';
 import { handleRequest } from '/src/runtime/background-runtime';
-import { ChromeCommands, PaletteInjection } from '/src/services/chrome-services';
+import {
+  ChromeCommands,
+  PaletteInjection,
+  WorkbenchNavigation,
+} from '/src/services/chrome-services';
+import type { WorkbenchSurface } from '/src/runtime/workbench-navigation';
 import { makeLiveLayer } from '/src/services/live-layer';
 
 const invalidResponse: RuntimeResponse = {
@@ -25,6 +30,13 @@ export default defineBackground({
           yield* injection.openActive();
         }).pipe(Effect.catchAll(() => Effect.void)),
       );
+    const openSurface = (surface: WorkbenchSurface): Promise<void> =>
+      runtime.runPromise(
+        Effect.gen(function* () {
+          const workbench = yield* WorkbenchNavigation;
+          yield* workbench.openSurface(surface);
+        }).pipe(Effect.catchAll(() => Effect.void)),
+      );
 
     browser.runtime.onMessage.addListener((input: unknown, sender) =>
       runtime.runPromise(
@@ -39,6 +51,8 @@ export default defineBackground({
     });
     browser.commands.onCommand.addListener((command) => {
       if (command === 'toggle-switcher') void invoke();
+      else if (command === 'open-terminal') void openSurface('terminal');
+      else if (command === 'open-agent') void openSurface('agent');
     });
     browser.runtime.onInstalled.addListener(() => {
       void runtime.runPromise(

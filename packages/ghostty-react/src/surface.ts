@@ -1,5 +1,6 @@
 /// <reference path="./vite-env.d.ts" />
 
+import { NextRafObserver } from "./scheduler/next-raf-observer.js";
 import {
   collectWrappedTerminalLinkLine,
   matchTerminalUrls,
@@ -7,7 +8,7 @@ import {
 } from "./links.js";
 import {
   GhosttyViewportModel,
-  type GhosttyRenderUpdate,
+  type GhosttyColor,
   type GhosttyResponsePolicy,
   type GhosttyScrollbar,
   type GhosttySnapshot,
@@ -603,6 +604,7 @@ export interface GhosttyTerminalSurfaceOptions {
   readonly onTitleChange?: (title: string) => void;
   /** Presentation telemetry only; transport ACK must not depend on this callback. */
   readonly onPresented?: (sample: TerminalPresentationSample) => void;
+  readonly onSubmitted?: () => number | void;
   /** Renderer selection for tests/operators; auto prefers a validated WebGL2 context. */
   readonly renderer?: TerminalRendererPreference;
   /** Parser placement. Worker is default with automatic main-thread initialization fallback. */
@@ -632,10 +634,14 @@ export interface GhosttyTerminalLifecycleSnapshot {
   readonly rendererSubmission: TerminalRendererSubmissionDiagnostics | null;
   readonly rendererCpuMs: TerminalRendererCpuPercentiles;
   readonly attachCount: number;
+  readonly snapshotRestoreCount: number;
   readonly resizeCount: number;
   readonly geometryGeneration: number;
+  readonly lastAppliedModelFrame: number;
   readonly lastSubmittedModelFrame: number;
   readonly lastNextPaintObservedFrame: number;
+  /** Next-rAF observation is a presentation proxy, not physical display latency. */
+  readonly lastPresentation: TerminalPresentationSample | null;
   readonly compatibilitySnapshotBuilds: number;
   readonly decodedGraphemes: number;
   readonly workerDiagnostics: ReturnType<TerminalCoreRuntime["workerDiagnostics"]>;
@@ -680,6 +686,10 @@ function rendererCpuPercentiles(samples: readonly number[]): TerminalRendererCpu
 
 export class GhosttyTerminalSurface {
   readonly surfaceInstanceId = nextSurfaceInstanceId++;
+  private lastPresentation: TerminalPresentationSample | null = null;
+  private lastModelAppliedAt = 0;
+  private modelUpdatedSinceSubmit = false;
+  private readonly pendingModelDirtyRows = new Set<number>();
   canvas: HTMLCanvasElement;
   readonly input: HTMLTextAreaElement;
   readonly scrollbar: HTMLDivElement;
@@ -791,7 +801,9 @@ export class GhosttyTerminalSurface {
   private geometryGeneration = 0;
   private lastSubmittedModelFrame = 0;
   private lastNextPaintObservedFrame = 0;
-  private pendingPresentationFrame = 0;
+  private readonly presentationObserver = new NextRafObserver<Omit<TerminalPresentationSample, "nextPaintObservedAt">>(
+    (sample, timestamp) => this.publishPresentation(sample, timestamp),
+  );
   private readonly rendererCpuSamples: number[] = [];
   private lastRendererActivityAt = performance.now()
   private lastObservedWorkerBytes = 0
@@ -894,10 +906,13 @@ export class GhosttyTerminalSurface {
       rendererSubmission: renderer.submission,
       rendererCpuMs: rendererCpuPercentiles(this.rendererCpuSamples),
       attachCount: this.attachCount,
+      snapshotRestoreCount: this.snapshotRestoreCount,
       resizeCount: this.resizeCount,
       geometryGeneration: this.geometryGeneration,
+      lastAppliedModelFrame: this.viewportModel.currentFrameId,
       lastSubmittedModelFrame: this.lastSubmittedModelFrame,
       lastNextPaintObservedFrame: this.lastNextPaintObservedFrame,
+      lastPresentation: this.lastPresentation,
       compatibilitySnapshotBuilds: this.viewportModel.compatibilitySnapshotBuilds,
       decodedGraphemes: this.viewportModel.decodedGraphemes,
       workerDiagnostics: this.core.workerDiagnostics(),
@@ -1077,6 +1092,10 @@ export class GhosttyTerminalSurface {
     if (this.disposed) throw new Error("Terminal surface is disposed")
     for (const update of this.core.drainRenderUpdates()) this.core.releaseRenderUpdate(update)
     this.viewportModel.reset()
+    this.modelUpdatedSinceSubmit = false
+    this.pendingModelDirtyRows.clear()
+    this.presentationObserver.reset()
+    this.lastPresentation = null
     this.snapshot = null
     this.forceFullRender = true
     this.terminalStateDirty = true
@@ -1103,6 +1122,8 @@ export class GhosttyTerminalSurface {
 
   resetAndWrite(data: string | Uint8Array, onParsed?: ParsedCallback): void {
     if (this.disposed) return;
+    this.presentationObserver.reset();
+    this.lastPresentation = null;
     this.contentGeneration += 1;
     this.core.resetAndWrite(data, onParsed);
     if (this.core.kind === "main") this.afterTerminalWrite(true);
@@ -1113,6 +1134,9 @@ export class GhosttyTerminalSurface {
     // Worker updates have already passed hidden/DEC-2026 suppression and its
     // safety deadline. Do not suppress the authoritative catch-up a second time.
     this.afterTerminalWrite(false, true);
+    // Copy into the retained model and return the worker's bounded transfer
+    // slot now. A display frame must not hold parser/presentation-buffer credit.
+    this.applyRuntimeUpdates();
   }
 
   private afterTerminalWrite(forceFullRender = false, workerPrepared = false): void {
@@ -1492,6 +1516,7 @@ export class GhosttyTerminalSurface {
     readonly width: number;
     readonly height: number;
     readonly nonBackgroundPixels: number;
+    readonly background: GhosttyColor;
   } | null> {
     const pixels = await this.rendererController.capturePixels();
     if (pixels === null) return null;
@@ -1505,7 +1530,12 @@ export class GhosttyTerminalSurface {
         nonBackgroundPixels += 1;
       }
     }
-    return { width: pixels.width, height: pixels.height, nonBackgroundPixels };
+    return {
+      width: pixels.width,
+      height: pixels.height,
+      nonBackgroundPixels,
+      background: { r: red, g: green, b: blue },
+    };
   }
 
   getCellSize(): { width: number; height: number } {
@@ -1610,10 +1640,7 @@ export class GhosttyTerminalSurface {
     if (this.selectionScrollTimer !== null) window.clearInterval(this.selectionScrollTimer);
     if (this.touchHoldTimer !== null) window.clearTimeout(this.touchHoldTimer);
     if (this.frame !== 0) window.cancelAnimationFrame(this.frame);
-    if (this.pendingPresentationFrame !== 0) {
-      window.cancelAnimationFrame(this.pendingPresentationFrame);
-      this.pendingPresentationFrame = 0;
-    }
+    this.presentationObserver.reset();
     if (this.fitRetryFrame !== 0) window.cancelAnimationFrame(this.fitRetryFrame);
     if (this.cursorTimer !== null) window.clearTimeout(this.cursorTimer);
     if (this.synchronizedOutputTimer !== null) {
@@ -2496,6 +2523,25 @@ export class GhosttyTerminalSurface {
     });
   }
 
+  private applyRuntimeUpdates(): void {
+    const updates = this.core.drainRenderUpdates();
+    if (updates.length === 0) return;
+    try {
+      for (const update of updates) {
+        if (!this.viewportModel.apply(update))
+          throw new Error("Ghostty packed render update was rejected");
+        this.forceFullRender ||= update.full;
+        for (const row of this.viewportModel.dirtyRows) this.pendingModelDirtyRows.add(row);
+      }
+      this.snapshot = null;
+      this.terminalStateDirty = false;
+      this.modelUpdatedSinceSubmit = true;
+      this.lastModelAppliedAt = performance.now();
+    } finally {
+      for (const update of updates) this.core.releaseRenderUpdate(update);
+    }
+  }
+
   private renderFrame(drainRuntimeUpdates = true): void {
     if (this.disposed || !this.visible) return;
     if (this.frame !== 0) {
@@ -2504,27 +2550,9 @@ export class GhosttyTerminalSurface {
     }
     const runtimeUpdatePending =
       this.terminalStateDirty || this.viewportModel.currentFrameId === 0;
-    let modelUpdated = false;
-    let modelAppliedAt = performance.now();
-    let update: GhosttyRenderUpdate | null = null;
-    const consumedUpdates: GhosttyRenderUpdate[] = [];
-    if (drainRuntimeUpdates && runtimeUpdatePending) {
-      const updates = this.core.drainRenderUpdates();
-      if (updates.length === 0) return;
-      if (updates.length > 1) this.forceFullRender = true;
-      for (const next of updates) {
-        consumedUpdates.push(next);
-        if (!this.viewportModel.apply(next)) {
-          for (const consumed of consumedUpdates) this.core.releaseRenderUpdate(consumed);
-          throw new Error("Ghostty packed render update was rejected");
-        }
-        update = next;
-      }
-      this.snapshot = null;
-      this.terminalStateDirty = false;
-      modelUpdated = true;
-      modelAppliedAt = performance.now();
-    }
+    if (drainRuntimeUpdates && runtimeUpdatePending) this.applyRuntimeUpdates();
+    const modelUpdated = this.modelUpdatedSinceSubmit;
+    const modelAppliedAt = this.lastModelAppliedAt;
     if (this.viewportModel.currentFrameId === 0) return;
     // A cursor that is not blinking right now must be drawn, never caught in an
     // off phase left behind by a blink that has since been turned off.
@@ -2553,25 +2581,25 @@ export class GhosttyTerminalSurface {
     }
     this.refreshHoveredLink();
     const renderStartedAt = performance.now();
-    try {
-      this.rendererController.render(this.viewportModel, update, {
-        metrics: this.metrics,
-        font: { family: this.fontFamily, size: this.fontSize },
-        viewport: this.renderViewport,
-        forceFull: this.forceFullRender,
-        cursorOn: this.cursorOn,
-        previousCursorY: this.renderedCursorY,
-        focused: this.focused,
-        hoveredLinkRange: this.hoveredLink?.range ?? null,
-        dirtyRows: modelUpdated ? this.viewportModel.dirtyRows : NO_DIRTY_ROWS,
-        ...(this.theme.selectionBackground !== undefined
-          ? { selectionBackground: this.theme.selectionBackground }
-          : {}),
-      });
-    } finally {
-      for (const consumed of consumedUpdates) this.core.releaseRenderUpdate(consumed);
-    }
+    const submitted = this.rendererController.render(this.viewportModel, null, {
+      metrics: this.metrics,
+      font: { family: this.fontFamily, size: this.fontSize },
+      viewport: this.renderViewport,
+      forceFull: this.forceFullRender,
+      cursorOn: this.cursorOn,
+      previousCursorY: this.renderedCursorY,
+      focused: this.focused,
+      hoveredLinkRange: this.hoveredLink?.range ?? null,
+      dirtyRows: modelUpdated ? this.pendingModelDirtyRows : NO_DIRTY_ROWS,
+      ...(this.theme.selectionBackground !== undefined
+        ? { selectionBackground: this.theme.selectionBackground }
+        : {}),
+    });
+    if (!submitted) return;
+    this.modelUpdatedSinceSubmit = false;
+    this.pendingModelDirtyRows.clear();
     const submittedAt = performance.now();
+    const parsedBytesAtSubmission = this.options.onSubmitted?.();
     this.lastRendererActivityAt = submittedAt
     this.lastObservedWorkerBytes = this.core.workerDiagnostics().bytesParsed
     this.rendererCpuSamples.push(submittedAt - renderStartedAt);
@@ -2587,6 +2615,7 @@ export class GhosttyTerminalSurface {
       modelAppliedAt,
       renderStartedAt,
       submittedAt,
+      ...(typeof parsedBytesAtSubmission === "number" ? { parsedBytesAtSubmission } : {}),
     });
     this.positionInput();
     this.renderedCursorY =
@@ -2604,24 +2633,26 @@ export class GhosttyTerminalSurface {
   private observeNextPaint(
     sample: Omit<TerminalPresentationSample, "nextPaintObservedAt">,
   ): void {
-    if (this.pendingPresentationFrame !== 0) {
-      window.cancelAnimationFrame(this.pendingPresentationFrame);
-    }
-    this.pendingPresentationFrame = window.requestAnimationFrame(timestamp => {
-      this.pendingPresentationFrame = 0;
-      if (this.disposed) return;
-      this.lastNextPaintObservedFrame = Math.max(
-        this.lastNextPaintObservedFrame,
-        sample.modelFrameId,
-      );
-      this.mount.dataset.ghosttyTerminalLastSubmittedFrame = String(
-        this.lastSubmittedModelFrame,
-      );
-      this.mount.dataset.ghosttyTerminalLastPresentedFrame = String(
-        this.lastNextPaintObservedFrame,
-      );
-      this.options.onPresented?.({ ...sample, nextPaintObservedAt: timestamp });
-    });
+    this.presentationObserver.submit(sample);
+  }
+
+  private publishPresentation(
+    sample: Omit<TerminalPresentationSample, "nextPaintObservedAt">,
+    timestamp: number,
+  ): void {
+    if (this.disposed || sample.runtimeGeneration !== this.core.runtimeGeneration) return;
+    this.lastNextPaintObservedFrame = Math.max(
+      this.lastNextPaintObservedFrame,
+      sample.modelFrameId,
+    );
+    this.mount.dataset.ghosttyTerminalLastSubmittedFrame = String(
+      this.lastSubmittedModelFrame,
+    );
+    this.mount.dataset.ghosttyTerminalLastPresentedFrame = String(
+      this.lastNextPaintObservedFrame,
+    );
+    this.lastPresentation = { ...sample, nextPaintObservedAt: timestamp };
+    this.options.onPresented?.(this.lastPresentation);
   }
 
   private scheduleCursorBlink(): void {

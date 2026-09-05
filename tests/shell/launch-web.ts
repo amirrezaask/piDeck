@@ -1,4 +1,5 @@
-import { chromium } from "@playwright/test"
+import { chromium, test } from "@playwright/test"
+import { serverArtifactPath } from "./server-artifact.js"
 import { spawn, type ChildProcessByStdio } from "node:child_process"
 import type { Readable } from "node:stream"
 import fs from "node:fs"
@@ -9,12 +10,6 @@ import { wrapPlaywrightPage } from "./playwright-driver.js"
 import type { LaunchShellResult } from "./driver.js"
 
 const REPO_ROOT = path.resolve(__dirname, "../..")
-const HOST_SERVER_ENTRY = path.join(
-  REPO_ROOT,
-  process.platform === "win32"
-    ? "apps/server/target/debug/yaade.exe"
-    : "apps/server/target/debug/yaade",
-)
 
 export type LaunchWebOptions = {
   workspaceRel?: string
@@ -69,7 +64,7 @@ function isExpectedBrowserFailure(
   expectedHttpErrors: LaunchWebOptions["expectedHttpErrors"],
 ): boolean {
   const firstLine = failure.message.split("\n", 1)[0]?.replace(/^Error: /, "") ?? ""
-  if (EXPECTED_BROWSER_MESSAGES.some(pattern => pattern.test(firstLine))) return true
+  if (EXPECTED_BROWSER_MESSAGES.some((pattern) => pattern.test(firstLine))) return true
   if (
     failure.kind === "requestfailed" &&
     failure.navigationRelated === true &&
@@ -79,7 +74,7 @@ function isExpectedBrowserFailure(
   }
   const path = urlPathname(failure.url)
   if (!path) return false
-  return (expectedHttpErrors ?? []).some(expected => {
+  return (expectedHttpErrors ?? []).some((expected) => {
     if (expected.path !== path) return false
     if (failure.kind === "http") {
       return expected.method === failure.method && expected.status === failure.status
@@ -108,14 +103,18 @@ async function freePort(): Promise<number> {
       if (!address || !("port" in addressObject)) {
         return reject(new Error("no test port"))
       }
-      server.close(error => (error ? reject(error) : resolve(addressObject.port)))
+      server.close((error) => (error ? reject(error) : resolve(addressObject.port)))
     })
   })
 }
 
 type TestServerProcess = ChildProcessByStdio<null, Readable, Readable>
 
-async function waitForHttpOk(url: string, proc: TestServerProcess, logs: () => string): Promise<void> {
+async function waitForHttpOk(
+  url: string,
+  proc: TestServerProcess,
+  logs: () => string,
+): Promise<void> {
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
     if (proc.exitCode !== null) throw new Error(`process exited (${proc.exitCode})\n${logs()}`)
@@ -125,20 +124,23 @@ async function waitForHttpOk(url: string, proc: TestServerProcess, logs: () => s
     } catch {
       /* startup */
     }
-    await new Promise(resolve => setTimeout(resolve, 50))
+    await new Promise((resolve) => setTimeout(resolve, 50))
   }
   throw new Error(`timed out waiting for ${url}\n${logs()}`)
 }
 
 function attachLogs(proc: TestServerProcess): () => string {
   let logs = ""
-  proc.stdout.on("data", chunk => {
-    logs += chunk.toString()
-  })
-  proc.stderr.on("data", chunk => {
-    logs += chunk.toString()
-  })
-  return () => logs
+  let omitted = 0
+  const append = (chunk: Buffer) => {
+    const next = logs + chunk.toString()
+    const excess = Math.max(0, next.length - 64 * 1024)
+    omitted += excess
+    logs = next.slice(excess)
+  }
+  proc.stdout.on("data", append)
+  proc.stderr.on("data", append)
+  return () => `${omitted > 0 ? `[${omitted} earlier log characters omitted]\n` : ""}${logs}`
 }
 
 function signalProcessTree(proc: TestServerProcess, signal: NodeJS.Signals): void {
@@ -157,7 +159,7 @@ function signalProcessTree(proc: TestServerProcess, signal: NodeJS.Signals): voi
 async function killProc(proc: TestServerProcess): Promise<void> {
   if (proc.exitCode !== null) return
   signalProcessTree(proc, "SIGTERM")
-  await new Promise<void>(resolve => {
+  await new Promise<void>((resolve) => {
     const force = setTimeout(() => {
       if (proc.exitCode === null) signalProcessTree(proc, "SIGKILL")
     }, 1_000)
@@ -171,21 +173,31 @@ async function killProc(proc: TestServerProcess): Promise<void> {
 }
 
 export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchShellResult> {
+  const hostServerEntry = serverArtifactPath(
+    test.info().project.name === "bench" ? "release" : "debug",
+  )
   const port = await freePort()
   const ownsTemporaryRoot = options.userDataDir == null
-  const temporaryRoot = options.userDataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "yaade-web-e2e-"))
+  const temporaryRoot =
+    options.userDataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "yaade-web-e2e-"))
   const browserData = path.join(temporaryRoot, "browser")
   const serverData = path.join(temporaryRoot, "server")
   fs.mkdirSync(browserData, { recursive: true })
   fs.mkdirSync(serverData, { recursive: true })
-  const sourceWorkspace = path.resolve(REPO_ROOT, options.workspaceRel ?? "fixtures/sample-workspace")
+  const sourceWorkspace = path.resolve(
+    REPO_ROOT,
+    options.workspaceRel ?? "fixtures/sample-workspace",
+  )
   const isFixture = sourceWorkspace.startsWith(path.join(REPO_ROOT, "fixtures") + path.sep)
   const workspace = isFixture
     ? path.join(temporaryRoot, path.basename(sourceWorkspace))
     : sourceWorkspace
-  if (isFixture && !fs.existsSync(workspace)) fs.cpSync(sourceWorkspace, workspace, { recursive: true })
-  if (!fs.existsSync(HOST_SERVER_ENTRY)) {
-    throw new Error(`Rust host server missing at ${HOST_SERVER_ENTRY}; run vp run build:server`)
+  if (isFixture && !fs.existsSync(workspace))
+    fs.cpSync(sourceWorkspace, workspace, { recursive: true })
+  if (!fs.existsSync(hostServerEntry)) {
+    throw new Error(
+      `Rust host server missing at ${hostServerEntry}; run the Playwright build setup`,
+    )
   }
 
   const sharedEnv: NodeJS.ProcessEnv = {
@@ -200,9 +212,7 @@ export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchS
 
   const homeDir =
     options.homeDir ??
-    (options.startPath && options.startPath !== "/"
-      ? path.join(temporaryRoot, "home")
-      : undefined)
+    (options.startPath && options.startPath !== "/" ? path.join(temporaryRoot, "home") : undefined)
   if (homeDir) {
     fs.mkdirSync(homeDir, { recursive: true })
     sharedEnv.HOME = homeDir
@@ -210,7 +220,7 @@ export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchS
   }
 
   const server: TestServerProcess = spawn(
-    HOST_SERVER_ENTRY,
+    hostServerEntry,
     [
       "serve",
       "--host",
@@ -234,9 +244,7 @@ export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchS
 
   const contextOptions: Parameters<typeof chromium.launchPersistentContext>[1] = {
     headless: process.env.YAADE_HEADED !== "1",
-    viewport: options.mobile
-      ? { width: 390, height: 844 }
-      : { width: 1440, height: 900 },
+    viewport: options.mobile ? { width: 390, height: 844 } : { width: 1440, height: 900 },
     deviceScaleFactor: 1,
     locale: "en-US",
     timezoneId: "UTC",
@@ -252,30 +260,43 @@ export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchS
   const context = await chromium.launchPersistentContext(browserData, contextOptions)
   const browserPage = context.pages()[0] ?? (await context.newPage())
   const browserFailures: BrowserFailure[] = []
-  let lastMainFrameNavigationAt = 0
-  browserPage.on("pageerror", error => {
+  let omittedFailures = 0
+  const recordFailure = (failure: BrowserFailure) => {
+    if (isExpectedBrowserFailure(failure, options.expectedHttpErrors)) return
+    if (browserFailures.length >= 100) {
+      omittedFailures += 1
+      return
+    }
     browserFailures.push({
+      ...failure,
+      message: failure.message.slice(0, 4096),
+      url: failure.url?.slice(0, 4096),
+    })
+  }
+  let lastMainFrameNavigationAt = 0
+  browserPage.on("pageerror", (error) => {
+    recordFailure({
       kind: "pageerror",
       message: error.stack ?? error.message,
     })
   })
-  browserPage.on("console", message => {
+  browserPage.on("console", (message) => {
     if (message.type() === "error") {
       const location = message.location()
-      browserFailures.push({
+      recordFailure({
         kind: "console",
         message: message.text(),
         url: location.url || undefined,
       })
     }
   })
-  browserPage.on("request", request => {
+  browserPage.on("request", (request) => {
     if (request.isNavigationRequest() && request.frame() === browserPage.mainFrame()) {
       lastMainFrameNavigationAt = Date.now()
     }
   })
-  browserPage.on("requestfailed", request => {
-    browserFailures.push({
+  browserPage.on("requestfailed", (request) => {
+    recordFailure({
       kind: "requestfailed",
       message: request.failure()?.errorText ?? "request failed",
       url: request.url(),
@@ -283,9 +304,9 @@ export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchS
       navigationRelated: Date.now() - lastMainFrameNavigationAt < 1_000,
     })
   })
-  browserPage.on("response", response => {
+  browserPage.on("response", (response) => {
     if (response.status() < 400) return
-    browserFailures.push({
+    recordFailure({
       kind: "http",
       message: response.statusText(),
       url: response.url(),
@@ -320,17 +341,18 @@ export async function launchWeb(options: LaunchWebOptions = {}): Promise<LaunchS
         // Ignore request aborts caused by teardown itself, but only after
         // preserving every failure observed while the application was live.
         const failuresBeforeTeardown = [...browserFailures]
+        const omittedBeforeTeardown = omittedFailures
         await context.close().catch(() => {})
         await killProc(server)
         if (ownsTemporaryRoot) {
           fs.rmSync(temporaryRoot, { recursive: true, force: true })
         }
         const unexpected = failuresBeforeTeardown.filter(
-          failure => !isExpectedBrowserFailure(failure, options.expectedHttpErrors),
+          (failure) => !isExpectedBrowserFailure(failure, options.expectedHttpErrors),
         )
         if (unexpected.length > 0) {
           throw new Error(
-            `Unexpected browser failures:\n${unexpected.map(formatBrowserFailure).join("\n")}\nServer logs:\n${yaadeLogs()}`,
+            `Unexpected browser failures (${omittedBeforeTeardown} additional failures omitted):\n${unexpected.map(formatBrowserFailure).join("\n")}\nServer log tail:\n${yaadeLogs()}`,
           )
         }
       },

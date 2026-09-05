@@ -11,6 +11,10 @@ export const RuntimeRequestSchema = Schema.Union(
   Schema.Struct({ type: Schema.Literal('palette/toggle') }),
   Schema.Struct({ type: Schema.Literal('palette/bootstrap') }),
   Schema.Struct({ type: Schema.Literal('palette/refresh') }),
+  Schema.Struct({
+    type: Schema.Literal('workbench/open'),
+    surface: Schema.Literal('terminal', 'agent'),
+  }),
   Schema.Struct({ type: Schema.Literal('tab/activate'), tabId: Id, windowId: Id }),
   Schema.Struct({ type: Schema.Literal('tab/close'), tabId: Id }),
   Schema.Struct({ type: Schema.Literal('tab/set-pinned'), tabId: Id, pinned: Schema.Boolean }),

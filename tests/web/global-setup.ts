@@ -1,3 +1,4 @@
+import type { FullConfig } from "@playwright/test"
 import { execFileSync } from "node:child_process"
 import { readdirSync, statSync } from "node:fs"
 import { join } from "node:path"
@@ -52,12 +53,26 @@ function distIsFresh(): boolean {
   return distMtime >= acc.value
 }
 
-export default function globalSetup(): void {
+export default function globalSetup(config: FullConfig): void {
   if (process.env.YAADE_SKIP_E2E_BUILD === "1") return
-  execFileSync("cargo", ["build", "--manifest-path", "apps/server/Cargo.toml"], {
-    cwd: repoRoot,
-    stdio: "inherit",
-  })
+  const profiles = new Set(
+    config.projects.map((project) => (project.name === "bench" ? "release" : "debug")),
+  )
+  for (const profile of profiles) {
+    execFileSync(
+      "cargo",
+      [
+        "build",
+        "--manifest-path",
+        "apps/server/Cargo.toml",
+        ...(profile === "release" ? ["--release"] : []),
+      ],
+      {
+        cwd: repoRoot,
+        stdio: "inherit",
+      },
+    )
+  }
   if (distIsFresh()) {
     console.log("[global-setup] apps/web/dist is newer than sources; skipping SPA build")
     return
