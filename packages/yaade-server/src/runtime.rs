@@ -1,5 +1,7 @@
 use std::{
-    path::PathBuf,
+    fs::{File, OpenOptions},
+    io::Write as _,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -97,6 +99,10 @@ pub enum RuntimeError {
     Unknown(String),
     #[error("principal does not have the capability for operation {0}")]
     ScopeDenied(String),
+    #[error("data directory is already owned by another host: {path}")]
+    DataDirectoryInUse { path: PathBuf },
+    #[error("cannot lock data directory {path}: {message}")]
+    DataDirectoryLock { path: PathBuf, message: String },
     #[error("PATH_OUTSIDE_ALLOWED_ROOTS")]
     PathOutsideRoots,
 }
@@ -110,6 +116,8 @@ impl RuntimeError {
             Self::Invalid(_) | Self::Json(_) => "INVALID_RPC_PAYLOAD",
             Self::Unknown(_) => "UNKNOWN_CHANNEL",
             Self::ScopeDenied(_) => "SCOPE_DENIED",
+            Self::DataDirectoryInUse { .. } => "DATA_DIRECTORY_IN_USE",
+            Self::DataDirectoryLock { .. } => "DATA_DIRECTORY_LOCK_FAILED",
             Self::PathOutsideRoots => "PATH_OUTSIDE_ALLOWED_ROOTS",
         }
     }
@@ -120,7 +128,7 @@ impl RuntimeError {
             Self::Store(StoreError::NotFound(_)) | Self::Terminal(TerminalError::NotFound(_)) => {
                 404
             }
-            Self::Store(StoreError::Conflict(_)) => 409,
+            Self::Store(StoreError::Conflict(_)) | Self::DataDirectoryInUse { .. } => 409,
             Self::ScopeDenied(_) | Self::PathOutsideRoots => 403,
             Self::Unknown(_) => 404,
             _ => 400,
@@ -139,10 +147,44 @@ pub struct HostRuntime {
     pub home_dir: String,
     pub machine_hostname: String,
     shutting_down: AtomicBool,
+    // Declared last so the storage owners are dropped before another process
+    // can acquire the directory and run startup reconciliation.
+    _data_directory_lock: File,
+}
+
+fn lock_data_directory(data_dir: &Path) -> Result<File, RuntimeError> {
+    let path = data_dir.join("host.lock");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| RuntimeError::DataDirectoryLock {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => RuntimeError::DataDirectoryInUse {
+            path: data_dir.to_owned(),
+        },
+        std::fs::TryLockError::Error(error) => RuntimeError::DataDirectoryLock {
+            path: path.clone(),
+            message: error.to_string(),
+        },
+    })?;
+    file.set_len(0)
+        .and_then(|()| writeln!(file, "{}", std::process::id()))
+        .map_err(|error| RuntimeError::DataDirectoryLock {
+            path,
+            message: error.to_string(),
+        })?;
+    Ok(file)
 }
 
 impl HostRuntime {
     pub fn start(config: HostConfig) -> Result<Arc<Self>, RuntimeError> {
+        let data_directory_lock = lock_data_directory(&config.data_dir)?;
         let machine_hostname = hostname::get().map_or_else(
             |_| "unknown".to_owned(),
             |value| value.to_string_lossy().into_owned(),
@@ -194,6 +236,7 @@ impl HostRuntime {
             terminal,
             devices,
             shutting_down: AtomicBool::new(false),
+            _data_directory_lock: data_directory_lock,
         });
         Self::start_lifecycle_listener(&runtime);
         Ok(runtime)
@@ -1343,6 +1386,18 @@ fn file_uri_or_path(value: &str) -> Result<PathBuf, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_directory_has_one_process_owner() {
+        let root = tempfile::tempdir().expect("data directory");
+        let first = lock_data_directory(root.path()).expect("first owner");
+        assert!(matches!(
+            lock_data_directory(root.path()),
+            Err(RuntimeError::DataDirectoryInUse { .. })
+        ));
+        drop(first);
+        lock_data_directory(root.path()).expect("lock is released with owner");
+    }
 
     #[test]
     fn route_policy_separates_observation_control_admin_and_local_admin() {

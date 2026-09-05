@@ -707,6 +707,19 @@ test("terminal stays painted while sidebar and pane geometry change", async ({ l
   expect(sidebarFrames.missingFrames).toBe(0);
   expect(sidebarFrames.mismatchedFrames).toBe(0);
   await expect(navigation).toBeHidden();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean(document.activeElement?.closest("[data-ghostty-terminal-input]")),
+      ),
+    )
+    .toBe(true);
+  const sidebarInputMarker = "YAADE_SIDEBAR_INPUT_GUARD";
+  await page.keyboard.type(`printf '${sidebarInputMarker}\\n'`);
+  await page.keyboard.press("Enter");
+  await expect
+    .poll(() => page.evaluate((id) => window.__yaadeTest?.getTerminalText(id) ?? "", terminalId))
+    .toContain(sidebarInputMarker);
 
   const splitFrames = await sampleTerminalBackgroundFrames(
     page,

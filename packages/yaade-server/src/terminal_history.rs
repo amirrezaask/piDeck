@@ -934,11 +934,13 @@ impl HistoryShared {
 
     fn persist_checkpoint_owned(&self, command: CheckpointCommand) -> Result<(), HistoryError> {
         let state = self.state_for(&command.terminal_id)?;
-        let dir = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .dir
-            .clone();
+        let dir = {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ensure_archive_directory(&mut state)?;
+            state.dir.clone()
+        };
         let target = dir.join(CHECKPOINT_FILE);
         let temporary = dir.join(format!("{CHECKPOINT_FILE}.tmp"));
         let mut file = OpenOptions::new()
@@ -1357,10 +1359,28 @@ fn finalize_ready(shared: &HistoryShared, closes: &mut Vec<(String, u64)>) {
     *closes = waiting;
 }
 
+fn ensure_archive_directory(state: &mut ArchiveState) -> Result<(), HistoryError> {
+    if state.dir.is_dir() {
+        return Ok(());
+    }
+
+    // Older hosts allowed overlapping processes to mutate the same archive.
+    // Preserve accepted in-memory records if that race (or external cleanup)
+    // removes a live directory instead of failing every later output chunk.
+    fs::create_dir_all(&state.dir)?;
+    state.manifest = new_manifest(&state.manifest.terminal_id);
+    write_manifest(state)?;
+    let (active, recovered) = open_active_segment(&state.dir, 0)?;
+    debug_assert!(recovered.is_empty());
+    state.active = active;
+    Ok(())
+}
+
 fn flush_state(state: &mut ArchiveState) -> Result<(), HistoryError> {
     if state.pending.is_empty() {
         return Ok(());
     }
+    ensure_archive_directory(state)?;
     let staging_before = state.staging_allocated_bytes();
     let records = state.pending.clone();
     let uncompressed_bytes = state.pending_bytes as u64;
@@ -2024,6 +2044,36 @@ mod tests {
                 .read_page("missing", 0, None)
                 .expect("read")
                 .is_none()
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn missing_live_archive_directory_is_rebuilt_without_stopping_ingest() {
+        let root = temp_dir();
+        let archive = TerminalHistoryArchive::with_limits(&root, 64, 64).expect("archive");
+        archive
+            .append("term-live", 1, Bytes::from_static(b"before"))
+            .expect("first append");
+        archive.snapshot().expect("first append is owned");
+
+        let dir = archive.shared.terminal_dir("term-live");
+        fs::remove_dir_all(&dir).expect("simulate externally removed archive");
+        archive
+            .append("term-live", 2, Bytes::from_static(b"after"))
+            .expect("second append");
+        archive.flush_all().expect("archive repairs and flushes");
+
+        let page = archive
+            .read_page("term-live", 0, None)
+            .expect("read repaired archive")
+            .expect("repaired history");
+        assert_eq!(
+            page.chunks,
+            vec![
+                Base64Bytes(Bytes::from_static(b"before")),
+                Base64Bytes(Bytes::from_static(b"after")),
+            ]
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

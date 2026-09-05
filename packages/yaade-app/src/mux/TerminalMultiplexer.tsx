@@ -802,20 +802,28 @@ export function TerminalMultiplexer() {
 	const sidebarLayout = twoSidebarLayout || singleSidebarLayout;
 	const sidebarsCollapsed = sidebarLayout && appearanceSettings.sidebarCollapsed;
 	const sidebarOrientation = isMobile ? "horizontal" : "vertical";
+	const restoreTerminalFocusAfterSidebarChange = useCallback(() => {
+		requestAnimationFrame(() => {
+			const terminalId = focusedMuxTerminalRef.current?.id;
+			if (terminalId) focusRegisteredTerminal(terminalId);
+		});
+	}, []);
 	const toggleSidebars = useCallback(() => {
 		setAppearanceSettings((previous) => ({
 			...previous,
 			sidebarCollapsed: !previous.sidebarCollapsed,
 		}));
-	}, [setAppearanceSettings]);
+		restoreTerminalFocusAfterSidebarChange();
+	}, [restoreTerminalFocusAfterSidebarChange, setAppearanceSettings]);
 	const setSidebarOpen = useCallback(
 		(open: boolean) => {
 			setAppearanceSettings((previous) => ({
 				...previous,
 				sidebarCollapsed: !open,
 			}));
+			restoreTerminalFocusAfterSidebarChange();
 		},
-		[setAppearanceSettings],
+		[restoreTerminalFocusAfterSidebarChange, setAppearanceSettings],
 	);
 
 	const resizeSidebar = useCallback(
